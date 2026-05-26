@@ -66,6 +66,7 @@ async function getOverview() {
 }
 
 async function buildOverview() {
+  const cfg = readConfig();
   const [status, positions, walletActivity, newMarkets, bot] = await Promise.all([
     runEvent(["status", "--wallet", botWallet], { timeoutMs: 30000 }),
     runEvent(["positions", "--wallet", botWallet], { timeoutMs: 30000 }),
@@ -86,10 +87,17 @@ async function buildOverview() {
     analytics: buildAnalytics(positions, walletActivity),
     activity: normalizeActivity(recentRows, walletActivity),
     settings: {
-      stakeText: `${status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5} 档 / ${status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 2}U`,
-      windowText: `${status.watchConfig?.eventOpenWindowSeconds ?? 60}s`
+      stakeText: `${status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5} 档 / ${status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5}U`,
+      windowText: `${status.watchConfig?.eventOpenWindowSeconds ?? 60}s`,
+      autoSellText: autoSellText(status.watchConfig, cfg)
     }
   };
+}
+
+function autoSellText(watchConfig, cfg) {
+  const enabled = Boolean(watchConfig?.autoSellEnabled ?? cfg.autoSellEnabled);
+  if (!enabled) return "关闭";
+  return `${watchConfig?.autoSellProfitMultiplier ?? cfg.autoSellProfitMultiplier}x / 卖 ${watchConfig?.autoSellPercent ?? cfg.autoSellPercent}%`;
 }
 
 async function sellQuote(body) {
@@ -215,7 +223,7 @@ function normalizeNewMarkets(markets, status, walletRows, localRows) {
       category: firstCategory(market),
       startsAt: market.startDate,
       choices: Math.min(Number(status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5), market.outcomes?.length ?? 0),
-      stake: money(Number(status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 2) *
+      stake: money(Number(status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5) *
         Math.min(Number(status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5), market.outcomes?.length ?? 0)),
       state: marketState(market, { bought, skipped, pending, openWindowSeconds }),
       tone: marketTone(market, { bought, skipped, pending, openWindowSeconds })

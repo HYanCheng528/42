@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import readline from "node:readline/promises";
 import { promisify } from "node:util";
+import { formatUnits } from "viem";
 import WebSocket from "ws";
 import { appendJsonl, loadSeen, parseArgs, readConfig, saveSeen } from "./config.js";
 import {
@@ -71,6 +72,10 @@ async function main() {
   }
   if (command === "sell") {
     await sell(cfg, args);
+    return;
+  }
+  if (command === "autosell") {
+    await autoSell(cfg, args);
     return;
   }
   if (command === "replay") {
@@ -320,6 +325,28 @@ async function sell(cfg, args) {
   }, null, 2));
 }
 
+async function autoSell(cfg, args) {
+  if (args.execute || args.real) {
+    cfg.dryRun = false;
+    cfg.execute = true;
+    cfg.riskAck = "YES";
+    cfg.eligibilityAck = "YES";
+  }
+  if (!cfg.dryRun && cfg.execute && !cfg.privateKey) {
+    cfg.privateKey = await promptHidden("PRIVATE_KEY for event:autosell (hidden): ");
+  }
+  const seen = loadSeen(cfg.autoSellStateFile);
+  const result = await runAutoSellOnce(cfg, {
+    seen,
+    source: "manual"
+  });
+  console.log(JSON.stringify({
+    level: "event-auto-sell",
+    mode: cfg.dryRun || !cfg.execute ? "dry-run" : "execute",
+    ...result
+  }, null, 2));
+}
+
 async function replay(cfg, args) {
   const { publicClient } = makeClients(cfg);
   const head = await publicClient.getBlockNumber();
@@ -437,6 +464,10 @@ async function status(cfg, args) {
       eventOutcomeSelection: cfg.eventOutcomeSelection,
       eventOutcomeCount: cfg.eventOutcomeCount,
       eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
+      autoSellEnabled: cfg.autoSellEnabled,
+      autoSellProfitMultiplier: cfg.autoSellProfitMultiplier,
+      autoSellPercent: cfg.autoSellPercent,
+      autoSellPollMs: cfg.autoSellPollMs,
       maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
       maxOutcomesPerMarket: cfg.maxOutcomesPerMarket,
       fastSkipPreflight: cfg.fastSkipPreflight,
@@ -458,7 +489,11 @@ async function status(cfg, args) {
       preopenHotMs: cfg.preopenHotMs,
       prebroadcastMs: cfg.prebroadcastMs,
       wsReceiptFallbackMs: cfg.wsReceiptFallbackMs,
-      wsReceiptFallbackRetries: cfg.wsReceiptFallbackRetries
+      wsReceiptFallbackRetries: cfg.wsReceiptFallbackRetries,
+      autoSellEnabled: cfg.autoSellEnabled,
+      autoSellProfitMultiplier: cfg.autoSellProfitMultiplier,
+      autoSellPercent: cfg.autoSellPercent,
+      autoSellPollMs: cfg.autoSellPollMs
     },
     live: {
       count: liveMarkets.length,
@@ -617,6 +652,10 @@ async function bench(cfg, args) {
       eventOutcomeSelection: cfg.eventOutcomeSelection,
       eventOutcomeCount: cfg.eventOutcomeCount,
       eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
+      autoSellEnabled: cfg.autoSellEnabled,
+      autoSellProfitMultiplier: cfg.autoSellProfitMultiplier,
+      autoSellPercent: cfg.autoSellPercent,
+      autoSellPollMs: cfg.autoSellPollMs,
       maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
       fastGasLimit: cfg.fastGasLimit,
       bundleFastGasLimit: cfg.bundleFastGasLimit,
@@ -1078,6 +1117,10 @@ async function arm(cfg, args) {
     armFundingHotWindowMs: cfg.armFundingHotWindowMs,
     armCatchUpAfterFunding: cfg.armCatchUpAfterFunding,
     armCatchUpWindowMs: cfg.armCatchUpWindowMs,
+    autoSellEnabled: cfg.autoSellEnabled,
+    autoSellProfitMultiplier: cfg.autoSellProfitMultiplier,
+    autoSellPercent: cfg.autoSellPercent,
+    autoSellPollMs: cfg.autoSellPollMs,
     note: "private key is held only in this process; it is not written to disk"
   }, null, 2));
 
@@ -1347,6 +1390,7 @@ async function watch(cfg, options = {}) {
   const watchPreflight = await validateWatchFunding(cfg);
   const broadcastWarmup = await maybeWarmBroadcastRpcs(cfg);
   const runtime = await createRuntime(cfg);
+  const autoSellMonitor = startAutoSellMonitor(cfg, runtime);
   const initialPending = new Map();
   const startupWarnings = [];
   const wsStartupSeedDeferred = cfg.eventDiscovery === "ws" && !cfg.watchBuyExisting;
@@ -1401,7 +1445,15 @@ async function watch(cfg, options = {}) {
         preopenHotMs: cfg.preopenHotMs,
         prebroadcastMs: cfg.prebroadcastMs,
         wsReceiptFallbackMs: cfg.wsReceiptFallbackMs,
-        wsReceiptFallbackRetries: cfg.wsReceiptFallbackRetries
+        wsReceiptFallbackRetries: cfg.wsReceiptFallbackRetries,
+        autoSell: autoSellMonitor
+          ? {
+              enabled: true,
+              profitMultiplier: cfg.autoSellProfitMultiplier,
+              percent: cfg.autoSellPercent,
+              pollMs: cfg.autoSellPollMs
+            }
+          : { enabled: false }
       },
       null,
       2
@@ -1428,6 +1480,211 @@ async function maybeWarmBroadcastRpcs(cfg) {
     return { skipped: true, reason: "dry-run" };
   }
   return warmBroadcastRpcClients(cfg);
+}
+
+function startAutoSellMonitor(cfg, runtime = null) {
+  if (!cfg.autoSellEnabled) return null;
+  const seen = loadSeen(cfg.autoSellStateFile);
+  let running = false;
+
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const result = await runAutoSellOnce(cfg, {
+        seen,
+        runtime,
+        source: "monitor"
+      });
+      if (result.triggered > 0 || result.errors.length > 0) {
+        console.log(JSON.stringify({
+          level: "event-auto-sell-monitor",
+          mode: cfg.dryRun || !cfg.execute ? "dry-run" : "execute",
+          ...result
+        }));
+      }
+    } catch (error) {
+      console.error(JSON.stringify({
+        level: "event-auto-sell-error",
+        source: "monitor",
+        message: errorMessage(error),
+        at: new Date().toISOString()
+      }));
+    } finally {
+      running = false;
+    }
+  };
+
+  const timer = setInterval(tick, cfg.autoSellPollMs);
+  void tick();
+  return timer;
+}
+
+async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), runtime = null, source = "manual" } = {}) {
+  const { publicClient, account } = makeClients(cfg);
+  const walletAddress = cfg.walletAddress || account?.address;
+  if (!walletAddress) throw new Error("AUTO_SELL requires WALLET_ADDRESS or PRIVATE_KEY-derived account");
+  if (!cfg.dryRun && cfg.execute && !account) throw new Error("PRIVATE_KEY is required for real AUTO_SELL");
+
+  const openPositions = await fetchOpenPositions(cfg, {
+    user: walletAddress,
+    limit: cfg.autoSellPositionLimit
+  });
+  const result = {
+    source,
+    wallet: walletAddress,
+    checked: 0,
+    alreadyHandled: 0,
+    triggered: 0,
+    executed: 0,
+    skipped: 0,
+    errors: [],
+    actions: []
+  };
+
+  for (const position of openPositions) {
+    if (!isAutoSellablePosition(position)) {
+      result.skipped += 1;
+      continue;
+    }
+    const key = autoSellKey(walletAddress, position, cfg);
+    if (seen.has(key)) {
+      result.alreadyHandled += 1;
+      continue;
+    }
+
+    result.checked += 1;
+    try {
+      const fullQuote = await quoteSellOutcome(publicClient, {
+        market: position.marketAddress,
+        tokenId: position.tokenId,
+        owner: walletAddress,
+        percent: 100,
+        slippageBps: cfg.slippageBps
+      });
+      const costBasisUsdt = Number(position.costBasis ?? 0);
+      const fullExitValueUsdt = rawUsdt(fullQuote.expectedCollateralToUser);
+      const profitMultiple = costBasisUsdt > 0 ? fullExitValueUsdt / costBasisUsdt : 0;
+      const summary = {
+        marketAddress: position.marketAddress,
+        tokenId: String(position.tokenId),
+        question: position.question?.title ?? null,
+        outcome: position.outcome?.name ?? null,
+        costBasisUsdt: roundUsd(costBasisUsdt),
+        fullExitValueUsdt: roundUsd(fullExitValueUsdt),
+        profitMultiple: roundUsd(profitMultiple),
+        triggerMultiple: cfg.autoSellProfitMultiplier
+      };
+
+      if (profitMultiple < cfg.autoSellProfitMultiplier) continue;
+
+      result.triggered += 1;
+      const sellPlan = await quoteSellOutcome(publicClient, {
+        market: position.marketAddress,
+        tokenId: position.tokenId,
+        owner: walletAddress,
+        percent: cfg.autoSellPercent,
+        slippageBps: cfg.slippageBps
+      });
+      const action = {
+        ...summary,
+        percent: cfg.autoSellPercent,
+        expectedCollateralToUserUsdt: roundUsd(rawUsdt(sellPlan.expectedCollateralToUser)),
+        minCollateralOutUsdt: roundUsd(rawUsdt(sellPlan.minCollateralOut)),
+        operatorApproved: sellPlan.operatorApproved,
+        txHash: null,
+        status: cfg.dryRun || !cfg.execute ? "dry-run" : "pending"
+      };
+
+      let execution = null;
+      if (!cfg.dryRun && cfg.execute) {
+        execution = await sellOutcome(cfg, sellPlan);
+        action.txHash = execution.txHash;
+        action.status = execution.status;
+        await syncRuntimeNonceAfterExternalTx(cfg, runtime, "auto-sell");
+        if (execution.status === "success" || execution.status === "broadcast") {
+          seen.add(key);
+          saveSeen(cfg.autoSellStateFile, seen);
+          result.executed += 1;
+        }
+      }
+
+      result.actions.push(action);
+      appendJsonl(cfg.fillsFile, {
+        level: "event-auto-sell",
+        source,
+        mode: cfg.dryRun || !cfg.execute ? "dry-run" : "execute",
+        wallet: walletAddress,
+        key,
+        action,
+        execution,
+        at: new Date().toISOString()
+      });
+    } catch (error) {
+      const item = {
+        marketAddress: position.marketAddress,
+        tokenId: String(position.tokenId),
+        question: position.question?.title ?? null,
+        outcome: position.outcome?.name ?? null,
+        message: errorMessage(error)
+      };
+      result.errors.push(item);
+      console.error(JSON.stringify({
+        level: "event-auto-sell-position-error",
+        source,
+        ...item,
+        at: new Date().toISOString()
+      }));
+    }
+  }
+
+  return result;
+}
+
+function isAutoSellablePosition(position) {
+  if (!position) return false;
+  if (position.isFinalized || position.isClaimed) return false;
+  if (!position.marketAddress || position.tokenId === undefined || position.tokenId === null) return false;
+  return Number(position.costBasis ?? 0) > 0 && Number(position.size ?? 0) > 0;
+}
+
+function autoSellKey(walletAddress, position, cfg) {
+  return [
+    String(walletAddress).toLowerCase(),
+    String(position.marketAddress).toLowerCase(),
+    String(position.tokenId),
+    `tp${cfg.autoSellProfitMultiplier}`,
+    `sell${cfg.autoSellPercent}`
+  ].join(":");
+}
+
+function rawUsdt(value) {
+  const raw = typeof value === "bigint" ? value : BigInt(value);
+  return Number(formatUnits(raw, 18));
+}
+
+async function syncRuntimeNonceAfterExternalTx(cfg, runtime, reason) {
+  if (!runtime || runtime.nextNonce === undefined || cfg.dryRun || !cfg.execute) return;
+  const { publicClient, account } = makeClients(cfg);
+  if (!account) return;
+  const pendingNonce = Number(await publicClient.getTransactionCount({
+    address: account.address,
+    blockTag: "pending"
+  }));
+  const previousNonce = runtime.nextNonce;
+  runtime.nextNonce = Math.max(runtime.nextNonce, pendingNonce);
+  runtime.lastNonceSyncAt = Date.now();
+  if (runtime.nextNonce !== previousNonce) {
+    console.error(JSON.stringify({
+      level: "warn",
+      source: "nonce-sync-after-external-tx",
+      reason,
+      previousNonce,
+      nextNonce: runtime.nextNonce,
+      pendingNonce,
+      at: new Date().toISOString()
+    }));
+  }
 }
 
 async function waitForWatchFunding(cfg) {

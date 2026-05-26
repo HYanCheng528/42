@@ -39,10 +39,10 @@ npm run event:scan
 npm run event:positions -- --wallet 0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b
 ```
 
-查看下一批同期开盘 Event Markets 的实盘资金门槛、当前钱包缺多少 BUSDT/BNB、是否已经能直接 `event:arm`。Event Market 默认每场只买赔率最低的 5 个 outcome，每个 outcome 买 `2U`，实盘前仍建议显式带上 `STAKE_PER_OUTCOME_USDT=2 EVENT_OUTCOME_COUNT=5`：
+查看下一批同期开盘 Event Markets 的实盘资金门槛、当前钱包缺多少 BUSDT/BNB、是否已经能直接 `event:arm`。Event Market 默认每场只买赔率最低的 5 个 outcome，每个 outcome 买 `5U`，实盘前仍建议显式带上 `STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5`：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=2 EVENT_OUTCOME_COUNT=5 npm run event:funding -- --wallet 0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b
+STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 npm run event:funding -- --wallet 0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b
 ```
 
 查看某个 outcome 的卖出报价。默认 dry-run，只读链上余额并用 market 的 `redeemExactOtToCollateral` 报价；真实卖出会先给当前 market 设置 Router operator，再通过 `FTRouterProxy.swap(isMint=false)` 带滑点保护卖出：
@@ -63,6 +63,13 @@ npm run event:sell -- --wallet 0x... --market 0x... --all --percent 100
 DRY_RUN=0 EXECUTE=1 I_UNDERSTAND_42_PRICE_MARKET_RISK=YES I_AM_NOT_IN_RESTRICTED_JURISDICTION=YES npm run event:sell -- --market 0x... --token-id 16 --percent 100
 ```
 
+自动止盈按真实链上卖出报价判断，不按页面展示赔率判断。默认规则是：某个 outcome 的 100% 可卖出报价达到当前成本的 `2x` 后，只卖出该 outcome 的 `50%`，且同一个 outcome 只自动触发一次：
+
+```bash
+npm run event:autosell
+DRY_RUN=0 EXECUTE=1 I_UNDERSTAND_42_PRICE_MARKET_RISK=YES I_AM_NOT_IN_RESTRICTED_JURISDICTION=YES npm run event:autosell -- --execute
+```
+
 无人值守运行时，把热钱包私钥放到 macOS Keychain 的 `42space-event-bot-private-key` 条目；程序会自动读取，不再弹窗。`PRIVATE_KEY` 环境变量仍然优先于 Keychain：
 
 ```bash
@@ -72,25 +79,25 @@ security add-generic-password -a 42space -s 42space-event-bot-private-key -w '0x
 模拟最近一个 Event Market，按当前 `EVENT_OUTCOME_SELECTION` 选择 outcome。默认是 `lowest_odds`，即优先按 `payout` 从小到大选 5 个；如果 REST/链上数据没有完整 payout 但有 price，则按 price 从大到小选；如果刚开场链上日志还没有赔率字段，默认按 token 顺序兜底并在 plan 里标记 `rankSource: token_order`。这个命令会逐 outcome 调 `FTLensV2.simulateMint`，用于分析，不是最快路径：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=2 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run event:plan
+STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run event:plan
 ```
 
 指定市场模拟：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=2 EVENT_OUTCOME_COUNT=5 npm run event:plan -- --market 0x73CbB55E357fA4Ceb2d808FF7A908A7a045F6ca5
+STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 npm run event:plan -- --market 0x73CbB55E357fA4Ceb2d808FF7A908A7a045F6ca5
 ```
 
 监听新 Event Market。默认启动时会把现有 live Event Markets 标记为已见，只等新场；如果要启动后连现有场也买，设置 `WATCH_BUY_EXISTING=1`。
 
 ```bash
-POLL_MS=500 STAKE_PER_OUTCOME_USDT=2 EVENT_OUTCOME_COUNT=5 npm run event:watch
+POLL_MS=500 STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 npm run event:watch
 ```
 
 实盘长期在线入口使用隐藏输入私钥，不把私钥写进 `.env`：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=2 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run event:arm
+STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run event:arm
 ```
 
 速度模式：
@@ -109,6 +116,7 @@ STAKE_PER_OUTCOME_USDT=2 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run 
 - `EVENT_OUTCOME_SELECTION=lowest_odds`、`EVENT_OUTCOME_COUNT=5`：每个 Event Market 只买赔率最低的 5 个 outcome。链上日志缺少赔率字段时，程序会先用 42 单市场 REST 接口按地址补全 outcomes；赔率优先用 `payout` 排序，其次用 `price`，再按 `EVENT_OUTCOME_SELECTION_FALLBACK` 兜底。
 - `EVENT_OUTCOME_SELECTION_FALLBACK=token_order`：刚开场链上日志缺少赔率字段时，仍按 token 顺序选 5 个并继续抢；设为 `error` 则缺少赔率数据时直接跳过/报错，保证只在能判断赔率时下单。
 - `EVENT_OUTCOME_SELECTION=all`：恢复旧策略，买入该市场全部 outcome。
+- `AUTO_SELL_ENABLED=1`、`AUTO_SELL_PROFIT_MULTIPLIER=2`、`AUTO_SELL_PERCENT=50`：长期守护进程会轮询持仓，真实卖出报价达到成本 2 倍后自动卖出一半；已触发的 outcome 会写入 `AUTO_SELL_STATE_FILE`，避免重复半仓卖出。
 - `EVENT_BUY_MODE=fast`：不逐个报价，直接 `minOut=1` 买入选中的 outcome。抢新场默认用这个。
 - `EVENT_BUY_MODE=quoted`：先模拟再买，慢但输出更完整。
 - `FAST_SKIP_PREFLIGHT=1`：触发时不再查余额/allowance，依赖启动前 `event:preflight` 和 `event:approve`。
@@ -214,8 +222,8 @@ BSC_RPC_URL=...
 Event Market 实盘命令：
 
 ```bash
-STAKE_PER_OUTCOME_USDT=2 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run event:minimal
-STAKE_PER_OUTCOME_USDT=2 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run event:buy
+STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run event:minimal
+STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run event:buy
 ```
 
 为了速度，fast `event:watch` 不会在发现新场后临时发 approve，也不会再逐笔 simulate、查余额、查 allowance。它假设启动前已经 `event:preflight` 和 `event:approve`，然后直接广播批量 mint；默认等待 receipt 后再落 seen 状态。`event:approve` 会提前把 BUSDT 对 Router 的 allowance 批到最大值；不要在主钱包里运行，使用小额热钱包。

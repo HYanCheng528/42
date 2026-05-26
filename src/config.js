@@ -50,7 +50,7 @@ export function readConfig() {
     targetOutcomeRegex: envRegex("TARGET_OUTCOME_REGEX", ""),
     strategy: envString("STRATEGY", "binance_volume_projection"),
     stakeUsdt: envNumber("STAKE_USDT", 5),
-    stakePerOutcomeUsdt: envNumber("STAKE_PER_OUTCOME_USDT", 2),
+    stakePerOutcomeUsdt: envNumber("STAKE_PER_OUTCOME_USDT", 5),
     maxStakeUsdt: envNumber("MAX_STAKE_USDT", 25),
     maxMarketStakeUsdt: envNumber("MAX_MARKET_STAKE_USDT", 25),
     maxBatchStakeUsdt: envNumber("MAX_BATCH_STAKE_USDT", 100),
@@ -107,6 +107,12 @@ export function readConfig() {
     armFundingHotWindowMs: envInteger("ARM_FUNDING_HOT_WINDOW_MS", 600000),
     armCatchUpAfterFunding: envBool("ARM_CATCH_UP_AFTER_FUNDING", true),
     armCatchUpWindowMs: envInteger("ARM_CATCH_UP_WINDOW_MS", 45000),
+    autoSellEnabled: envBool("AUTO_SELL_ENABLED", true),
+    autoSellPollMs: envInteger("AUTO_SELL_POLL_MS", 30000),
+    autoSellProfitMultiplier: envNumber("AUTO_SELL_PROFIT_MULTIPLIER", 2),
+    autoSellPercent: envNumber("AUTO_SELL_PERCENT", 50),
+    autoSellPositionLimit: envInteger("AUTO_SELL_POSITION_LIMIT", 500),
+    autoSellStateFile: envString("AUTO_SELL_STATE_FILE", "data/auto-sell-seen.json"),
     scanLimit: envInteger("SCAN_LIMIT", 10),
     openWindowSeconds: envInteger("OPEN_WINDOW_SECONDS", 45),
     lookaheadSeconds: envInteger("LOOKAHEAD_SECONDS", 900),
@@ -167,6 +173,18 @@ export function readConfig() {
   }
   if (cfg.receiptWatchPollingMs <= 0) {
     throw new Error("RECEIPT_WATCH_POLLING_MS must be positive");
+  }
+  if (cfg.autoSellPollMs <= 0) {
+    throw new Error("AUTO_SELL_POLL_MS must be positive");
+  }
+  if (cfg.autoSellProfitMultiplier <= 1) {
+    throw new Error("AUTO_SELL_PROFIT_MULTIPLIER must be greater than 1");
+  }
+  if (cfg.autoSellPercent <= 0 || cfg.autoSellPercent > 100) {
+    throw new Error("AUTO_SELL_PERCENT must be > 0 and <= 100");
+  }
+  if (cfg.autoSellPositionLimit <= 0) {
+    throw new Error("AUTO_SELL_POSITION_LIMIT must be positive");
   }
   if (cfg.executionRetryMs <= 0) {
     throw new Error("EXECUTION_RETRY_MS must be positive");

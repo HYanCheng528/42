@@ -12,6 +12,7 @@
     "event:positions": "node src/event-sniper.js positions",
     "event:funding": "node src/event-sniper.js funding",
     "event:sell": "node src/event-sniper.js sell",
+    "event:autosell": "node src/event-sniper.js autosell",
     "event:replay": "node src/event-sniper.js replay",
     "event:status": "node src/event-sniper.js status",
     "event:rehearse": "node src/event-sniper.js rehearse",

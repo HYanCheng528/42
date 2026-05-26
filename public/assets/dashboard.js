@@ -85,6 +85,7 @@ const els = {
   overviewActivityMini: $("overviewActivityMini"),
   stakeText: $("stakeText"),
   windowText: $("windowText"),
+  autoSellText: $("autoSellText"),
   preflightList: $("preflightList"),
   sellDrawer: $("sellDrawer"),
   sellBackdrop: $("sellBackdrop"),
@@ -351,6 +352,7 @@ function renderCompactActivity(row) {
 function renderStrategy(data) {
   els.stakeText.textContent = data.settings?.stakeText ?? "--";
   els.windowText.textContent = data.settings?.windowText ?? "--";
+  els.autoSellText.textContent = data.settings?.autoSellText ?? "--";
   const checks = [
     { label: "运行状态", value: data.bot.label, tone: data.bot.tone },
     { label: "BUSDT / BNB", value: data.wallet ? `${data.wallet.busdt} U / ${data.wallet.bnb} BNB` : "--", tone: data.wallet?.ready ? "good" : "warn" },
