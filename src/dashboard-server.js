@@ -16,6 +16,7 @@ const botWallet = process.env.DASHBOARD_WALLET ?? "0x244FcE72db40B69C4DA4D41F0a7
 const host = process.env.DASHBOARD_HOST ?? "127.0.0.1";
 const port = Number(process.env.DASHBOARD_PORT ?? 4242);
 const launchLabel = "com.myandong.42space-event-arm";
+const systemdService = process.env.BOT_SYSTEMD_SERVICE ?? "42space-event-arm.service";
 const fillsFile = path.join(rootDir, "data/fills.jsonl");
 const actionsFile = path.join(rootDir, "data/dashboard-actions.jsonl");
 
@@ -593,6 +594,8 @@ function readRecentActivity() {
 }
 
 async function getBotState() {
+  if (process.platform !== "darwin") return getSystemdBotState();
+
   try {
     const uid = String(process.getuid?.() ?? 501);
     const { stdout } = await execFileAsync("launchctl", ["print", `gui/${uid}/${launchLabel}`], { timeoutMs: 5000 });
@@ -600,6 +603,25 @@ async function getBotState() {
     return {
       running: state === "running",
       message: state === "running" ? "运行中" : "未运行"
+    };
+  } catch {
+    return { running: false, message: "未运行" };
+  }
+}
+
+async function getSystemdBotState() {
+  try {
+    const { stdout } = await execFileAsync("systemctl", [
+      "show",
+      systemdService,
+      "--property=ActiveState,SubState",
+      "--value"
+    ], { timeoutMs: 5000 });
+    const [activeState = "", subState = ""] = stdout.trim().split(/\r?\n/);
+    const running = activeState === "active" && subState === "running";
+    return {
+      running,
+      message: running ? "运行中" : "未运行"
     };
   } catch {
     return { running: false, message: "未运行" };
