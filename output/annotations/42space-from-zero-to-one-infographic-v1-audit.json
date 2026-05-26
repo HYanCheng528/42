@@ -1,0 +1,13 @@
+{
+  "output": "/Users/myandong/Projects/42space/output/annotations/42space-from-zero-to-one-infographic-v1.png",
+  "size": [
+    1800,
+    7489
+  ],
+  "source_count": 9,
+  "issues": [],
+  "notes": [
+    "Content summarized from 42 Docs MCP pages.",
+    "No raster AI redraw was used; image is deterministic PIL layout to preserve Chinese text accuracy."
+  ]
+}

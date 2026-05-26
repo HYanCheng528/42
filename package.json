@@ -1,0 +1,39 @@
+{
+  "name": "42-btc-open-sniper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "scan": "node src/sniper.js scan",
+    "watch": "node src/sniper.js watch",
+    "buy": "node src/sniper.js buy",
+    "event:scan": "node src/event-sniper.js scan",
+    "event:plan": "node src/event-sniper.js plan",
+    "event:positions": "node src/event-sniper.js positions",
+    "event:funding": "node src/event-sniper.js funding",
+    "event:sell": "node src/event-sniper.js sell",
+    "event:replay": "node src/event-sniper.js replay",
+    "event:status": "node src/event-sniper.js status",
+    "event:rehearse": "node src/event-sniper.js rehearse",
+    "event:bench": "node src/event-sniper.js bench",
+    "event:rpc": "node src/event-sniper.js rpc",
+    "event:presign-test": "node src/event-sniper.js presign-test",
+    "event:due-test": "node src/event-sniper.js due-test",
+    "event:catchup-test": "node src/event-sniper.js catchup-test",
+    "event:retry-test": "node src/event-sniper.js retry-test",
+    "event:deadline-test": "node src/event-sniper.js deadline-test",
+    "event:buy": "node src/event-sniper.js buy",
+    "event:minimal": "node src/event-sniper.js minimal",
+    "event:arm": "node src/event-sniper.js arm",
+    "event:watch": "node src/event-sniper.js watch",
+    "event:preflight": "node src/event-sniper.js preflight",
+    "event:approve": "node src/event-sniper.js approve",
+    "event:doctor": "node src/event-sniper.js doctor",
+    "dashboard": "node src/dashboard-server.js",
+    "check": "node --check src/sniper.js && node --check src/event-sniper.js && node --check src/dashboard-server.js && node --check src/fortytwo.js && node --check src/strategy.js && node --check src/event-strategy.js && node --check src/binance.js && node --check src/config.js"
+  },
+  "dependencies": {
+    "viem": "^2.41.2"
+  },
+  "devDependencies": {}
+}

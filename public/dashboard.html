@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>42space Bot Console</title>
+    <link rel="stylesheet" href="/assets/dashboard.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brandMark" aria-hidden="true">42</div>
+          <div>
+            <h1>42space Bot Console</h1>
+            <p>Event Market execution desk</p>
+          </div>
+        </div>
+        <div class="topStatus" aria-label="实时状态">
+          <div class="statusPill">
+            <span>状态</span>
+            <strong id="botState">--</strong>
+          </div>
+          <div class="statusPill">
+            <span>资金</span>
+            <strong id="fundingState">--</strong>
+          </div>
+          <div class="statusPill">
+            <span>下一场</span>
+            <strong id="nextClock">--</strong>
+          </div>
+        </div>
+        <div class="topActions">
+          <span id="updated" class="syncText">--</span>
+          <button id="refreshBtn" class="iconButton" type="button" aria-label="刷新">
+            <span data-icon="refresh-cw"></span>
+            <span>刷新</span>
+          </button>
+        </div>
+      </header>
+
+      <section class="appFrame">
+        <nav class="sideNav" aria-label="主导航">
+          <button class="navItem isActive" type="button" data-route="overview">
+            <span data-icon="radio"></span>
+            <span>Overview</span>
+            <small>是否干预</small>
+          </button>
+          <button class="navItem" type="button" data-route="markets">
+            <span data-icon="sparkles"></span>
+            <span>Markets</span>
+            <small>买入队列</small>
+          </button>
+          <button class="navItem" type="button" data-route="positions">
+            <span data-icon="layers-3"></span>
+            <span>Positions</span>
+            <small>持仓卖出</small>
+          </button>
+          <button class="navItem" type="button" data-route="execution">
+            <span data-icon="activity"></span>
+            <span>Execution</span>
+            <small>执行记录</small>
+          </button>
+          <button class="navItem" type="button" data-route="strategy">
+            <span data-icon="sliders-horizontal"></span>
+            <span>Strategy</span>
+            <small>策略预检</small>
+          </button>
+        </nav>
+
+        <section class="contentShell">
+          <div class="viewHeader">
+            <div>
+              <span id="viewKicker" class="viewKicker">Today</span>
+              <h2 id="viewTitle">Overview</h2>
+              <p id="viewLead">判断当前 bot 是否需要人工干预。</p>
+            </div>
+          </div>
+
+          <section id="overviewView" class="view isActive" data-view="overview">
+            <div class="overviewGrid">
+              <section class="panel decisionPanel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="radio"></i>当前判断</h3>
+                    <p>先看是否需要人工处理</p>
+                  </div>
+                </div>
+                <div id="attentionList" class="attentionList"></div>
+              </section>
+              <section class="panel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="trending-up"></i>资金快照</h3>
+                    <p>持仓和收益概览</p>
+                  </div>
+                </div>
+                <div id="overviewSnapshot" class="snapshotGrid"></div>
+              </section>
+            </div>
+            <div class="overviewGrid lowerGrid">
+              <section class="panel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="calendar-clock"></i>下一步</h3>
+                    <p>开盘准备和资金门槛</p>
+                  </div>
+                </div>
+                <div id="overviewNextAction" class="compactList"></div>
+              </section>
+              <section class="panel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="activity"></i>最近异常</h3>
+                    <p>失败和跳过优先展示</p>
+                  </div>
+                </div>
+                <div id="overviewActivityMini" class="compactList"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="marketsView" class="view" data-view="markets">
+            <div class="viewToolbar">
+              <div class="segmented" aria-label="市场筛选">
+                <button type="button" class="isActive" data-market-filter="all">全部</button>
+                <button type="button" data-market-filter="pending">待处理</button>
+                <button type="button" data-market-filter="bought">已买</button>
+                <button type="button" data-market-filter="skipped">已跳过</button>
+              </div>
+            </div>
+            <div class="marketsLayout">
+              <section class="panel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="sparkles"></i>市场队列</h3>
+                    <p>按 bot 的买入决策状态查看</p>
+                  </div>
+                  <span id="newMarketCount">--</span>
+                </div>
+                <div id="newMarketList" class="marketTable"></div>
+              </section>
+              <aside class="panel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="calendar-clock"></i>即将开盘</h3>
+                    <p>已知 future markets</p>
+                  </div>
+                  <span id="nextCount">--</span>
+                </div>
+                <div id="upcomingList" class="compactList"></div>
+              </aside>
+            </div>
+          </section>
+
+          <section id="positionsView" class="view" data-view="positions">
+            <div id="positionSummary" class="summaryStrip"></div>
+            <section class="panel positionsPanel">
+              <div class="panelHead">
+                <div>
+                  <h3><i data-icon="layers-3"></i>持仓与退出</h3>
+                  <p>选择仓位后在右侧面板报价和卖出</p>
+                </div>
+                <span id="holdingCount">--</span>
+              </div>
+              <div id="holdingsList" class="holdings"></div>
+            </section>
+            <section class="panel projectsPanel">
+              <div class="panelHead">
+                <div>
+                  <h3><i data-icon="bar-chart-3"></i>项目统计</h3>
+                  <p>按 market 聚合的资金表现</p>
+                </div>
+                <span id="projectCount">--</span>
+              </div>
+              <div id="projectStats" class="projects"></div>
+            </section>
+          </section>
+
+          <section id="executionView" class="view" data-view="execution">
+            <section class="panel">
+              <div class="panelHead">
+                <div>
+                  <h3><i data-icon="activity"></i>执行记录</h3>
+                  <p>链上活动和本地执行日志</p>
+                </div>
+              </div>
+              <div id="activityList" class="timeline"></div>
+            </section>
+          </section>
+
+          <section id="strategyView" class="view" data-view="strategy">
+            <div class="strategyGrid">
+              <section class="panel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="sliders-horizontal"></i>Watch Config</h3>
+                    <p>当前买入策略参数</p>
+                  </div>
+                </div>
+                <div class="settingsGrid">
+                  <div class="settingItem">
+                    <span>买入档位</span>
+                    <strong id="stakeText">--</strong>
+                  </div>
+                  <div class="settingItem">
+                    <span>开盘窗口</span>
+                    <strong id="windowText">--</strong>
+                  </div>
+                </div>
+              </section>
+              <section class="panel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="wallet"></i>Preflight</h3>
+                    <p>资金和运行状态</p>
+                  </div>
+                </div>
+                <div id="preflightList" class="preflightList"></div>
+              </section>
+            </div>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <aside id="sellDrawer" class="sellDrawer" aria-hidden="true">
+      <button id="sellBackdrop" class="sellBackdrop" type="button" aria-label="关闭卖出面板"></button>
+      <section class="sellSheet" aria-label="卖出报价">
+        <div class="dialogHead">
+          <div>
+            <h3 id="sellTitle"><span data-icon="badge-dollar-sign"></span>卖出</h3>
+            <p id="sellOutcome">--</p>
+          </div>
+          <button id="closeDialog" class="ghost iconButton" type="button" aria-label="关闭">
+            <span data-icon="x"></span>
+            <span>关闭</span>
+          </button>
+        </div>
+        <div id="sellContext" class="sellContext"></div>
+        <div class="sellControl">
+          <div class="controlHead">
+            <span>卖出比例</span>
+            <strong id="sellPercentText">100%</strong>
+          </div>
+          <div class="percentButtons">
+            <button type="button" data-sell-percent="25">25%</button>
+            <button type="button" data-sell-percent="50">50%</button>
+            <button type="button" data-sell-percent="75">75%</button>
+            <button type="button" class="isActive" data-sell-percent="100">100%</button>
+          </div>
+          <div class="rangeLine">
+            <input id="sellPercentRange" type="range" min="1" max="100" step="1" value="100">
+            <input id="sellPercentInput" type="number" min="1" max="100" step="1" value="100" aria-label="卖出百分比">
+          </div>
+        </div>
+        <div id="quoteBox" class="quoteBox"></div>
+        <div class="dialogActions">
+          <button id="quoteRefresh" class="ghost iconButton" type="button">
+            <span data-icon="refresh-cw"></span>
+            <span>重新报价</span>
+          </button>
+          <button id="confirmSell" class="danger iconButton" type="button">
+            <span data-icon="send"></span>
+            <span>确认卖出</span>
+          </button>
+        </div>
+      </section>
+    </aside>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/assets/dashboard.js"></script>
+  </body>
+</html>
