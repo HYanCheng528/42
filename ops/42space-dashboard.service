@@ -1,0 +1,23 @@
+[Unit]
+Description=42space dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=42space
+Group=42space
+WorkingDirectory=/opt/42space
+EnvironmentFile=/etc/42space/event-bot.env
+Environment=DASHBOARD_HOST=127.0.0.1
+Environment=DASHBOARD_PORT=4242
+Environment=BOT_CONFIG_FILE=/opt/42space/data/bot-config.env
+ExecStart=/usr/bin/env npm run dashboard
+Restart=always
+RestartSec=5
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/42space/data
+
+[Install]
+WantedBy=multi-user.target

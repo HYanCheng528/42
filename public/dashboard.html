@@ -4,13 +4,17 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>42space Bot Console</title>
+    <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+    <meta name="theme-color" content="#120c18">
     <link rel="stylesheet" href="/assets/dashboard.css">
   </head>
   <body>
     <main class="shell">
       <header class="topbar">
         <div class="brand">
-          <div class="brandMark" aria-hidden="true">42</div>
+          <div class="brandMark" aria-hidden="true">
+            <img src="/assets/icon.svg" alt="">
+          </div>
           <div>
             <h1>42space Bot Console</h1>
             <p>Event Market execution desk</p>
@@ -127,6 +131,7 @@
                 <button type="button" data-market-filter="pending">待处理</button>
                 <button type="button" data-market-filter="bought">已买</button>
                 <button type="button" data-market-filter="skipped">已跳过</button>
+                <button type="button" data-market-filter="rejected">被刷掉</button>
               </div>
             </div>
             <div class="marketsLayout">
@@ -140,7 +145,7 @@
                 </div>
                 <div id="newMarketList" class="marketTable"></div>
               </section>
-              <aside class="panel">
+              <aside class="panel upcomingPanel">
                 <div class="panelHead">
                   <div>
                     <h3><i data-icon="calendar-clock"></i>即将开盘</h3>
@@ -148,7 +153,7 @@
                   </div>
                   <span id="nextCount">--</span>
                 </div>
-                <div id="upcomingList" class="compactList"></div>
+                <div id="upcomingList" class="compactList upcomingList"></div>
               </aside>
             </div>
           </section>
@@ -178,6 +183,15 @@
           </section>
 
           <section id="executionView" class="view" data-view="execution">
+            <section class="panel speedPanel">
+              <div class="panelHead">
+                <div>
+                  <h3><i data-icon="timer"></i>买入速度统计</h3>
+                  <p>最近买入的链上排名、txIndex、gas 和前排 gas</p>
+                </div>
+              </div>
+              <div id="buySpeedList" class="speedList"></div>
+            </section>
             <section class="panel">
               <div class="panelHead">
                 <div>
@@ -221,6 +235,45 @@
                   </div>
                 </div>
                 <div id="preflightList" class="preflightList"></div>
+              </section>
+              <section class="panel approvalPanel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="shield-check"></i>手动授权</h3>
+                    <p>设置 BUSDT 给 42 Router 的可用额度</p>
+                  </div>
+                </div>
+                <div class="approvalForm">
+                  <label class="configField" for="approveAmount">
+                    <span>授权数量 U</span>
+                    <input id="approveAmount" type="number" min="0.01" step="0.01" inputmode="decimal" value="25">
+                  </label>
+                  <button id="approveRouter" class="iconButton" type="button">
+                    <span data-icon="shield-check"></span>
+                    <span>授权 BUSDT</span>
+                  </button>
+                </div>
+                <p id="approveStatus" class="approvalStatus">未提交授权交易</p>
+              </section>
+              <section class="panel configPanel">
+                <div class="panelHead">
+                  <div>
+                    <h3><i data-icon="sliders-horizontal"></i>配置文件</h3>
+                    <p id="configFileText">.env.local</p>
+                  </div>
+                  <div class="panelActions">
+                    <button id="restartWatch" class="ghost iconButton" type="button">
+                      <span data-icon="refresh-cw"></span>
+                      <span>重启 Watch</span>
+                    </button>
+                    <button id="saveConfig" class="iconButton" type="button">
+                      <span data-icon="save"></span>
+                      <span>保存</span>
+                    </button>
+                  </div>
+                </div>
+                <p id="restartStatus" class="restartStatus">保存配置后，点“重启 Watch”才会让运行中的程序读取新配置。</p>
+                <div id="configForm" class="configForm"></div>
               </section>
             </div>
           </section>

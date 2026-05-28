@@ -1,17 +1,19 @@
 import { ADDRESSES } from "./fortytwo.js";
 
-export function filterEventMarkets(markets, cfg) {
+export function filterEventMarkets(markets, cfg, options = {}) {
   return markets
-    .filter((market) => isEventMarket(market, cfg))
+    .filter((market) => isEventMarket(market, cfg, options))
     .filter((market) => passesCreatedAtFloor(market, cfg))
     .sort(compareCreatedAtDesc);
 }
 
-export function isEventMarket(market, cfg) {
-  if (!market || market.status !== "live") return false;
+export function isEventMarket(market, cfg, options = {}) {
+  const statuses = options.statuses ?? ["live"];
+  if (!market || !statuses.includes(String(market.status ?? ""))) return false;
   if (!Array.isArray(market.outcomes) || market.outcomes.length === 0) return false;
   if (isPriceMarket(market, cfg)) return false;
   if (!passesCategoryAllowlist(market, cfg)) return false;
+  if (!passesMinimumDuration(market, cfg)) return false;
   return true;
 }
 
@@ -87,6 +89,20 @@ function passesCreatedAtFloor(market, cfg) {
   const createdAt = new Date(market.createdAt).getTime();
   const floor = new Date(cfg.minMarketCreatedAt).getTime();
   return Number.isFinite(createdAt) && Number.isFinite(floor) && createdAt >= floor;
+}
+
+export function marketDurationHours(market) {
+  const start = new Date(market?.startDate).getTime();
+  const end = new Date(market?.endDate).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return (end - start) / 3600000;
+}
+
+export function passesMinimumDuration(market, cfg) {
+  const minimumHours = Number(cfg.minMarketDurationHours ?? 0);
+  if (!Number.isFinite(minimumHours) || minimumHours <= 0) return true;
+  const durationHours = marketDurationHours(market);
+  return durationHours !== null && durationHours >= minimumHours;
 }
 
 function containsAny(text, needles = []) {

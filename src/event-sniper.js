@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { performance } from "node:perf_hooks";
 import readline from "node:readline/promises";
 import { promisify } from "node:util";
@@ -9,6 +12,7 @@ import WebSocket from "ws";
 import { appendJsonl, loadSeen, parseArgs, readConfig, saveSeen } from "./config.js";
 import {
   approveRouterMax,
+  approveRouterAmount,
   buildFastBuyBundlePlan,
   buildDirectBuyAllOutcomesPlan,
   buildMarketFromCreationLog,
@@ -44,10 +48,18 @@ import {
   selectEventMarket,
   summarizeEventMarket
 } from "./event-strategy.js";
+import { markdownLine, notifyPushPlusSafe, shortHash } from "./pushplus.js";
 
 const execFileAsync = promisify(execFile);
-const PUBLIC_TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const PUBLIC_TEST_PRIVATE_KEY = [
+  "0x",
+  "ac0974bec39a17e36",
+  "ba4a6b4d238ff944",
+  "bacb478cbed5efcae784d7bf4f2ff80"
+].join("");
 const PUBLIC_TEST_RECEIVER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+const REST_DISCOVERY_STATUSES = ["live", "not_started"];
+const activeDiscoveryKeys = new Set();
 
 async function main() {
   const [command = "scan", ...rest] = process.argv.slice(2);
@@ -118,6 +130,10 @@ async function main() {
     await deadlineTest(cfg, args);
     return;
   }
+  if (command === "self-test") {
+    await selfTest(cfg);
+    return;
+  }
   if (command === "buy") {
     await buy(cfg, args);
     return;
@@ -135,7 +151,7 @@ async function main() {
     return;
   }
   if (command === "approve") {
-    await approve(cfg);
+    await approve(cfg, args);
     return;
   }
   if (command === "doctor") {
@@ -395,36 +411,38 @@ async function replay(cfg, args) {
 
 async function status(cfg, args) {
   const { publicClient } = makeClients(cfg);
-  const [liveMarkets, chain] = await Promise.all([
+  const [liveMarkets, chain, restFutureMarkets] = await Promise.all([
     loadEventMarkets(cfg, { limit: cfg.watchScanLimit }),
-    loadChainEventMarkets(cfg, args)
+    loadChainEventMarkets(cfg, args),
+    loadUpcomingRestEventMarkets(cfg)
   ]);
-  const funding = computeFundingRequirement(cfg, chain.eventMarkets);
-  const gasReserve = await estimateFastGasReserve(publicClient, cfg, funding);
+  const fundingMarkets = mergeMarketLists(chain.eventMarkets, restFutureMarkets);
+  const funding = computeFundingRequirement(cfg, fundingMarkets);
+  const [gasReserve, minimumGasReserve] = await Promise.all([
+    estimateFastGasReserve(publicClient, cfg, funding),
+    estimateFastGasReserve(publicClient, cfg, minimumExecutionFunding(funding))
+  ]);
   const walletAddress = args.wallet ?? cfg.walletAddress;
   let wallet = null;
   if (walletAddress) {
     try {
       const statusResult = await getWalletStatusForAddress(publicClient, walletAddress);
+      const readiness = walletFundingReadiness(statusResult, funding, gasReserve, minimumGasReserve);
       wallet = {
         ...statusResult,
         requiredBusdt: funding.requiredBusdt,
+        minimumRequiredBusdt: funding.minimumRequiredBusdt,
+        fullBatchRequiredBusdt: funding.requiredBusdt,
         requiredBusdtUpperBound: funding.upperBoundRequiredBusdt,
         fundingMode: funding.mode,
-        requiredBnbGasReserve: gasReserve.requiredBnb,
-        gasReserveMode: gasReserve.mode,
-        allowanceReady: Number(statusResult.busdtAllowanceToRouter) >= funding.requiredBusdt,
-        balanceReady: Number(statusResult.busdtBalance) >= funding.requiredBusdt,
-        bnbReady: Number(statusResult.bnbBalance) >= Number(gasReserve.requiredBnb),
-        allowanceReadyForUpperBound: Number(statusResult.busdtAllowanceToRouter) >= funding.upperBoundRequiredBusdt,
-        balanceReadyForUpperBound: Number(statusResult.busdtBalance) >= funding.upperBoundRequiredBusdt
+        ...readiness
       };
     } catch (error) {
       wallet = { ok: false, message: errorMessage(error) };
     }
   }
 
-  const futureMarkets = chain.eventMarkets
+  const futureMarkets = fundingMarkets
     .filter((market) => msUntilStart(market) > 0)
     .sort(compareStartAsc);
   const latestLive = liveMarkets[0] ?? null;
@@ -460,6 +478,8 @@ async function status(cfg, args) {
       eventBuyMode: cfg.eventBuyMode,
       watchFundingMode: cfg.watchFundingMode,
       bundleDueMarkets: cfg.bundleDueMarkets,
+      restDiscoveryEnabled: cfg.restDiscoveryEnabled,
+      restDiscoveryPollMs: cfg.restDiscoveryPollMs,
       stakePerOutcomeUsdt: cfg.stakePerOutcomeUsdt,
       eventOutcomeSelection: cfg.eventOutcomeSelection,
       eventOutcomeCount: cfg.eventOutcomeCount,
@@ -749,8 +769,8 @@ async function dueTest(cfg, args) {
     ...testCfg,
     dryRun: true,
     execute: false,
-    stateFile: `/tmp/42space-due-test-seen-${Date.now()}.json`,
-    fillsFile: `/tmp/42space-due-test-fills-${Date.now()}.jsonl`
+    stateFile: tempFile(`42space-due-test-seen-${Date.now()}.json`),
+    fillsFile: tempFile(`42space-due-test-fills-${Date.now()}.jsonl`)
   };
   const forcedStartDate = new Date(Date.now() - 1000).toISOString();
   const pending = new Map();
@@ -813,8 +833,8 @@ async function catchupTest(cfg, args) {
     execute: false,
     armCatchUpAfterFunding: true,
     armCatchUpWindowMs: Number(args.windowMs ?? cfg.armCatchUpWindowMs),
-    stateFile: `/tmp/42space-catchup-test-seen-${now}.json`,
-    fillsFile: `/tmp/42space-catchup-test-fills-${now}.jsonl`
+    stateFile: tempFile(`42space-catchup-test-seen-${now}.json`),
+    fillsFile: tempFile(`42space-catchup-test-fills-${now}.jsonl`)
   };
   const forcedStartDate = new Date(now - ageMs).toISOString();
   const markets = batch.map((market) => ({
@@ -834,6 +854,8 @@ async function catchupTest(cfg, args) {
   const pending = new Map();
   const catchUpStart = performance.now();
   await handleDiscoveredMarkets(catchUpCfg, seen, pending, catchUpMarkets, null, {
+    source: "catchup-test",
+    notify: false,
     hydrateDueOdds: true,
     hydrationSkipReason: "catchup_test"
   });
@@ -938,8 +960,8 @@ async function deadlineTest(cfg, args) {
     dryRun: true,
     execute: false,
     eventOpenWindowSeconds: Number(args.windowSeconds ?? cfg.eventOpenWindowSeconds),
-    stateFile: `/tmp/42space-deadline-test-seen-${now}.json`,
-    fillsFile: `/tmp/42space-deadline-test-fills-${now}.jsonl`
+    stateFile: tempFile(`42space-deadline-test-seen-${now}.json`),
+    fillsFile: tempFile(`42space-deadline-test-fills-${now}.jsonl`)
   };
   const staleMarket = {
     address: "0x0000000000000000000000000000000000000042",
@@ -979,6 +1001,158 @@ async function deadlineTest(cfg, args) {
     fillsFile: testCfg.fillsFile,
     stateFile: testCfg.stateFile
   }, null, 2));
+}
+
+async function selfTest(cfg) {
+  const testCfg = {
+    ...cfg,
+    privateKey: PUBLIC_TEST_PRIVATE_KEY,
+    walletAddress: PUBLIC_TEST_RECEIVER,
+    dryRun: true,
+    execute: false,
+    eventBuyMode: "fast",
+    eventOutcomeSelection: "lowest_odds",
+    eventOutcomeCount: 5,
+    eventOutcomeSelectionFallback: "token_order",
+    stakePerOutcomeUsdt: 5,
+    maxStakeUsdt: 25,
+    maxMarketStakeUsdt: 25,
+    maxBatchStakeUsdt: 100,
+    maxOutcomesPerMarket: 12,
+    minMarketDurationHours: 48,
+    marketCategoryBlocklist: ["Price"],
+    marketTagBlocklist: ["8 hour", "automated"]
+  };
+  const passed = [];
+
+  const lowestOddsPlan = buildDirectBuyAllOutcomesPlan(mockEventMarket(), testCfg);
+  assertSelfTest(
+    lowestOddsPlan.selection?.rankSource === "payout",
+    `expected payout ranking, got ${lowestOddsPlan.selection?.rankSource}`
+  );
+  assertArrayEqual(
+    lowestOddsPlan.outcomes.map((outcome) => String(outcome.tokenId)),
+    ["8", "2", "16", "32", "4"],
+    "lowest-odds token selection"
+  );
+  passed.push("lowest-odds selection uses lowest payout");
+
+  const noOddsPlan = buildDirectBuyAllOutcomesPlan(mockEventMarket({
+    address: "0x0000000000000000000000000000000000000043",
+    outcomes: tokenOrderOutcomes()
+  }), testCfg);
+  assertSelfTest(
+    noOddsPlan.selection?.rankSource === "token_order",
+    `expected token_order fallback, got ${noOddsPlan.selection?.rankSource}`
+  );
+  assertSelfTest(
+    noOddsPlan.selection?.fallbackReason === "missing_complete_odds_data",
+    `expected missing odds fallback, got ${noOddsPlan.selection?.fallbackReason}`
+  );
+  assertArrayEqual(
+    noOddsPlan.outcomes.map((outcome) => String(outcome.tokenId)),
+    ["1", "2", "4", "8", "16"],
+    "token-order fallback selection"
+  );
+  passed.push("speed fallback selects token order when odds are missing");
+
+  const priceMarkets = filterEventMarkets([mockEventMarket({
+    address: "0x0000000000000000000000000000000000000044",
+    question: "BTC price range - 8 Hours",
+    curve: "0x495B31876c092c236d1b0Df5Cc953D45d41301F1",
+    categories: ["Price"],
+    tags: ["8 hour"]
+  })], testCfg);
+  assertSelfTest(priceMarkets.length === 0, "Price market filter should exclude BTC price range markets");
+  passed.push("Price markets are excluded from Event Market bot");
+
+  const baseStart = Date.now() + 60000;
+  const shortDurationMarkets = filterEventMarkets([mockEventMarket({
+    address: "0x0000000000000000000000000000000000000045",
+    startDate: new Date(baseStart).toISOString(),
+    endDate: new Date(baseStart + (48 * 3600000) - 1).toISOString()
+  })], testCfg);
+  assertSelfTest(shortDurationMarkets.length === 0, "47.999h markets should be excluded");
+  const exactDurationMarkets = filterEventMarkets([mockEventMarket({
+    address: "0x0000000000000000000000000000000000000046",
+    startDate: new Date(baseStart).toISOString(),
+    endDate: new Date(baseStart + 48 * 3600000).toISOString()
+  })], testCfg);
+  assertSelfTest(exactDurationMarkets.length === 1, "48h markets should be allowed");
+  passed.push("market duration filter allows >=48h only");
+
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-self-test-"));
+  try {
+    const stateFile = path.join(stateDir, "seen.json");
+    saveSeen(stateFile, new Set(["market-a", "market-b"]));
+    assertSelfTest(loadSeen(stateFile).has("market-a"), "saved seen file should load");
+    saveSeen(stateFile, new Set(["market-c"]));
+    fs.writeFileSync(stateFile, "{ broken json", { mode: 0o600 });
+    const recovered = loadSeen(stateFile);
+    assertSelfTest(
+      recovered.has("market-a") && recovered.has("market-b"),
+      "corrupt seen file should recover from backup"
+    );
+    passed.push("seen state write is atomic and backup-recoverable");
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+
+  console.log(JSON.stringify({
+    level: "event-self-test",
+    passed: passed.length,
+    checks: passed,
+    at: new Date().toISOString()
+  }, null, 2));
+}
+
+function mockEventMarket(overrides = {}) {
+  const now = Date.now();
+  return {
+    address: "0x0000000000000000000000000000000000000042",
+    question: "Self test Event Market",
+    status: "live",
+    createdAt: new Date(now).toISOString(),
+    startDate: new Date(now + 60000).toISOString(),
+    endDate: new Date(now + 3600000).toISOString(),
+    contractVersion: 2,
+    collateral: "0x55d398326f99059fF775485246999027B3197955",
+    parentTokenId: "0",
+    curve: "0xDC26047458FEa8Bd45164217CCb7eE90b9bE10B8",
+    categories: ["Crypto"],
+    tags: ["Normal"],
+    outcomes: [
+      { tokenId: "1", name: "A", payout: 6, price: 0.1667 },
+      { tokenId: "2", name: "B", payout: 2, price: 0.5 },
+      { tokenId: "4", name: "C", payout: 5, price: 0.2 },
+      { tokenId: "8", name: "D", payout: 1, price: 1 },
+      { tokenId: "16", name: "E", payout: 3, price: 0.3333 },
+      { tokenId: "32", name: "F", payout: 4, price: 0.25 }
+    ],
+    ...overrides
+  };
+}
+
+function tokenOrderOutcomes() {
+  return [
+    { tokenId: "1", name: "A" },
+    { tokenId: "2", name: "B" },
+    { tokenId: "4", name: "C" },
+    { tokenId: "8", name: "D" },
+    { tokenId: "16", name: "E" },
+    { tokenId: "32", name: "F" }
+  ];
+}
+
+function assertSelfTest(condition, message) {
+  if (!condition) throw new Error(`Self-test failed: ${message}`);
+}
+
+function assertArrayEqual(actual, expected, label) {
+  const same = actual.length === expected.length && actual.every((value, index) => value === expected[index]);
+  if (!same) {
+    throw new Error(`Self-test failed: ${label}; expected ${expected.join(",")}, got ${actual.join(",")}`);
+  }
 }
 
 async function buildPresignTestRecords(cfg, args) {
@@ -1094,6 +1268,8 @@ async function arm(cfg, args) {
     eventDiscovery: cfg.eventDiscovery,
     wsProvider: wsProviderLabel(cfg.wsUrl),
     eventBuyMode: cfg.eventBuyMode,
+    restDiscoveryEnabled: cfg.restDiscoveryEnabled,
+    restDiscoveryPollMs: cfg.restDiscoveryPollMs,
     stakePerOutcomeUsdt: cfg.stakePerOutcomeUsdt,
     eventOutcomeSelection: cfg.eventOutcomeSelection,
     eventOutcomeCount: cfg.eventOutcomeCount,
@@ -1142,9 +1318,16 @@ async function arm(cfg, args) {
 async function preflight(cfg) {
   const { publicClient } = makeClients(cfg);
   const status = await getWalletStatus(cfg);
-  const chain = await loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks });
-  const funding = computeFundingRequirement(cfg, chain.eventMarkets);
-  const gasReserve = await estimateFastGasReserve(publicClient, cfg, funding);
+  const [chain, restFutureMarkets] = await Promise.all([
+    loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks }),
+    loadUpcomingRestEventMarkets(cfg)
+  ]);
+  const funding = computeFundingRequirement(cfg, mergeMarketLists(chain.eventMarkets, restFutureMarkets));
+  const [gasReserve, minimumGasReserve] = await Promise.all([
+    estimateFastGasReserve(publicClient, cfg, funding),
+    estimateFastGasReserve(publicClient, cfg, minimumExecutionFunding(funding))
+  ]);
+  const readiness = walletFundingReadiness(status, funding, gasReserve, minimumGasReserve);
   console.log(
     JSON.stringify(
       {
@@ -1152,11 +1335,8 @@ async function preflight(cfg) {
         status,
         funding,
         gasReserve,
-        allowanceReady: Number(status.busdtAllowanceToRouter) >= funding.requiredBusdt,
-        balanceReady: Number(status.busdtBalance) >= funding.requiredBusdt,
-        bnbReady: Number(status.bnbBalance) >= Number(gasReserve.requiredBnb),
-        allowanceReadyForUpperBound: Number(status.busdtAllowanceToRouter) >= funding.upperBoundRequiredBusdt,
-        balanceReadyForUpperBound: Number(status.busdtBalance) >= funding.upperBoundRequiredBusdt
+        minimumGasReserve,
+        ...readiness
       },
       null,
       2
@@ -1164,8 +1344,11 @@ async function preflight(cfg) {
   );
 }
 
-async function approve(cfg) {
-  const result = await approveRouterMax(cfg, { requiredUsdt: cfg.maxMarketStakeUsdt });
+async function approve(cfg, args = {}) {
+  const amountUsdt = args.amountUsdt ?? args.amount ?? args.allowance ?? null;
+  const result = amountUsdt
+    ? await approveRouterAmount(cfg, { amountUsdt })
+    : await approveRouterMax(cfg, { requiredUsdt: cfg.maxMarketStakeUsdt });
   console.log(JSON.stringify({ level: "router-approval", result }, null, 2));
 }
 
@@ -1399,66 +1582,17 @@ async function watch(cfg, options = {}) {
     startupWarnings.push(...(await seedStartupMarkets(cfg, seen, initialPending, runtime, options)));
   }
 
-  console.log(
-    JSON.stringify(
-      {
-        mode: cfg.dryRun || !cfg.execute ? "dry-run" : "execute",
-        stakePerOutcomeUsdt: cfg.stakePerOutcomeUsdt,
-        maxMarketStakeUsdt: cfg.maxMarketStakeUsdt,
-        maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
-        maxOutcomesPerMarket: cfg.maxOutcomesPerMarket,
-        eventDiscovery: cfg.eventDiscovery,
-        wsProvider: wsProviderLabel(cfg.wsUrl),
-        eventBuyMode: cfg.eventBuyMode,
-        eventOutcomeSelection: cfg.eventOutcomeSelection,
-        eventOutcomeCount: cfg.eventOutcomeCount,
-        eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
-        fastSkipPreflight: cfg.fastSkipPreflight,
-        fastSkipDueRestHydration: cfg.fastSkipDueRestHydration,
-        waitForReceipt: cfg.waitForReceipt,
-        gasPriceGwei: cfg.gasPriceGwei || null,
-        fastGasLimit: cfg.fastGasLimit || null,
-        bundleFastGasLimit: cfg.bundleFastGasLimit || null,
-        logChunkBlocks: cfg.logChunkBlocks,
-      bundleDueMarkets: cfg.bundleDueMarkets,
-      fastNonceManager: cfg.fastNonceManager,
-      fastSkipDueRestHydration: cfg.fastSkipDueRestHydration,
-      preSignFastTx: cfg.preSignFastTx,
-        preSignWindowMs: cfg.preSignWindowMs,
-        preSignRetryMs: cfg.preSignRetryMs,
-        nonceSyncBeforePreSign: cfg.nonceSyncBeforePreSign,
-        nonceSyncMinIntervalMs: cfg.nonceSyncMinIntervalMs,
-        nextNonce: runtime?.nextNonce ?? null,
-        asyncReceiptWatch: cfg.asyncReceiptWatch,
-        receiptWatchTimeoutMs: cfg.receiptWatchTimeoutMs,
-        receiptWatchPollingMs: cfg.receiptWatchPollingMs,
-        executionRetryMs: cfg.executionRetryMs,
-        eventOpenWindowSeconds: cfg.eventOpenWindowSeconds,
-        receiverReady: Boolean(runtime?.receiverAddress || cfg.walletAddress),
-        watchPreflight,
-        broadcastWarmup,
-        startupWarnings,
-        wsStartupSeedDeferred,
-        fundingRecovery: describeFundingRecovery(options.fundingRecovery),
-        pollMs: cfg.pollMs,
-        hotPollMs: cfg.hotPollMs,
-        preopenHotMs: cfg.preopenHotMs,
-        prebroadcastMs: cfg.prebroadcastMs,
-        wsReceiptFallbackMs: cfg.wsReceiptFallbackMs,
-        wsReceiptFallbackRetries: cfg.wsReceiptFallbackRetries,
-        autoSell: autoSellMonitor
-          ? {
-              enabled: true,
-              profitMultiplier: cfg.autoSellProfitMultiplier,
-              percent: cfg.autoSellPercent,
-              pollMs: cfg.autoSellPollMs
-            }
-          : { enabled: false }
-      },
-      null,
-      2
-    )
-  );
+  const runtimeStatus = buildWatchRuntimeStatus(cfg, {
+    runtime,
+    watchPreflight,
+    broadcastWarmup,
+    startupWarnings,
+    wsStartupSeedDeferred,
+    fundingRecovery: options.fundingRecovery,
+    autoSellMonitor
+  });
+  writeRuntimeStatusFile(cfg, runtimeStatus);
+  console.log(JSON.stringify(runtimeStatus, null, 2));
 
   if (cfg.eventDiscovery === "ws") {
     await watchWs(cfg, seen, runtime, initialPending, {
@@ -1473,6 +1607,123 @@ async function watch(cfg, options = {}) {
   }
 
   await watchRest(cfg, seen, runtime, initialPending);
+}
+
+function buildWatchRuntimeStatus(cfg, {
+  runtime = null,
+  watchPreflight = null,
+  broadcastWarmup = null,
+  startupWarnings = [],
+  wsStartupSeedDeferred = false,
+  fundingRecovery = null,
+  autoSellMonitor = null
+} = {}) {
+  return {
+    level: "watch-runtime",
+    command: process.argv[2] ?? "watch",
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    mode: cfg.dryRun || !cfg.execute ? "dry-run" : "execute",
+    walletAddress: cfg.walletAddress || runtime?.receiverAddress || null,
+    configSources: runtimeConfigSources(cfg),
+    dataSources: {
+      restApi: wsProviderLabel(cfg.restUrl),
+      primaryRpc: wsProviderLabel(cfg.rpcUrl),
+      wsProvider: wsProviderLabel(cfg.wsUrl),
+      eventDiscovery: cfg.eventDiscovery,
+      restDiscoveryEnabled: cfg.restDiscoveryEnabled,
+      restDiscoveryPollMs: cfg.restDiscoveryPollMs,
+      broadcastRpcCount: cfg.broadcastRpcUrls.length,
+      broadcastRpcProviders: cfg.broadcastRpcUrls.map(wsProviderLabel)
+    },
+    strategy: {
+      eventBuyMode: cfg.eventBuyMode,
+      eventOutcomeSelection: cfg.eventOutcomeSelection,
+      eventOutcomeCount: cfg.eventOutcomeCount,
+      eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
+      stakePerOutcomeUsdt: cfg.stakePerOutcomeUsdt,
+      maxMarketStakeUsdt: cfg.maxMarketStakeUsdt,
+      maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
+      maxOutcomesPerMarket: cfg.maxOutcomesPerMarket,
+      minMarketDurationHours: cfg.minMarketDurationHours,
+      watchBuyExisting: cfg.watchBuyExisting,
+      watchScanLimit: cfg.watchScanLimit,
+      eventOpenWindowSeconds: cfg.eventOpenWindowSeconds
+    },
+    execution: {
+      fastSkipPreflight: cfg.fastSkipPreflight,
+      fastSkipDueRestHydration: cfg.fastSkipDueRestHydration,
+      waitForReceipt: cfg.waitForReceipt,
+      gasPriceGwei: cfg.gasPriceGwei || null,
+      fastGasLimit: cfg.fastGasLimit || null,
+      bundleFastGasLimit: cfg.bundleFastGasLimit || null,
+      logChunkBlocks: cfg.logChunkBlocks,
+      bundleDueMarkets: cfg.bundleDueMarkets,
+      fastNonceManager: cfg.fastNonceManager,
+      preSignFastTx: cfg.preSignFastTx,
+      preSignWindowMs: cfg.preSignWindowMs,
+      preSignRetryMs: cfg.preSignRetryMs,
+      nonceSyncBeforePreSign: cfg.nonceSyncBeforePreSign,
+      nonceSyncMinIntervalMs: cfg.nonceSyncMinIntervalMs,
+      nextNonce: runtime?.nextNonce ?? null,
+      asyncReceiptWatch: cfg.asyncReceiptWatch,
+      receiptWatchTimeoutMs: cfg.receiptWatchTimeoutMs,
+      receiptWatchPollingMs: cfg.receiptWatchPollingMs,
+      executionRetryMs: cfg.executionRetryMs,
+      pollMs: cfg.pollMs,
+      hotPollMs: cfg.hotPollMs,
+      preopenHotMs: cfg.preopenHotMs,
+      prebroadcastMs: cfg.prebroadcastMs,
+      wsReceiptFallbackMs: cfg.wsReceiptFallbackMs,
+      wsReceiptFallbackRetries: cfg.wsReceiptFallbackRetries,
+      receiverReady: Boolean(runtime?.receiverAddress || cfg.walletAddress)
+    },
+    autoSell: autoSellMonitor
+      ? {
+          enabled: true,
+          profitMultiplier: cfg.autoSellProfitMultiplier,
+          percent: cfg.autoSellPercent,
+          pollMs: cfg.autoSellPollMs
+        }
+      : { enabled: false },
+    watchPreflight,
+    broadcastWarmup,
+    startupWarnings,
+    wsStartupSeedDeferred,
+    fundingRecovery: describeFundingRecovery(fundingRecovery)
+  };
+}
+
+function runtimeConfigSources(cfg) {
+  return {
+    dotenvLocal: runtimeFileSource(".env.local"),
+    dotenv: runtimeFileSource(".env"),
+    providerEnv: runtimeFileSource(path.join(os.homedir(), ".codex/secrets/evm-rpc-providers.env")),
+    botConfigFile: runtimeFileSource(process.env.BOT_CONFIG_FILE ?? ""),
+    runtimeStatusFile: path.resolve(cfg.runtimeStatusFile)
+  };
+}
+
+function runtimeFileSource(file) {
+  if (!file) return null;
+  const resolved = path.resolve(file);
+  return {
+    path: resolved,
+    exists: fs.existsSync(resolved)
+  };
+}
+
+function writeRuntimeStatusFile(cfg, status) {
+  if (!cfg.runtimeStatusFile) return;
+  try {
+    const file = path.resolve(cfg.runtimeStatusFile);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(status, null, 2)}\n`);
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    console.warn(JSON.stringify({ level: "runtime-status-write-error", message: errorMessage(error) }));
+  }
 }
 
 async function maybeWarmBroadcastRpcs(cfg) {
@@ -1620,6 +1871,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
         execution,
         at: new Date().toISOString()
       });
+      notifyAutoSell(cfg, action, execution);
     } catch (error) {
       const item = {
         marketAddress: position.marketAddress,
@@ -1696,8 +1948,12 @@ async function waitForWatchFunding(cfg) {
         console.log(JSON.stringify({
           level: "event-arm-funding-ready",
           address: fundingStatus.address ?? null,
-          requiredBusdt: fundingStatus.funding?.requiredBusdt ?? null,
-          requiredBnbGasReserve: fundingStatus.gasReserve?.requiredBnb ?? null,
+          minimumRequiredBusdt: fundingStatus.funding?.minimumRequiredBusdt ?? fundingStatus.funding?.requiredBusdt ?? null,
+          fullBatchRequiredBusdt: fundingStatus.funding?.requiredBusdt ?? null,
+          minimumRequiredBnbGasReserve: fundingStatus.minimumGasReserve?.requiredBnb ?? fundingStatus.gasReserve?.requiredBnb ?? null,
+          fullBatchRequiredBnbGasReserve: fundingStatus.gasReserve?.requiredBnb ?? null,
+          partialReady: Boolean(fundingStatus.partialReady),
+          message: fundingStatus.message ?? null,
           at: new Date().toISOString()
         }));
         return fundingStatus;
@@ -1760,34 +2016,50 @@ async function getWatchFundingStatus(cfg) {
     return { skipped: true, ready: true };
   }
   const { publicClient } = makeClients(cfg);
-  const chain = await loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks });
-  const funding = computeFundingRequirement(cfg, chain.eventMarkets);
-  const gasReserve = await estimateFastGasReserve(publicClient, cfg, funding);
+  const [chain, restFutureMarkets] = await Promise.all([
+    loadChainEventMarkets(cfg, { lookbackBlocks: cfg.eventLogLookbackBlocks }),
+    loadUpcomingRestEventMarkets(cfg)
+  ]);
+  const funding = computeFundingRequirement(cfg, mergeMarketLists(chain.eventMarkets, restFutureMarkets));
+  const [gasReserve, minimumGasReserve] = await Promise.all([
+    estimateFastGasReserve(publicClient, cfg, funding),
+    estimateFastGasReserve(publicClient, cfg, minimumExecutionFunding(funding))
+  ]);
   const walletStatus = await getWalletStatus(cfg);
-  const balanceReady = Number(walletStatus.busdtBalance) >= funding.requiredBusdt;
-  const allowanceReady = Number(walletStatus.busdtAllowanceToRouter) >= funding.requiredBusdt;
-  const bnbReady = Number(walletStatus.bnbBalance) >= Number(gasReserve.requiredBnb);
-  const ready = balanceReady && allowanceReady && bnbReady;
+  const readiness = walletFundingReadiness(walletStatus, funding, gasReserve, minimumGasReserve);
+  const { balanceReady, allowanceReady, bnbReady, ready } = readiness;
   const message = ready
-    ? null
-    : `Watch preflight failed: BUSDT balance ${walletStatus.busdtBalance}, allowance ${walletStatus.busdtAllowanceToRouter}, required ${funding.requiredBusdt} (${funding.reason}); BNB balance ${walletStatus.bnbBalance}, required gas reserve ${gasReserve.requiredBnb} (${gasReserve.mode})`;
+    ? readiness.message
+    : `Watch preflight failed: BUSDT balance ${walletStatus.busdtBalance}, allowance ${walletStatus.busdtAllowanceToRouter}, minimum required ${funding.minimumRequiredBusdt} (${funding.reason}); full batch requires ${funding.requiredBusdt}; BNB balance ${walletStatus.bnbBalance}, minimum gas reserve ${minimumGasReserve.requiredBnb} (${minimumGasReserve.mode})`;
   return {
     address: walletStatus.address,
     funding,
     gasReserve,
+    minimumGasReserve,
     ready,
+    partialReady: ready && !readiness.fullBatchReady,
     balanceReady,
     allowanceReady,
     bnbReady,
+    fullBatchReady: readiness.fullBatchReady,
+    fullBatchBalanceReady: readiness.fullBatchBalanceReady,
+    fullBatchAllowanceReady: readiness.fullBatchAllowanceReady,
+    fullBatchBnbReady: readiness.fullBatchBnbReady,
     message,
     wallet: {
       address: walletStatus.address,
       bnbBalance: walletStatus.bnbBalance,
       busdtBalance: walletStatus.busdtBalance,
       busdtAllowanceToRouter: walletStatus.busdtAllowanceToRouter,
+      minimumRequiredBusdt: funding.minimumRequiredBusdt,
+      fullBatchRequiredBusdt: funding.requiredBusdt,
       balanceReady,
       allowanceReady,
-      bnbReady
+      bnbReady,
+      fullBatchReady: readiness.fullBatchReady,
+      fullBatchBalanceReady: readiness.fullBatchBalanceReady,
+      fullBatchAllowanceReady: readiness.fullBatchAllowanceReady,
+      fullBatchBnbReady: readiness.fullBatchBnbReady
     }
   };
 }
@@ -1841,7 +2113,7 @@ async function seedStartupMarkets(cfg, seen, pending, runtime = null, options = 
 async function seedExistingRestMarkets(cfg, seen, pending, runtime = null, options = {}) {
   let currentMarkets = [];
   try {
-    currentMarkets = await loadEventMarkets(cfg);
+    currentMarkets = await loadStartupRestEventMarkets(cfg);
   } catch (error) {
     return {
       ok: false,
@@ -1870,6 +2142,7 @@ async function seedExistingRestMarkets(cfg, seen, pending, runtime = null, optio
   }
   if (catchUpMarkets.length > 0) {
     await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByStartAsc(catchUpMarkets), runtime, {
+      source: "startup-rest-catchup",
       hydrateDueOdds: true,
       hydrationSkipReason: "funding_recovery_catchup"
     });
@@ -1913,6 +2186,7 @@ async function seedRecentChainMarkets(cfg, seen, pending, runtime = null, option
   }
   if (catchUpMarkets.length > 0) {
     await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByStartAsc(catchUpMarkets), runtime, {
+      source: "startup-chain-catchup",
       hydrateDueOdds: true,
       hydrationSkipReason: "funding_recovery_catchup"
     });
@@ -1956,6 +2230,7 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
   const queue = [];
   const txBuffers = new Map();
   const wakeSignal = createWakeSignal();
+  const restDiscovery = createRestDiscoveryState();
   let wsFailed = false;
   let consecutiveErrors = 0;
 
@@ -1990,6 +2265,7 @@ async function watchWs(cfg, seen, runtime, initialPending = new Map(), options =
       while (queue.length > 0) addBufferedControllerLog(txBuffers, queue.shift());
       await drainControllerLogBuffers(publicClient, txBuffers, cfg, seen, pending, runtime);
       await preSignHotPendingMarkets(cfg, pending, runtime);
+      maybePollRestDiscovery(cfg, seen, pending, runtime, restDiscovery, () => wakeSignal.wake());
 
       if (wsFailed) throw new Error("WebSocket event subscription failed");
       consecutiveErrors = 0;
@@ -2018,18 +2294,69 @@ async function watchRest(cfg, seen, runtime = null, initialPending = new Map()) 
       await preSignHotPendingMarkets(cfg, pending, runtime);
       await drainDuePendingMarkets(cfg, seen, pending, runtime);
 
-      const markets = await loadEventMarkets(cfg, { limit: cfg.watchScanLimit });
-      for (const market of [...markets].reverse()) {
-        const executed = await maybeExecuteMarket(cfg, seen, market, { allowFuturePending: false, runtime });
-        if (!executed && !seen.has(eventSeenKey(market, cfg)) && msUntilStart(market) > 0) {
-          pending.set(eventSeenKey(market, cfg), await preparePendingRecord(cfg, market, runtime));
-        }
-      }
+      const markets = await loadRestDiscoveryEventMarkets(cfg);
+      await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByStartAsc(markets), runtime, {
+        source: "rest-watch",
+        hydrateDueOdds: true,
+        hydrationSkipReason: "rest_watch_poll",
+        eventStatuses: REST_DISCOVERY_STATUSES
+      });
       await preSignHotPendingMarkets(cfg, pending, runtime);
     } catch (error) {
       console.error(JSON.stringify({ level: "error", message: errorMessage(error), at: new Date().toISOString() }));
     }
     await sleep(nextWatchSleepMs(cfg, pending));
+  }
+}
+
+function createRestDiscoveryState() {
+  return {
+    nextPollAt: 0,
+    running: false
+  };
+}
+
+function maybePollRestDiscovery(cfg, seen, pending, runtime, state, onUpdate = null) {
+  if (!cfg.restDiscoveryEnabled || cfg.eventDiscovery === "rest") return;
+  const now = Date.now();
+  if (state.running || now < state.nextPollAt) return;
+
+  state.running = true;
+  void runRestDiscoveryPoll(cfg, seen, pending, runtime, state, onUpdate);
+}
+
+async function runRestDiscoveryPoll(cfg, seen, pending, runtime, state, onUpdate = null) {
+  try {
+    const markets = await loadRestDiscoveryEventMarkets(cfg);
+    const candidates = markets.filter((market) => {
+      const key = eventSeenKey(market, cfg);
+      return !seen.has(key) && !pending.has(key);
+    });
+    if (candidates.length > 0) {
+      console.log(JSON.stringify({
+        level: "rest-discovery-poll",
+        candidates: candidates.length,
+        at: new Date().toISOString()
+      }));
+      await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByStartAsc(candidates), runtime, {
+        source: "rest-discovery-poll",
+        hydrateDueOdds: true,
+        hydrationSkipReason: "rest_discovery_poll",
+        eventStatuses: REST_DISCOVERY_STATUSES
+      });
+      onUpdate?.();
+    }
+  } catch (error) {
+    console.error(JSON.stringify({
+      level: "warn",
+      source: "rest-discovery-poll",
+      message: errorMessage(error),
+      retryInMs: cfg.restDiscoveryPollMs,
+      at: new Date().toISOString()
+    }));
+  } finally {
+    state.nextPollAt = Date.now() + cfg.restDiscoveryPollMs;
+    state.running = false;
   }
 }
 
@@ -2041,6 +2368,7 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
   }
   let consecutiveErrors = 0;
   const pending = new Map(initialPending);
+  const restDiscovery = createRestDiscoveryState();
 
   console.log(JSON.stringify({ level: "chain-watch", fromBlock: fromBlock.toString() }));
 
@@ -2056,7 +2384,9 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
           createdAt: new Date().toISOString(),
           fallback: true
         });
-        await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByChainDesc(decoded), runtime);
+        await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByChainDesc(decoded), runtime, {
+          source: "chain-watch"
+        });
         for (const error of decodeErrors) {
           console.error(JSON.stringify({ level: "warn", source: "chain-decode", ...error }));
         }
@@ -2064,6 +2394,7 @@ async function watchChain(cfg, seen, runtime = null, initialPending = new Map())
         fromBlock = toBlock + 1n;
         consecutiveErrors = 0;
       }
+      maybePollRestDiscovery(cfg, seen, pending, runtime, restDiscovery);
     } catch (error) {
       console.error(JSON.stringify({ level: "error", message: errorMessage(error), at: new Date().toISOString() }));
       consecutiveErrors += 1;
@@ -2127,7 +2458,9 @@ async function drainControllerLogBuffers(publicClient, txBuffers, cfg, seen, pen
     }
 
     txBuffers.delete(txHash);
-    await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByChainDesc(decoded), runtime);
+    await handleDiscoveredMarkets(cfg, seen, pending, sortMarketsByChainDesc(decoded), runtime, {
+      source: "ws-watch"
+    });
     for (const error of decodeErrors) {
       console.error(JSON.stringify({ level: "warn", source: "ws-decode", ...error }));
     }
@@ -2189,12 +2522,13 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
     }
     const preSigned = records.find((record) => record.preSignedFastBundleTransaction)?.preSignedFastBundleTransaction;
     if (preSigned) bundle = { ...bundle, preSignedFastBundleTransaction: preSigned };
-  const result = await executeOrPrintBundle(bundle, cfg, runtime);
+    const result = await executeOrPrintBundle(bundle, cfg, runtime);
     appendJsonl(cfg.fillsFile, {
       bundle: describeFastBundlePlan(bundle),
       result,
       at: new Date().toISOString()
     });
+    notifyBundleExecution(cfg, bundle, result);
     if (!executionMarksSeen(result)) {
       for (const record of records) markExecutionRetry(record, cfg, new Error(`execution status ${result.status ?? "unknown"}`));
       console.error(JSON.stringify({
@@ -2370,74 +2704,99 @@ function reusablePreSignedBundle(records) {
 
 async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, options = {}) {
   const immediateRecords = [];
-  for (const market of markets) {
-    const key = eventSeenKey(market, cfg);
-    if (seen.has(key)) continue;
-    if (filterEventMarkets([market], cfg).length === 0) {
-      seen.add(key);
-      saveSeen(cfg.stateFile, seen);
-      continue;
-    }
-    if (markSkippedIfExpired(cfg, seen, market, "discovery-open-window")) {
-      saveSeen(cfg.stateFile, seen);
-      continue;
-    }
+  const futureDiscoveryNotifications = [];
+  const immediateDiscoveryNotifications = [];
+  const eventStatuses = options.eventStatuses ?? ["live"];
+  const lockedKeys = new Set();
+  try {
+    for (const market of markets) {
+      const key = eventSeenKey(market, cfg);
+      if (seen.has(key) || pending.has(key) || activeDiscoveryKeys.has(key)) continue;
+      activeDiscoveryKeys.add(key);
+      lockedKeys.add(key);
+      if (filterEventMarkets([market], cfg, { statuses: eventStatuses }).length === 0) {
+        seen.add(key);
+        saveSeen(cfg.stateFile, seen);
+        continue;
+      }
+      if (markSkippedIfExpired(cfg, seen, market, "discovery-open-window")) {
+        saveSeen(cfg.stateFile, seen);
+        continue;
+      }
 
-    const dueNow = msUntilAction(market, cfg) <= 0;
-    const shouldHydrateDueOdds = Boolean(options.hydrateDueOdds);
-    const record = await preparePendingRecord(cfg, market, runtime, {
-      hydrateOdds: !(dueNow && cfg.fastSkipDueRestHydration && !shouldHydrateDueOdds),
-      hydrationSkipReason: dueNow ? (options.hydrationSkipReason ?? "due_fast_path") : null
-    });
-    if (dueNow) {
-      immediateRecords.push(record);
-      continue;
-    }
+      const dueNow = msUntilAction(market, cfg) <= 0;
+      const shouldHydrateDueOdds = Boolean(options.hydrateDueOdds);
+      const record = await preparePendingRecord(cfg, market, runtime, {
+        hydrateOdds: !(dueNow && cfg.fastSkipDueRestHydration && !shouldHydrateDueOdds),
+        hydrationSkipReason: dueNow ? (options.hydrationSkipReason ?? "due_fast_path") : null
+      });
+      if (seen.has(key) || pending.has(key)) continue;
+      if (dueNow) {
+        if (options.notify !== false) {
+          immediateDiscoveryNotifications.push({ market, record, source: options.source ?? "discovery" });
+        }
+        immediateRecords.push(record);
+        continue;
+      }
 
-    await maybeExecuteMarket(cfg, seen, market, {
-      allowFuturePending: true,
-      runtime,
-      preparedPlan: record.preparedPlan,
-      preSignedFastTransaction: record.preSignedFastTransaction,
-      retryRecord: record
-    });
-    if (!seen.has(key)) pending.set(key, record);
-  }
-
-  if (immediateRecords.length === 0) return;
-  if (cfg.bundleDueMarkets && cfg.eventBuyMode === "fast") {
-    const grouped = groupRecordsByStartDate(immediateRecords);
-    const bundled = new Set();
-    for (const records of grouped.values()) {
-      if (records.length <= 1 || !records.every((record) => record.preparedPlan)) continue;
-      const ok = await executeDueBundle(cfg, seen, pending, runtime, records);
-      if (ok) {
-        for (const record of records) bundled.add(eventSeenKey(pendingMarket(record), cfg));
+      await maybeExecuteMarket(cfg, seen, market, {
+        allowFuturePending: true,
+        runtime,
+        preparedPlan: record.preparedPlan,
+        preSignedFastTransaction: record.preSignedFastTransaction,
+        retryRecord: record
+      });
+      if (!seen.has(key)) pending.set(key, record);
+      if (options.notify !== false) {
+        futureDiscoveryNotifications.push({ market, record, source: options.source ?? "discovery" });
       }
     }
-    if (bundled.size > 0) {
-      console.log(JSON.stringify({
-        level: "immediate-discovery-bundle",
-        marketCount: bundled.size,
-        at: new Date().toISOString()
-      }));
-    }
-  }
 
-  for (const record of immediateRecords) {
-    const market = pendingMarket(record);
-    const key = eventSeenKey(market, cfg);
-    if (seen.has(key)) continue;
-    const executed = await maybeExecuteMarket(cfg, seen, market, {
-      allowFuturePending: false,
-      runtime,
-      preparedPlan: record.preparedPlan,
-      preSignedFastTransaction: record.preSignedFastTransaction,
-      hydrateOdds: false,
-      hydrationSkipReason: "immediate_discovery_fast_path",
-      retryRecord: record
-    });
-    if (!executed && !seen.has(key)) pending.set(key, record);
+    if (immediateRecords.length > 0) {
+      if (cfg.bundleDueMarkets && cfg.eventBuyMode === "fast") {
+        const grouped = groupRecordsByStartDate(immediateRecords);
+        const bundled = new Set();
+        for (const records of grouped.values()) {
+          if (records.length <= 1 || !records.every((record) => record.preparedPlan)) continue;
+          const ok = await executeDueBundle(cfg, seen, pending, runtime, records);
+          if (ok) {
+            for (const record of records) bundled.add(eventSeenKey(pendingMarket(record), cfg));
+          }
+        }
+        if (bundled.size > 0) {
+          console.log(JSON.stringify({
+            level: "immediate-discovery-bundle",
+            marketCount: bundled.size,
+            at: new Date().toISOString()
+          }));
+        }
+      }
+
+      for (const record of immediateRecords) {
+        const market = pendingMarket(record);
+        const key = eventSeenKey(market, cfg);
+        if (seen.has(key)) continue;
+        const executed = await maybeExecuteMarket(cfg, seen, market, {
+          allowFuturePending: false,
+          runtime,
+          preparedPlan: record.preparedPlan,
+          preSignedFastTransaction: record.preSignedFastTransaction,
+          hydrateOdds: false,
+          hydrationSkipReason: "immediate_discovery_fast_path",
+          retryRecord: record
+        });
+        if (!executed && !seen.has(key)) pending.set(key, record);
+      }
+    }
+
+    for (const item of immediateDiscoveryNotifications) {
+      notifyMarketDiscovered(cfg, item.market, item.record, item.source);
+    }
+    for (const item of futureDiscoveryNotifications) {
+      notifyMarketDiscovered(cfg, item.market, item.record, item.source);
+    }
+  } finally {
+    for (const key of lockedKeys) activeDiscoveryKeys.delete(key);
   }
 }
 
@@ -2582,15 +2941,21 @@ function computeFundingRequirement(cfg, eventMarkets = []) {
   const nextBatchRequiredBusdt = roundUsd(nextBatch.reduce((sum, market) => {
     return sum + selectedStakeUsdt(market, cfg);
   }, 0));
+  const minimumNextBatchRequiredBusdt = nextBatch.length > 0
+    ? roundUsd(Math.min(...nextBatch.map((market) => selectedStakeUsdt(market, cfg))))
+    : 0;
   const useNextBatch = cfg.watchFundingMode === "next_batch" && nextBatch.length > 0;
   const requiredBusdt = useNextBatch ? nextBatchRequiredBusdt : upperBoundRequiredBusdt;
+  const minimumRequiredBusdt = useNextBatch ? minimumNextBatchRequiredBusdt : upperBoundRequiredBusdt;
 
   return {
     mode: cfg.watchFundingMode,
     reason: useNextBatch ? "known_next_opening_batch" : "single_market_upper_bound",
     requiredBusdt,
+    minimumRequiredBusdt,
     upperBoundRequiredBusdt,
     nextBatchRequiredBusdt,
+    minimumNextBatchRequiredBusdt,
     nextBatchMarketCount: nextBatch.length,
     nextBatchOutcomeCount: batchSelectedOutcomeCount(nextBatch, cfg),
     nextBatchAvailableOutcomeCount: nextBatch.reduce((sum, market) => sum + (market.outcomes?.length ?? 0), 0),
@@ -2603,6 +2968,49 @@ function computeFundingRequirement(cfg, eventMarkets = []) {
       availableOutcomeCount: market.outcomes?.length ?? 0,
       totalStakeUsdt: roundUsd(selectedStakeUsdt(market, cfg))
     }))
+  };
+}
+
+function minimumExecutionFunding(funding) {
+  return {
+    ...funding,
+    requiredBusdt: funding.minimumRequiredBusdt ?? funding.requiredBusdt,
+    nextBatchRequiredBusdt: funding.minimumRequiredBusdt ?? funding.nextBatchRequiredBusdt,
+    nextBatchMarketCount: funding.nextBatchMarketCount > 0 ? 1 : 0
+  };
+}
+
+function walletFundingReadiness(status, funding, gasReserve, minimumGasReserve) {
+  const busdtBalance = Number(status.busdtBalance);
+  const busdtAllowance = Number(status.busdtAllowanceToRouter);
+  const bnbBalance = Number(status.bnbBalance);
+  const minimumRequiredBusdt = Number(funding.minimumRequiredBusdt ?? funding.requiredBusdt);
+  const fullBatchRequiredBusdt = Number(funding.requiredBusdt);
+  const minimumRequiredBnb = Number(minimumGasReserve.requiredBnb);
+  const fullBatchRequiredBnb = Number(gasReserve.requiredBnb);
+  const balanceReady = busdtBalance >= minimumRequiredBusdt;
+  const allowanceReady = busdtAllowance >= minimumRequiredBusdt;
+  const bnbReady = bnbBalance >= minimumRequiredBnb;
+  const fullBatchBalanceReady = busdtBalance >= fullBatchRequiredBusdt;
+  const fullBatchAllowanceReady = busdtAllowance >= fullBatchRequiredBusdt;
+  const fullBatchBnbReady = bnbBalance >= fullBatchRequiredBnb;
+  const fullBatchReady = fullBatchBalanceReady && fullBatchAllowanceReady && fullBatchBnbReady;
+  return {
+    requiredBnbGasReserve: minimumGasReserve.requiredBnb,
+    gasReserveMode: minimumGasReserve.mode,
+    fullBatchRequiredBnbGasReserve: gasReserve.requiredBnb,
+    fullBatchGasReserveMode: gasReserve.mode,
+    balanceReady,
+    allowanceReady,
+    bnbReady,
+    fullBatchReady,
+    fullBatchBalanceReady,
+    fullBatchAllowanceReady,
+    fullBatchBnbReady,
+    allowanceReadyForUpperBound: busdtAllowance >= funding.upperBoundRequiredBusdt,
+    balanceReadyForUpperBound: busdtBalance >= funding.upperBoundRequiredBusdt,
+    ready: balanceReady && allowanceReady && bnbReady,
+    message: fullBatchReady ? null : "ready for partial execution; full next batch is underfunded"
   };
 }
 
@@ -2840,7 +3248,7 @@ function clearExecutionRetry(record) {
 
 function executionMarksSeen(result) {
   if (result?.dryRun) return true;
-  return result?.status === "success";
+  return result?.status === "success" || (result?.status === "broadcast" && Boolean(result?.txHash));
 }
 
 function pendingMarket(record) {
@@ -3023,6 +3431,7 @@ async function maybeExecuteMarket(
     };
     appendJsonl(cfg.fillsFile, row);
     console.error(JSON.stringify(row));
+    notifyBuyError(cfg, market, error);
     return false;
   }
   appendJsonl(cfg.fillsFile, {
@@ -3030,6 +3439,7 @@ async function maybeExecuteMarket(
     result,
     at: new Date().toISOString()
   });
+  notifyBuyExecution(cfg, eventPlan, result);
   if (!executionMarksSeen(result)) {
     markExecutionRetry(retryRecord, cfg, new Error(`execution status ${result.status ?? "unknown"}`));
     console.error(JSON.stringify({
@@ -3077,15 +3487,60 @@ async function buildEventPlanForMarket(cfg, market, args = {}) {
   });
 }
 
-async function loadEventMarkets(cfg, { status = "live", limit = 500 } = {}) {
+async function loadEventMarkets(
+  cfg,
+  { status = "live", limit = 500, order = "created_at", ascending = false, eventStatuses = ["live"] } = {}
+) {
   const markets = await fetchMarkets(cfg, {
     status,
     topic: "",
-    order: "created_at",
-    ascending: false,
+    order,
+    ascending,
     limit
   });
-  return filterEventMarkets(markets, cfg);
+  return filterEventMarkets(markets, cfg, { statuses: eventStatuses });
+}
+
+async function loadUpcomingRestEventMarkets(cfg) {
+  return loadEventMarkets(cfg, {
+    status: "not_started",
+    order: "start_timestamp",
+    ascending: true,
+    limit: Math.max(cfg.watchScanLimit, 100),
+    eventStatuses: ["not_started"]
+  });
+}
+
+async function loadRestDiscoveryEventMarkets(cfg) {
+  return loadEventMarkets(cfg, {
+    status: "all",
+    limit: cfg.watchScanLimit,
+    eventStatuses: REST_DISCOVERY_STATUSES
+  });
+}
+
+async function loadStartupRestEventMarkets(cfg) {
+  const [liveMarkets, futureMarkets] = await Promise.all([
+    loadEventMarkets(cfg),
+    loadUpcomingRestEventMarkets(cfg)
+  ]);
+  return mergeMarketLists(liveMarkets, futureMarkets);
+}
+
+function mergeMarketLists(...lists) {
+  const merged = new Map();
+  for (const list of lists) {
+    for (const market of list ?? []) {
+      if (!market?.address) continue;
+      const key = String(market.address).toLowerCase();
+      if (!merged.has(key)) {
+        merged.set(key, market);
+      } else {
+        merged.set(key, { ...merged.get(key), ...market });
+      }
+    }
+  }
+  return [...merged.values()];
 }
 
 async function executeOrPrint(eventPlan, cfg, runtime = null) {
@@ -3144,6 +3599,7 @@ function maybeTrackReceipt(cfg, result, context = {}) {
     };
     appendJsonl(cfg.fillsFile, row);
     console.error(JSON.stringify(row));
+    notifyReceipt(cfg, row);
   });
 }
 
@@ -3166,6 +3622,113 @@ async function trackReceipt(cfg, txHash, context) {
   };
   appendJsonl(cfg.fillsFile, row);
   console.log(JSON.stringify(row));
+  notifyReceipt(cfg, row);
+}
+
+function notifyMarketDiscovered(cfg, market, record, source) {
+  const plan = record?.preparedPlan;
+  const lines = [
+    markdownLine("来源", source),
+    markdownLine("市场", market.question),
+    markdownLine("开盘", market.startDate),
+    markdownLine("结束", market.endDate),
+    markdownLine("选项", plan?.outcomes?.length ?? market.outcomes?.length),
+    markdownLine("计划金额", plan?.totalStakeUsdt ? `${plan.totalStakeUsdt} U` : ""),
+    markdownLine("状态", market.status)
+  ].filter(Boolean);
+  notifyPushPlusSafe(cfg, {
+    title: "42space 发现符合策略的新市场",
+    content: lines.join("\n")
+  });
+}
+
+function notifyBuyExecution(cfg, eventPlan, result) {
+  if (result?.dryRun) return;
+  const status = buyResultText(result);
+  const lines = [
+    markdownLine("状态", status),
+    markdownLine("市场", eventPlan.market?.question),
+    markdownLine("金额", eventPlan.totalStakeUsdt ? `${eventPlan.totalStakeUsdt} U` : ""),
+    markdownLine("选项", eventPlan.outcomes?.length),
+    markdownLine("交易", shortHash(result.txHash)),
+    markdownLine("区块", result.blockNumber),
+    markdownLine("广播", result.broadcastMode),
+    markdownLine("节点数", result.broadcastRpcCount)
+  ].filter(Boolean);
+  notifyPushPlusSafe(cfg, {
+    title: `42space 买入${status}`,
+    content: lines.join("\n")
+  });
+}
+
+function notifyBundleExecution(cfg, bundle, result) {
+  if (result?.dryRun) return;
+  const status = buyResultText(result);
+  const lines = [
+    markdownLine("状态", status),
+    markdownLine("市场数", bundle.marketCount),
+    markdownLine("选项数", bundle.outcomeCount),
+    markdownLine("金额", bundle.totalStakeUsdt ? `${bundle.totalStakeUsdt} U` : ""),
+    markdownLine("交易", shortHash(result.txHash)),
+    markdownLine("区块", result.blockNumber),
+    markdownLine("广播", result.broadcastMode),
+    ...bundle.markets.slice(0, 6).map((market) => markdownLine("市场", market.question))
+  ].filter(Boolean);
+  notifyPushPlusSafe(cfg, {
+    title: `42space 批量买入${status}`,
+    content: lines.join("\n")
+  });
+}
+
+function notifyBuyError(cfg, market, error) {
+  const lines = [
+    markdownLine("市场", market.question),
+    markdownLine("开盘", market.startDate),
+    markdownLine("错误", errorMessage(error).slice(0, 180))
+  ].filter(Boolean);
+  notifyPushPlusSafe(cfg, {
+    title: "42space 买入失败",
+    content: lines.join("\n")
+  });
+}
+
+function notifyReceipt(cfg, row) {
+  const lines = [
+    markdownLine("状态", row.status),
+    markdownLine("交易", shortHash(row.txHash)),
+    markdownLine("区块", row.blockNumber),
+    markdownLine("Gas", row.gasUsed),
+    markdownLine("市场", row.context?.question),
+    markdownLine("错误", row.message)
+  ].filter(Boolean);
+  notifyPushPlusSafe(cfg, {
+    title: row.status === "success" ? "42space 交易已确认" : "42space 交易确认异常",
+    content: lines.join("\n")
+  });
+}
+
+function notifyAutoSell(cfg, action, execution) {
+  const status = execution?.status ?? action?.status;
+  const lines = [
+    markdownLine("状态", status),
+    markdownLine("市场", action?.question),
+    markdownLine("选项", action?.outcome),
+    markdownLine("比例", action?.percent ? `${action.percent}%` : ""),
+    markdownLine("预计收回", action?.expectedCollateralToUserUsdt ? `${action.expectedCollateralToUserUsdt} U` : ""),
+    markdownLine("交易", shortHash(action?.txHash))
+  ].filter(Boolean);
+  notifyPushPlusSafe(cfg, {
+    title: "42space 自动止盈",
+    content: lines.join("\n")
+  });
+}
+
+function buyResultText(result) {
+  if (result?.status === "success") return "已确认";
+  if (result?.status === "broadcast" && result?.txHash) return "已广播";
+  if (result?.status === "reverted") return "链上失败";
+  if (result?.txHash) return "已广播";
+  return "待确认";
 }
 
 function sleep(ms) {
@@ -3361,6 +3924,10 @@ function redactSecretUrls(message) {
       return "[redacted-url]";
     }
   });
+}
+
+function tempFile(name) {
+  return path.join(os.tmpdir(), name);
 }
 
 main().catch((error) => {

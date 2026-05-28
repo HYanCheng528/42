@@ -1,0 +1,3 @@
+# Allow the dashboard to restart only the event watcher service.
+Defaults:42space !requiretty
+42space ALL=(root) NOPASSWD: /usr/bin/systemctl restart 42space-event-arm.service

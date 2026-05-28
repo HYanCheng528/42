@@ -9,6 +9,22 @@ npm install
 cp .env.example .env
 ```
 
+Windows PowerShell 下可以用 `Copy-Item .env.example .env` 创建配置文件；临时环境变量不要写成 `FOO=1 npm run ...`，改用 `.env` / `.env.local`，或者先执行 `$env:FOO="1"` 再运行 `npm run ...`。
+
+Windows 无人值守不建议把明文私钥写进 `.env`。可以用当前 Windows 用户的 DPAPI 加密保存，密文文件默认放在已被 `.gitignore` 忽略的 `data/private-key.dpapi`：
+
+```powershell
+New-Item -ItemType Directory -Force data | Out-Null
+$pk = Read-Host "PRIVATE_KEY" -AsSecureString
+$pk | ConvertFrom-SecureString | Set-Content -Encoding ASCII data\private-key.dpapi
+```
+
+之后保持 `.env.local` 里 `PRIVATE_KEY=` 为空，并设置 `WINDOWS_DPAPI_PRIVATE_KEY_FILE=data/private-key.dpapi`。这个文件通常只能由同一台机器上的同一个 Windows 用户解密。
+
+Linux VPS 部署推荐使用小额热钱包、root-owned 环境文件和 systemd 守护进程，模板见 `docs/linux-vps.md`。
+
+Dashboard 可以设置 `DASHBOARD_PASSWORD` 开启服务端登录保护；输错密码会跳转到 `DASHBOARD_AUTH_FAIL_REDIRECT`。公开到公网时仍建议放在 Cloudflare Access、VPN 或 SSH tunnel 后面。
+
 ## 常用命令
 
 ```bash

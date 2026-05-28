@@ -1,8 +1,14 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 export function loadDotEnv(file = ".env") {
+  loadDotEnvFile(file, { override: false });
+}
+
+export function loadDotEnvFile(file = ".env", { override = false } = {}) {
+  if (!file) return;
   if (!fs.existsSync(file)) return;
 
   const text = fs.readFileSync(file, "utf8");
@@ -20,7 +26,7 @@ export function loadDotEnv(file = ".env") {
     ) {
       value = value.slice(1, -1);
     }
-    if (process.env[key] === undefined) process.env[key] = value;
+    if (override || process.env[key] === undefined) process.env[key] = value;
   }
 }
 
@@ -28,6 +34,7 @@ export function readConfig() {
   loadDotEnv(".env.local");
   loadDotEnv();
   loadProviderEnv();
+  loadBotConfigEnv();
 
   const cfg = {
     restUrl: envString("FORTYTWO_REST_URL", "https://rest.ft.42.space"),
@@ -39,7 +46,7 @@ export function readConfig() {
       ["BSC_WS_URL", "CHAINSTACK_BSC_WS_URL", "ANKR_BSC_WS_URL", "ANKR_BSC_WS_RPC_URL"],
       "wss://bsc-rpc.publicnode.com"
     ),
-    privateKey: envString("PRIVATE_KEY", "") || readKeychainPrivateKey(),
+    privateKey: envString("PRIVATE_KEY", "") || readKeychainPrivateKey() || readWindowsDpapiPrivateKey(),
     walletAddress: envString("WALLET_ADDRESS", ""),
     dryRun: envBool("DRY_RUN", true),
     execute: envBool("EXECUTE", false),
@@ -60,6 +67,8 @@ export function readConfig() {
     eventOutcomeSelectionFallback: envString("EVENT_OUTCOME_SELECTION_FALLBACK", "token_order"),
     eventBuyMode: envString("EVENT_BUY_MODE", "fast"),
     eventDiscovery: envString("EVENT_DISCOVERY", "ws"),
+    restDiscoveryEnabled: envBool("REST_DISCOVERY_ENABLED", true),
+    restDiscoveryPollMs: envInteger("REST_DISCOVERY_POLL_MS", 1000),
     watchFundingMode: envString("WATCH_FUNDING_MODE", "next_batch"),
     bundleDueMarkets: envBool("BUNDLE_DUE_MARKETS", true),
     fastSkipPreflight: envBool("FAST_SKIP_PREFLIGHT", true),
@@ -85,13 +94,14 @@ export function readConfig() {
     fastGasLimit: envInteger("FAST_GAS_LIMIT", 5000000),
     bundleFastGasLimit: envInteger("BUNDLE_FAST_GAS_LIMIT", 12000000),
     logChunkBlocks: envInteger("LOG_CHUNK_BLOCKS", 5000),
-    watchScanLimit: envInteger("WATCH_SCAN_LIMIT", 25),
+    watchScanLimit: envInteger("WATCH_SCAN_LIMIT", 500),
     eventLogLookbackBlocks: envInteger("EVENT_LOG_LOOKBACK_BLOCKS", 50000),
     replayLookbackBlocks: envInteger("REPLAY_LOOKBACK_BLOCKS", 50000),
     marketCategoryAllowlist: envList("MARKET_CATEGORY_ALLOWLIST", ""),
     marketCategoryBlocklist: envList("MARKET_CATEGORY_BLOCKLIST", "Price"),
     marketTagBlocklist: envList("MARKET_TAG_BLOCKLIST", "8 hour,automated"),
     minMarketCreatedAt: envString("MIN_MARKET_CREATED_AT", ""),
+    minMarketDurationHours: envNumber("MIN_MARKET_DURATION_HOURS", 48),
     watchBuyExisting: envBool("WATCH_BUY_EXISTING", false),
     slippageBps: envInteger("SLIPPAGE_BPS", 800),
     pollMs: envInteger("POLL_MS", 500),
@@ -113,6 +123,11 @@ export function readConfig() {
     autoSellPercent: envNumber("AUTO_SELL_PERCENT", 50),
     autoSellPositionLimit: envInteger("AUTO_SELL_POSITION_LIMIT", 500),
     autoSellStateFile: envString("AUTO_SELL_STATE_FILE", "data/auto-sell-seen.json"),
+    pushPlusEnabled: envBool("PUSHPLUS_ENABLED", Boolean(envString("PUSHPLUS_TOKEN", ""))),
+    pushPlusToken: envString("PUSHPLUS_TOKEN", ""),
+    pushPlusUrl: envString("PUSHPLUS_URL", "https://www.pushplus.plus/send"),
+    pushPlusTemplate: envString("PUSHPLUS_TEMPLATE", "markdown"),
+    runtimeStatusFile: envString("RUNTIME_STATUS_FILE", "data/runtime-status.json"),
     scanLimit: envInteger("SCAN_LIMIT", 10),
     openWindowSeconds: envInteger("OPEN_WINDOW_SECONDS", 45),
     lookaheadSeconds: envInteger("LOOKAHEAD_SECONDS", 900),
@@ -149,6 +164,9 @@ export function readConfig() {
   }
   if (!["ws", "chain", "rest"].includes(cfg.eventDiscovery)) {
     throw new Error("EVENT_DISCOVERY must be ws, chain, or rest");
+  }
+  if (cfg.restDiscoveryPollMs <= 0) {
+    throw new Error("REST_DISCOVERY_POLL_MS must be positive");
   }
   if (!["next_batch", "upper_bound"].includes(cfg.watchFundingMode)) {
     throw new Error("WATCH_FUNDING_MODE must be next_batch or upper_bound");
@@ -191,6 +209,9 @@ export function readConfig() {
   }
   if (cfg.eventOpenWindowSeconds <= 0) {
     throw new Error("EVENT_OPEN_WINDOW_SECONDS must be positive");
+  }
+  if (cfg.minMarketDurationHours < 0) {
+    throw new Error("MIN_MARKET_DURATION_HOURS must be 0 or a positive number");
   }
   if (cfg.logChunkBlocks < 0) {
     throw new Error("LOG_CHUNK_BLOCKS must be 0 or a positive integer");
@@ -243,12 +264,18 @@ export function readConfig() {
 
   ensureParentDir(cfg.stateFile);
   ensureParentDir(cfg.fillsFile);
+  ensureParentDir(cfg.runtimeStatusFile);
   return cfg;
 }
 
 function loadProviderEnv() {
-  const file = path.join(process.env.HOME ?? "", ".codex/secrets/evm-rpc-providers.env");
+  const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  const file = path.join(home, ".codex/secrets/evm-rpc-providers.env");
   loadDotEnv(file);
+}
+
+function loadBotConfigEnv() {
+  loadDotEnvFile(process.env.BOT_CONFIG_FILE ?? "", { override: true });
 }
 
 function readKeychainPrivateKey() {
@@ -263,6 +290,41 @@ function readKeychainPrivateKey() {
       "-s",
       service,
       "-w"
+    ], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function readWindowsDpapiPrivateKey() {
+  if (process.platform !== "win32" || envBool("DISABLE_WINDOWS_DPAPI_PRIVATE_KEY", false)) return "";
+  const file = envString("WINDOWS_DPAPI_PRIVATE_KEY_FILE", "data/private-key.dpapi");
+  if (!fs.existsSync(file)) return "";
+  const resolved = path.resolve(file);
+  const script = `
+$ErrorActionPreference = 'Stop'
+$encrypted = (Get-Content -Raw -LiteralPath ${psString(resolved)}).Trim()
+$secure = $encrypted | ConvertTo-SecureString
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+try {
+  [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+} finally {
+  if ($bstr -ne [IntPtr]::Zero) {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+  }
+}
+`;
+  try {
+    return execFileSync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      script
     ], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
@@ -291,16 +353,42 @@ export function parseArgs(argv) {
 
 export function loadSeen(file) {
   if (!fs.existsSync(file)) return new Set();
-  const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-  return new Set(Array.isArray(parsed) ? parsed : []);
+  return new Set(readSeenArray(file));
 }
 
 export function saveSeen(file, seen) {
-  fs.writeFileSync(file, `${JSON.stringify([...seen].sort(), null, 2)}\n`);
+  ensureParentDir(file);
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  const tmp = path.join(dir, `.${base}.${process.pid}.${Date.now()}.tmp`);
+  const backup = `${file}.bak`;
+  const body = `${JSON.stringify([...seen].sort(), null, 2)}\n`;
+  fs.writeFileSync(tmp, body, { mode: 0o600 });
+  if (fs.existsSync(file)) {
+    fs.copyFileSync(file, backup);
+    fs.chmodSync(backup, 0o600);
+  }
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
 }
 
 export function appendJsonl(file, row) {
+  ensureParentDir(file);
   fs.appendFileSync(file, `${JSON.stringify(row)}\n`);
+}
+
+function readSeenArray(file) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    const backup = `${file}.bak`;
+    if (fs.existsSync(backup)) {
+      const parsed = JSON.parse(fs.readFileSync(backup, "utf8"));
+      return Array.isArray(parsed) ? parsed : [];
+    }
+    throw new Error(`Failed to load seen file ${file}: ${error.message}`);
+  }
 }
 
 function envString(key, fallback) {
@@ -379,4 +467,8 @@ function uniqueStrings(items) {
 function ensureParentDir(file) {
   const dir = path.dirname(file);
   if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true });
+}
+
+function psString(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
 }

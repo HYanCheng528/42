@@ -274,6 +274,42 @@ export async function approveRouterMax(cfg, { requiredUsdt = cfg.maxMarketStakeU
   return { ...base, ...approval, approved: true };
 }
 
+export async function approveRouterAmount(cfg, { amountUsdt } = {}) {
+  if (!cfg.privateKey) throw new Error("PRIVATE_KEY is required for router approval");
+  const amount = Number(amountUsdt);
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error("Approval amount must be positive");
+
+  const { publicClient, walletClient, account } = makeClients(cfg);
+  const targetAmount = parseUnits(String(amountUsdt), 18);
+  const allowance = await publicClient.readContract({
+    address: ADDRESSES.busdt,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [account.address, ADDRESSES.routerProxy]
+  });
+
+  const base = {
+    address: account.address,
+    router: ADDRESSES.routerProxy,
+    currentAllowance: formatUnits(allowance, 18),
+    targetAllowance: formatUnits(targetAmount, 18),
+    alreadyReady: allowance === targetAmount
+  };
+  if (allowance === targetAmount) return base;
+  if (cfg.dryRun || !cfg.execute) {
+    return { ...base, dryRun: true, wouldApproveAmount: formatUnits(targetAmount, 18) };
+  }
+  if (cfg.riskAck !== "YES") {
+    throw new Error("Refusing approval: set I_UNDERSTAND_42_PRICE_MARKET_RISK=YES");
+  }
+  if (cfg.eligibilityAck !== "YES") {
+    throw new Error("Refusing approval: set I_AM_NOT_IN_RESTRICTED_JURISDICTION=YES");
+  }
+
+  const approval = await setBusdtAllowance(publicClient, walletClient, account.address, targetAmount);
+  return { ...base, ...approval, approved: true };
+}
+
 export async function assertRouterAllowanceReady(cfg, totalAmount) {
   if (!cfg.privateKey) throw new Error("PRIVATE_KEY is required for allowance check");
   const { publicClient, account } = makeClients(cfg);
@@ -902,9 +938,15 @@ export async function executeFastBuyBundle(cfg, bundle, runtime = null) {
     }
   }
 
-  const receipt = cfg.waitForReceipt
-    ? await waitForReceiptWithConfig(cfg, broadcast.txHash)
-    : null;
+  let receipt = null;
+  let receiptError = null;
+  if (cfg.waitForReceipt) {
+    try {
+      receipt = await waitForReceiptWithConfig(cfg, broadcast.txHash);
+    } catch (error) {
+      receiptError = error?.message ?? String(error);
+    }
+  }
 
   return {
     txHash: broadcast.txHash,
@@ -919,6 +961,7 @@ export async function executeFastBuyBundle(cfg, bundle, runtime = null) {
     preSignedAt: bundle.preSignedFastBundleTransaction?.preparedAt ?? null,
     preSignedNonce: bundle.preSignedFastBundleTransaction?.nonce ?? null,
     waitedForReceipt: Boolean(receipt),
+    receiptError,
     marketCount: bundle.marketCount,
     outcomeCount: bundle.outcomeCount,
     totalAmount: formatUnits(bundle.totalAmount, 18),
@@ -1008,9 +1051,15 @@ export async function buyOutcomesBatch(cfg, plan, runtime = null) {
       throw error;
     }
   }
-  const receipt = cfg.waitForReceipt || !isFastPlan
-    ? await waitForReceiptWithConfig(cfg, broadcast.txHash)
-    : null;
+  let receipt = null;
+  let receiptError = null;
+  if (cfg.waitForReceipt || !isFastPlan) {
+    try {
+      receipt = await waitForReceiptWithConfig(cfg, broadcast.txHash);
+    } catch (error) {
+      receiptError = error?.message ?? String(error);
+    }
+  }
 
   return {
     approveHash: null,
@@ -1028,6 +1077,7 @@ export async function buyOutcomesBatch(cfg, plan, runtime = null) {
     preSignedAt: plan.preSignedFastTransaction?.preparedAt ?? null,
     preSignedNonce: plan.preSignedFastTransaction?.nonce ?? null,
     waitedForReceipt: Boolean(receipt),
+    receiptError,
     totalAmount: formatUnits(totalAmount, 18),
     outcomes: plan.outcomes.map((outcome) => ({
       tokenId: String(outcome.tokenId),
@@ -1401,21 +1451,29 @@ export async function sellOutcome(cfg, sellPlan) {
     ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
   };
   const txHash = await walletClient.writeContract(request);
-  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+  let receipt = null;
+  let receiptError = null;
+  try {
+    receipt = await waitForReceiptWithConfig(cfg, txHash);
+  } catch (error) {
+    receiptError = error?.message ?? String(error);
+  }
 
   return {
     operatorApprovalHash,
     operatorApproved,
     txHash,
-    status: receipt.status,
-    blockNumber: receipt.blockNumber?.toString() ?? null,
+    status: receipt?.status ?? "broadcast",
+    blockNumber: receipt?.blockNumber?.toString() ?? null,
     market,
     receiver,
     tokenId: tokenId.toString(),
     amountOt: formatUnits(amount, 18),
     minCollateralOut: formatUnits(minOut, 18),
     expectedCollateralToUser: formatUnits(sellPlan.expectedCollateralToUser, 18),
-    slippageBps: sellPlan.slippageBps
+    slippageBps: sellPlan.slippageBps,
+    waitedForReceipt: Boolean(receipt),
+    receiptError
   };
 }
 
@@ -1581,6 +1639,16 @@ async function ensureBusdtAllowance(publicClient, walletClient, owner, amount) {
     };
   }
 
+  return setBusdtAllowance(publicClient, walletClient, owner, MAX_UINT256, allowance);
+}
+
+async function setBusdtAllowance(publicClient, walletClient, owner, targetAmount, currentAllowance = null) {
+  const allowance = currentAllowance ?? await publicClient.readContract({
+    address: ADDRESSES.busdt,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [owner, ADDRESSES.routerProxy]
+  });
   let resetHash = null;
   if (allowance > 0n) {
     resetHash = await walletClient.writeContract({
@@ -1591,16 +1659,15 @@ async function ensureBusdtAllowance(publicClient, walletClient, owner, amount) {
     });
     await publicClient.waitForTransactionReceipt({ hash: resetHash });
   }
-
   const approveHash = await walletClient.writeContract({
     address: ADDRESSES.busdt,
     abi: erc20Abi,
     functionName: "approve",
-    args: [ADDRESSES.routerProxy, MAX_UINT256]
+    args: [ADDRESSES.routerProxy, targetAmount]
   });
   await publicClient.waitForTransactionReceipt({ hash: approveHash });
   return {
-    allowance: formatUnits(allowance, 18),
+    allowance: formatUnits(targetAmount, 18),
     approveHash,
     resetHash
   };

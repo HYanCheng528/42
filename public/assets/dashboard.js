@@ -30,6 +30,7 @@ const state = {
   data: null,
   route: routeFromHash(),
   marketFilter: "all",
+  configDirty: false,
   selected: null,
   sellPercent: 100,
   quoteRequest: 0,
@@ -49,7 +50,9 @@ const ICONS = {
   radio: `<path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"></path><path d="M7.8 16.2a6 6 0 0 1 0-8.5"></path><circle cx="12" cy="12" r="2"></circle><path d="M16.2 7.8a6 6 0 0 1 0 8.5"></path><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"></path>`,
   receipt: `<path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1-2-1Z"></path><path d="M16 8h-6"></path><path d="M16 12h-6"></path><path d="M10 16h4"></path>`,
   "refresh-cw": `<path d="M3 12a9 9 0 0 1 15.2-6.4L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-15.2 6.4L3 16"></path><path d="M3 21v-5h5"></path>`,
+  save: `<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8A2 2 0 0 1 21 8.8V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"></path><path d="M17 21v-7H7v7"></path><path d="M7 3v5h8"></path>`,
   send: `<path d="m22 2-7 20-4-9-9-4Z"></path><path d="M22 2 11 13"></path>`,
+  "shield-check": `<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.68 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"></path><path d="m9 12 2 2 4-4"></path>`,
   "sliders-horizontal": `<line x1="21" x2="14" y1="4" y2="4"></line><line x1="10" x2="3" y1="4" y2="4"></line><line x1="21" x2="12" y1="12" y2="12"></line><line x1="8" x2="3" y1="12" y2="12"></line><line x1="21" x2="16" y1="20" y2="20"></line><line x1="12" x2="3" y1="20" y2="20"></line><line x1="14" x2="14" y1="2" y2="6"></line><line x1="8" x2="8" y1="10" y2="14"></line><line x1="16" x2="16" y1="18" y2="22"></line>`,
   sparkles: `<path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3L12 3Z"></path><path d="M5 3v4"></path><path d="M19 17v4"></path><path d="M3 5h4"></path><path d="M17 19h4"></path>`,
   timer: `<line x1="10" x2="14" y1="2" y2="2"></line><line x1="12" x2="15" y1="14" y2="11"></line><circle cx="12" cy="14" r="8"></circle>`,
@@ -78,6 +81,7 @@ const els = {
   positionSummary: $("positionSummary"),
   projectCount: $("projectCount"),
   projectStats: $("projectStats"),
+  buySpeedList: $("buySpeedList"),
   activityList: $("activityList"),
   attentionList: $("attentionList"),
   overviewSnapshot: $("overviewSnapshot"),
@@ -86,7 +90,15 @@ const els = {
   stakeText: $("stakeText"),
   windowText: $("windowText"),
   autoSellText: $("autoSellText"),
+  configFileText: $("configFileText"),
+  configForm: $("configForm"),
+  restartWatch: $("restartWatch"),
+  restartStatus: $("restartStatus"),
+  saveConfig: $("saveConfig"),
   preflightList: $("preflightList"),
+  approveAmount: $("approveAmount"),
+  approveRouter: $("approveRouter"),
+  approveStatus: $("approveStatus"),
   sellDrawer: $("sellDrawer"),
   sellBackdrop: $("sellBackdrop"),
   closeDialog: $("closeDialog"),
@@ -105,10 +117,37 @@ const els = {
 renderStaticIcons();
 bindNavigation();
 bindSellControls();
+bindConfigControls();
+bindApprovalControls();
 setRoute(state.route, { replace: true });
 
 els.refreshBtn.addEventListener("click", () => loadOverview({ force: true }));
 window.addEventListener("hashchange", () => setRoute(routeFromHash(), { replace: true }));
+
+const CONFIG_FIELDS = [
+  { key: "DRY_RUN", label: "模拟交易", type: "boolean" },
+  { key: "EXECUTE", label: "允许真实下单", type: "boolean", danger: true },
+  { key: "I_UNDERSTAND_42_PRICE_MARKET_RISK", label: "确认交易风险", type: "ack", danger: true },
+  { key: "I_AM_NOT_IN_RESTRICTED_JURISDICTION", label: "确认地区合规", type: "ack", danger: true },
+  { key: "STAKE_PER_OUTCOME_USDT", label: "每档金额 U", type: "number", min: "0.01", step: "0.01" },
+  { key: "EVENT_OUTCOME_COUNT", label: "买入档数", type: "number", min: "1", step: "1" },
+  { key: "MAX_MARKET_STAKE_USDT", label: "单场上限 U", type: "number", min: "0.01", step: "0.01" },
+  { key: "MAX_BATCH_STAKE_USDT", label: "批次上限 U", type: "number", min: "0.01", step: "0.01" },
+  { key: "EVENT_OPEN_WINDOW_SECONDS", label: "开盘窗口秒", type: "number", min: "1", step: "1" },
+  { key: "GAS_PRICE_GWEI", label: "Gas 价格 gwei", type: "number", min: "0.01", step: "0.01" },
+  { key: "EVENT_DISCOVERY", label: "发现方式", type: "select", options: ["ws", "chain", "rest"] },
+  { key: "REST_DISCOVERY_ENABLED", label: "REST 补漏", type: "boolean" },
+  { key: "REST_DISCOVERY_POLL_MS", label: "REST 补漏间隔 ms", type: "number", min: "1", step: "100" },
+  { key: "WATCH_SCAN_LIMIT", label: "扫描数量", type: "number", min: "1", step: "1" },
+  { key: "MIN_MARKET_DURATION_HOURS", label: "最小时长 h", type: "number", min: "0", step: "0.1" },
+  { key: "EVENT_BUY_MODE", label: "买入模式", type: "select", options: ["fast", "quoted"] },
+  { key: "EVENT_OUTCOME_SELECTION", label: "选择策略", type: "select", options: ["lowest_odds", "all"] },
+  { key: "EVENT_OUTCOME_SELECTION_FALLBACK", label: "赔率缺失兜底", type: "select", options: ["token_order", "error"] },
+  { key: "WATCH_BUY_EXISTING", label: "启动买现有场", type: "boolean" },
+  { key: "AUTO_SELL_ENABLED", label: "自动止盈", type: "boolean" },
+  { key: "AUTO_SELL_PROFIT_MULTIPLIER", label: "止盈倍数", type: "number", min: "1.01", step: "0.01" },
+  { key: "AUTO_SELL_PERCENT", label: "止盈卖出 %", type: "number", min: "1", max: "100", step: "1" }
+];
 
 loadOverview();
 state.timer = setInterval(() => {
@@ -141,6 +180,7 @@ function render(data) {
   renderOverview(data);
   renderMarkets(data);
   renderPositions(data);
+  renderBuySpeed(data.buySpeed);
   renderExecution(data.activity);
   renderStrategy(data);
   updateCountdowns();
@@ -200,7 +240,7 @@ function renderMarkets(data) {
 
 function renderNewMarkets(feed) {
   const items = feed.items.filter((item) => marketMatchesFilter(item, state.marketFilter));
-  const baseCount = feed.excluded ? `${feed.count} 个 · 排除 ${feed.excluded}` : `${feed.count} 个`;
+  const baseCount = feed.excluded ? `${feed.count} 个 · 刷掉 ${feed.excluded}` : `${feed.count} 个`;
   els.newMarketCount.textContent = state.marketFilter === "all" ? baseCount : `${items.length} / ${feed.count}`;
   if (!items.length) {
     els.newMarketList.innerHTML = `<div class="empty">暂无匹配市场</div>`;
@@ -217,7 +257,7 @@ function renderNewMarkets(feed) {
       <div class="marketRow">
         <div class="marketQuestion">
           <strong title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</strong>
-          <small>${item.category ? escapeHtml(item.category) : "Event Market"} · 买 ${item.choices} 档</small>
+          <small>${escapeHtml(item.meta ?? `${item.category || "Event Market"} · 买 ${item.choices} 档`)}</small>
         </div>
         <div>${formatDate(item.startsAt)}</div>
         <div><span class="marketState ${marketStateTone(item.tone)}">${escapeHtml(item.state)}</span></div>
@@ -265,9 +305,14 @@ function renderHoldings(holdings) {
       <div class="marketTop">
         <div>
           <div class="marketTitle" title="${escapeAttr(group.title)}">${escapeHtml(group.title)}</div>
-          <div class="marketMeta">投入 ${group.cost} U · 当前 ${group.value} U</div>
+          <div class="marketMeta">投入 ${group.cost} U · 当前 ${group.value} U · ${group.positionCount} 仓</div>
         </div>
-        <strong class="${group.positive ? "good" : "bad"}">${group.pnl} U</strong>
+        <div class="marketActions">
+          <strong class="${group.positive ? "good" : "bad"}">${group.pnl} U</strong>
+          <button class="ghost iconButton marketSellBtn" data-sell='${escapeAttr(JSON.stringify(marketSellPayload(group)))}' ${group.sellable ? "" : "disabled"}>
+            ${icon("badge-dollar-sign")}<span>卖本市场</span>
+          </button>
+        </div>
       </div>
       <div class="positionTable">
         ${group.items.map(renderPosition).join("")}
@@ -278,6 +323,21 @@ function renderHoldings(holdings) {
   for (const button of document.querySelectorAll("[data-sell]")) {
     button.addEventListener("click", () => openSell(JSON.parse(button.dataset.sell)));
   }
+}
+
+function marketSellPayload(group) {
+  return {
+    market: group.market,
+    all: true,
+    title: group.title,
+    outcome: `全部 ${group.positionCount} 个仓位`,
+    value: group.value,
+    pnl: group.pnl,
+    pnlPct: group.pnlPct,
+    positive: group.positive,
+    sellable: group.sellable,
+    positionCount: group.positionCount
+  };
 }
 
 function renderPosition(item) {
@@ -313,6 +373,42 @@ function renderProjectStats(projects) {
       </div>
     </div>
   `).join("");
+}
+
+function renderBuySpeed(speed) {
+  if (!els.buySpeedList) return;
+  const items = speed?.items ?? [];
+  if (!items.length) {
+    els.buySpeedList.innerHTML = `<div class="empty">暂无买入速度统计</div>`;
+    return;
+  }
+  els.buySpeedList.innerHTML = items.map((item) => `
+    <div class="speedRow">
+      <div class="speedMain">
+        <strong title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</strong>
+        <span>${formatTime(item.at)} · ${escapeHtml(item.stake || "--")} · ${escapeHtml(String(item.outcomes ?? "--"))} 档</span>
+      </div>
+      <div class="speedStats">
+        <div class="stat"><span>排名</span><strong>${item.ok && item.rank ? `第 ${item.rank}` : "--"}</strong></div>
+        <div class="stat"><span>Block</span><strong>${item.ok ? item.blockNumber : "--"}</strong></div>
+        <div class="stat"><span>TxIndex</span><strong>${item.ok ? item.txIndex : "--"}</strong></div>
+        <div class="stat"><span>Gas</span><strong>${escapeHtml(item.gasGwei || "--")}</strong></div>
+        <div class="stat"><span>开盘偏差</span><strong>${item.openDeltaSec === null || item.openDeltaSec === undefined ? "--" : `${item.openDeltaSec}s`}</strong></div>
+      </div>
+      ${item.ok ? renderSpeedPeers(item.peers) : `<div class="speedError">${escapeHtml(item.message || "统计失败")}</div>`}
+    </div>
+  `).join("");
+}
+
+function renderSpeedPeers(peers = []) {
+  if (!peers.length) return `<div class="speedPeers emptyInline">无前排数据</div>`;
+  return `
+    <div class="speedPeers">
+      ${peers.map((peer) => `
+        <span>#${peer.rank} ${escapeHtml(peer.gasGwei || "--")} · ${peer.blockNumber}/${peer.txIndex}</span>
+      `).join("")}
+    </div>
+  `;
 }
 
 function renderExecution(rows) {
@@ -353,9 +449,13 @@ function renderStrategy(data) {
   els.stakeText.textContent = data.settings?.stakeText ?? "--";
   els.windowText.textContent = data.settings?.windowText ?? "--";
   els.autoSellText.textContent = data.settings?.autoSellText ?? "--";
+  renderConfig(data.settings?.config, data.settings?.runtimeStatus);
+  renderApprovalDefaults(data);
   const checks = [
     { label: "运行状态", value: data.bot.label, tone: data.bot.tone },
     { label: "BUSDT / BNB", value: data.wallet ? `${data.wallet.busdt} U / ${data.wallet.bnb} BNB` : "--", tone: data.wallet?.ready ? "good" : "warn" },
+    { label: "Router 授权", value: data.wallet ? `${data.wallet.allowance} / ${data.wallet.minimumRequired} U` : "--", tone: data.wallet?.allowanceReady ? "good" : "warn" },
+    { label: "完整批次", value: data.wallet ? `${data.wallet.busdt} / ${data.wallet.fullBatchRequired} U` : "--", tone: data.wallet?.fullBatchReady ? "good" : "warn" },
     { label: "下一批市场", value: `${data.next.count} 场`, tone: data.next.count ? "warn" : "neutral" },
     { label: "持仓数量", value: `${data.holdings.count} 个`, tone: data.holdings.count ? "good" : "neutral" }
   ];
@@ -367,17 +467,221 @@ function renderStrategy(data) {
   `).join("");
 }
 
+function renderConfig(config, runtimeStatus = null) {
+  if (!els.configForm || !config) return;
+  if (state.configDirty && els.configForm.contains(document.activeElement)) return;
+  const values = config.values ?? {};
+  const runtime = config.runtime ?? {};
+  els.configFileText.textContent = `${config.file ?? ".env.local"} · ${runtime.dryRun ? "dry-run" : "execute"}`;
+  els.configForm.innerHTML = `
+    ${renderWatchRuntime(runtimeStatus)}
+    <div class="configRuntime">
+      <span>钱包 ${runtime.walletAddress ? shortAddress(runtime.walletAddress) : "--"}</span>
+      <span>私钥 ${runtime.privateKeyLoaded ? "已加载" : "未加载"}</span>
+      <span>RPC ${runtime.rpcConfigured && runtime.wsConfigured ? "已配置" : "缺失"}</span>
+    </div>
+    ${CONFIG_FIELDS.map((field) => renderConfigField(field, values[field.key])).join("")}
+  `;
+}
+
+function renderWatchRuntime(runtime) {
+  if (!runtime?.present) {
+    return `
+      <div class="configRuntime watchRuntime ${runtime?.tone ?? "neutral"}">
+        <span>运行快照 ${runtime?.stateText ?? "暂无"}</span>
+      </div>
+    `;
+  }
+  const strategy = runtime.strategy ?? {};
+  const dataSources = runtime.dataSources ?? {};
+  const autoSell = runtime.autoSell ?? {};
+  const restText = dataSources.restDiscoveryEnabled ? `${dataSources.restDiscoveryPollMs ?? "--"}ms` : "关";
+  return `
+    <div class="configRuntime watchRuntime ${runtime.tone ?? "neutral"}">
+      <span>Watch ${runtime.stateText ?? "--"}</span>
+      <span>启动 ${runtime.startedAt ? formatDate(runtime.startedAt) : "--"}</span>
+      <span>模式 ${runtime.mode ?? "--"}</span>
+      <span>数据 ${dataSources.eventDiscovery ?? "--"} / ${dataSources.wsProvider ?? dataSources.primaryRpc ?? "--"}</span>
+      <span>买入 ${strategy.eventOutcomeCount ?? "--"} 档 x ${strategy.stakePerOutcomeUsdt ?? "--"}U</span>
+      <span>时长 ≥ ${strategy.minMarketDurationHours ?? "--"}h</span>
+      <span>REST ${restText}</span>
+      <span>Gas ${runtime.execution?.gasPriceGwei ?? "--"} gwei</span>
+      <span>广播 ${dataSources.broadcastRpcCount ?? 0} 节点</span>
+      <span>止盈 ${autoSell.enabled ? `${autoSell.profitMultiplier}x / ${autoSell.percent}%` : "关"}</span>
+      <span>快照 ${runtime.file ?? "--"}</span>
+    </div>
+  `;
+}
+
+function renderConfigField(field, value) {
+  const id = `config_${field.key}`;
+  if (field.type === "boolean" || field.type === "ack") {
+    return `
+      <label class="configField configToggle ${field.danger ? "danger" : ""}" for="${id}">
+        <span>${escapeHtml(field.label)}</span>
+        <span class="configSwitch">
+          <input id="${id}" data-config-key="${field.key}" data-config-type="${field.type}" type="checkbox" ${truthy(value) ? "checked" : ""}>
+          <span></span>
+        </span>
+      </label>
+    `;
+  }
+  if (field.type === "select") {
+    return `
+      <label class="configField" for="${id}">
+        <span>${escapeHtml(field.label)}</span>
+        <select id="${id}" data-config-key="${field.key}" data-config-type="${field.type}">
+          ${field.options.map((option) => `<option value="${escapeAttr(option)}" ${String(value) === option ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}
+        </select>
+      </label>
+    `;
+  }
+  return `
+    <label class="configField" for="${id}">
+      <span>${escapeHtml(field.label)}</span>
+      <input id="${id}" data-config-key="${field.key}" data-config-type="${field.type}" type="number" min="${field.min ?? ""}" max="${field.max ?? ""}" step="${field.step ?? "1"}" value="${escapeAttr(value ?? "")}">
+    </label>
+  `;
+}
+
+function bindConfigControls() {
+  if (els.configForm) {
+    els.configForm.addEventListener("input", () => {
+      state.configDirty = true;
+    });
+  }
+  if (els.saveConfig) els.saveConfig.addEventListener("click", saveConfig);
+  if (els.restartWatch) els.restartWatch.addEventListener("click", restartWatch);
+}
+
+async function saveConfig() {
+  const values = {};
+  for (const field of CONFIG_FIELDS) {
+    const input = document.querySelector(`[data-config-key="${field.key}"]`);
+    if (!input) continue;
+    values[field.key] = field.type === "boolean" || field.type === "ack" ? input.checked : input.value;
+  }
+  els.saveConfig.disabled = true;
+  try {
+    const data = await api("/api/config", {
+      method: "POST",
+      body: JSON.stringify({ values })
+    });
+    state.configDirty = false;
+    renderConfig(data.config, state.data?.settings?.runtimeStatus);
+    setRestartStatus("配置已保存，重启 Watch 后生效", "warn");
+    showToast("配置已保存，运行中的 watch 需重启生效");
+    await loadOverview({ force: true });
+  } catch (error) {
+    showToast(error.message || "保存失败");
+  } finally {
+    els.saveConfig.disabled = false;
+  }
+}
+
+async function restartWatch() {
+  if (state.configDirty) {
+    setRestartStatus("有未保存配置，先保存再重启 Watch", "warn");
+    showToast("先保存配置，再重启 Watch");
+    return;
+  }
+  if (!window.confirm("重启 Watch 会让买入监控中断几秒，确认继续？")) return;
+
+  els.restartWatch.disabled = true;
+  setButtonLabel(els.restartWatch, "loader-circle", "重启中");
+  setRestartStatus("Watch 正在重启...", "warn");
+  try {
+    const data = await api("/api/watch/restart", {
+      method: "POST",
+      body: "{}"
+    });
+    setRestartStatus(data.message || "Watch 已重启", data.bot?.running ? "good" : "warn");
+    showToast(data.message || "Watch 已重启");
+    setTimeout(() => loadOverview({ force: true }), 2500);
+  } catch (error) {
+    setRestartStatus(error.message || "重启失败", "bad");
+    showToast(error.message || "重启失败");
+  } finally {
+    els.restartWatch.disabled = false;
+    setButtonLabel(els.restartWatch, "refresh-cw", "重启 Watch");
+  }
+}
+
+function setRestartStatus(message, tone = "neutral") {
+  if (!els.restartStatus) return;
+  els.restartStatus.textContent = message;
+  els.restartStatus.className = `restartStatus ${tone}`;
+}
+
+function renderApprovalDefaults(data) {
+  if (!els.approveAmount || document.activeElement === els.approveAmount) return;
+  const current = Number(els.approveAmount.value);
+  if (Number.isFinite(current) && current > 0) return;
+  const values = data.settings?.config?.values ?? {};
+  const configured = Number(data.wallet?.required ?? values.MAX_MARKET_STAKE_USDT ?? values.MAX_BATCH_STAKE_USDT ?? 25);
+  els.approveAmount.value = Number.isFinite(configured) && configured > 0 ? String(configured) : "25";
+}
+
+function bindApprovalControls() {
+  if (!els.approveRouter) return;
+  els.approveRouter.addEventListener("click", approveRouter);
+}
+
+async function approveRouter() {
+  const amount = Number(els.approveAmount?.value);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    showToast("请输入大于 0 的授权数量");
+    return;
+  }
+  const confirmed = window.confirm(`这会提交真实链上授权交易，把 BUSDT Router 授权额度设置为 ${amount} U。继续？`);
+  if (!confirmed) return;
+
+  els.approveRouter.disabled = true;
+  setButtonLabel(els.approveRouter, "loader-circle", "授权中");
+  if (els.approveStatus) {
+    els.approveStatus.textContent = "授权交易提交中...";
+    els.approveStatus.className = "approvalStatus warn";
+  }
+  try {
+    const data = await api("/api/approve", {
+      method: "POST",
+      body: JSON.stringify({ amountUsdt: amount })
+    });
+    const approval = data.approval ?? {};
+    const hashText = approval.approveHash ? ` · ${shortAddress(approval.approveHash)}` : "";
+    const message = approval.alreadyReady
+      ? `Router 授权额度已经是 ${approval.allowance} U`
+      : `已提交授权 ${approval.allowance} U${hashText}`;
+    if (els.approveStatus) {
+      els.approveStatus.textContent = message;
+      els.approveStatus.className = "approvalStatus good";
+    }
+    showToast(message);
+    await loadOverview({ force: true });
+  } catch (error) {
+    if (els.approveStatus) {
+      els.approveStatus.textContent = error.message || "授权失败";
+      els.approveStatus.className = "approvalStatus bad";
+    }
+    showToast(error.message || "授权失败");
+  } finally {
+    els.approveRouter.disabled = false;
+    setButtonLabel(els.approveRouter, "shield-check", "授权 BUSDT");
+  }
+}
+
 function openSell(item) {
   state.selected = item;
   setSellPercent(100, { quote: false });
   els.sellTitle.innerHTML = `${icon("badge-dollar-sign")}<span>卖出</span>`;
-  els.sellOutcome.textContent = item.outcome;
+  els.sellOutcome.textContent = item.all ? "本市场全部仓位" : item.outcome;
   els.sellContext.innerHTML = `
     <div class="sellContextTitle" title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</div>
     <div class="sellContextGrid">
       <div class="stat"><span>当前价值</span><strong>${item.value} U</strong></div>
       <div class="stat"><span>盈亏</span><strong class="${item.positive ? "good" : "bad"}">${item.pnl} U</strong></div>
       <div class="stat"><span>收益</span><strong class="${item.positive ? "good" : "bad"}">${item.pnlPct}</strong></div>
+      ${item.all ? `<div class="stat"><span>范围</span><strong>${item.positionCount} 个仓位</strong></div>` : ""}
     </div>
   `;
   els.quoteBox.innerHTML = `<div class="empty">报价中</div>`;
@@ -401,11 +705,7 @@ async function requestSellQuote() {
   try {
     const data = await api("/api/sell/quote", {
       method: "POST",
-      body: JSON.stringify({
-        market: state.selected.market,
-        tokenId: state.selected.tokenId,
-        percent: state.sellPercent
-      })
+      body: JSON.stringify(sellRequestPayload())
     });
     if (requestId !== state.quoteRequest) return;
     renderQuote(data.quote);
@@ -423,6 +723,7 @@ function renderQuote(quote) {
     <div class="quoteIntro">
       <strong>${formatPercent(state.sellPercent)} 仓位</strong>
       <span>${escapeHtml(quote.outcome || state.selected?.outcome || "")}</span>
+      ${quote.positionCount > 1 ? `<span>${quote.positionCount} 个 outcome 依次卖出</span>` : ""}
       ${quote.sellAmountOt ? `<span>卖出 ${escapeHtml(quote.sellAmountOt)} / ${escapeHtml(quote.balanceOt)} OT</span>` : ""}
     </div>
     <div class="quoteLine"><span>预计到账</span><strong>${quote.expected} U</strong></div>
@@ -437,18 +738,16 @@ async function executeSell() {
   els.confirmSell.disabled = true;
   els.quoteRefresh.disabled = true;
   setButtonLabel(els.confirmSell, "loader-circle", "卖出中");
+  let submitted = false;
   try {
     const data = await api("/api/sell/execute", {
       method: "POST",
-      body: JSON.stringify({
-        market: state.selected.market,
-        tokenId: state.selected.tokenId,
-        percent: state.sellPercent
-      })
+      body: JSON.stringify(sellRequestPayload())
     });
-    showToast(`${data.sell.status}：${data.sell.receivedText} U`);
-    closeSell();
-    await loadOverview({ force: true });
+    const txText = data.sell.txHash ? ` · ${shortAddress(data.sell.txHash)}` : "";
+    showToast(`${data.sell.status}：${data.sell.receivedText} U${txText}`);
+    submitted = data.sell.rawStatus !== "reverted";
+    if (data.sell.rawStatus !== "reverted" && data.sell.rawStatus !== "partial_failed") closeSell();
   } catch (error) {
     showToast(error.message || "卖出失败");
   } finally {
@@ -456,6 +755,26 @@ async function executeSell() {
     els.quoteRefresh.disabled = false;
     setButtonLabel(els.confirmSell, "send", `确认卖出 ${formatPercent(state.sellPercent)}`);
   }
+  if (submitted) {
+    try {
+      await loadOverview({ force: true });
+    } catch {
+      showToast("卖出已提交，但刷新数据失败");
+    }
+  }
+}
+
+function sellRequestPayload() {
+  const payload = {
+    market: state.selected.market,
+    percent: state.sellPercent
+  };
+  if (state.selected.all) {
+    payload.all = true;
+  } else {
+    payload.tokenId = state.selected.tokenId;
+  }
+  return payload;
 }
 
 function setSellPercent(value, { quote = true } = {}) {
@@ -531,6 +850,7 @@ function routeFromHash() {
 }
 
 function marketMatchesFilter(item, filter) {
+  if (item.bucket) return filter === "all" || item.bucket === filter;
   if (filter === "all") return true;
   if (filter === "bought") return item.state === "已买";
   if (filter === "skipped") return item.state === "已跳过" || item.state === "已错过";
@@ -655,6 +975,16 @@ function setButtonLabel(button, iconName, label) {
 function icon(name, className = "icon") {
   const body = ICONS[name] ?? "";
   return `<svg class="${className}" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+}
+
+function truthy(value) {
+  return ["1", "true", "yes", "y", "on"].includes(String(value ?? "").toLowerCase());
+}
+
+function shortAddress(value) {
+  const text = String(value ?? "");
+  if (text.length <= 12) return text || "--";
+  return `${text.slice(0, 6)}...${text.slice(-4)}`;
 }
 
 function escapeHtml(value) {
