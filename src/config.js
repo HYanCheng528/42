@@ -61,10 +61,9 @@ export function readConfig() {
     maxStakeUsdt: envNumber("MAX_STAKE_USDT", 25),
     maxMarketStakeUsdt: envNumber("MAX_MARKET_STAKE_USDT", 25),
     maxBatchStakeUsdt: envNumber("MAX_BATCH_STAKE_USDT", 100),
-    maxOutcomesPerMarket: envInteger("MAX_OUTCOMES_PER_MARKET", 12),
     eventOutcomeSelection: envString("EVENT_OUTCOME_SELECTION", "lowest_odds"),
     eventOutcomeCount: envInteger("EVENT_OUTCOME_COUNT", 5),
-    eventOutcomeSelectionFallback: envString("EVENT_OUTCOME_SELECTION_FALLBACK", "token_order"),
+    eventOutcomeSelectionFallback: envString("EVENT_OUTCOME_SELECTION_FALLBACK", "error"),
     eventBuyMode: envString("EVENT_BUY_MODE", "fast"),
     eventDiscovery: envString("EVENT_DISCOVERY", "ws"),
     restDiscoveryEnabled: envBool("REST_DISCOVERY_ENABLED", true),
@@ -84,14 +83,22 @@ export function readConfig() {
     receiptWatchTimeoutMs: envInteger("RECEIPT_WATCH_TIMEOUT_MS", 120000),
     receiptWatchPollingMs: envInteger("RECEIPT_WATCH_POLLING_MS", 1000),
     executionRetryMs: envInteger("EXECUTION_RETRY_MS", 500),
-    eventOpenWindowSeconds: envInteger("EVENT_OPEN_WINDOW_SECONDS", 60),
+    eventOpenWindowSeconds: envInteger("EVENT_OPEN_WINDOW_SECONDS", 25),
+    eventBuyDelaySeconds: envInteger("EVENT_BUY_DELAY_SECONDS", 0),
+    requireRestBeforeBuy: envBool("REQUIRE_REST_BEFORE_BUY", false),
+    requireRestStatus: envList("REQUIRE_REST_STATUS", ""),
+    requireQuoteBeforeBuy: envBool("REQUIRE_QUOTE_BEFORE_BUY", false),
+    requireChainMintBeforeBuy: envBool("REQUIRE_CHAIN_MINT_BEFORE_BUY", false),
     fanoutBroadcast: envBool("FANOUT_BROADCAST", true),
     broadcastRpcUrls: [],
     broadcastTimeoutMs: envInteger("BROADCAST_TIMEOUT_MS", 1200),
     rpcWarmupTimeoutMs: envInteger("RPC_WARMUP_TIMEOUT_MS", 2500),
     doctorCheckWs: envBool("DOCTOR_CHECK_WS", false),
     gasPriceGwei: envString("GAS_PRICE_GWEI", "0.12"),
+    sellGasPriceGwei: envString("SELL_GAS_PRICE_GWEI", envString("GAS_PRICE_GWEI", "0.12")),
+    operatorApproveGasPriceGwei: envString("OPERATOR_APPROVE_GAS_PRICE_GWEI", envString("GAS_PRICE_GWEI", "0.12")),
     fastGasLimit: envInteger("FAST_GAS_LIMIT", 5000000),
+    fastSellGasLimit: envInteger("FAST_SELL_GAS_LIMIT", 1000000),
     bundleFastGasLimit: envInteger("BUNDLE_FAST_GAS_LIMIT", 12000000),
     logChunkBlocks: envInteger("LOG_CHUNK_BLOCKS", 5000),
     watchScanLimit: envInteger("WATCH_SCAN_LIMIT", 500),
@@ -100,6 +107,9 @@ export function readConfig() {
     marketCategoryAllowlist: envList("MARKET_CATEGORY_ALLOWLIST", ""),
     marketCategoryBlocklist: envList("MARKET_CATEGORY_BLOCKLIST", "Price"),
     marketTagBlocklist: envList("MARKET_TAG_BLOCKLIST", "8 hour,automated"),
+    marketAddressBlocklist: envList("MARKET_ADDRESS_BLOCKLIST", ""),
+    marketQuestionBlocklist: envList("MARKET_QUESTION_BLOCKLIST", ""),
+    allowOnchainOnlyMarkets: envBool("ALLOW_ONCHAIN_ONLY_MARKETS", false),
     minMarketCreatedAt: envString("MIN_MARKET_CREATED_AT", ""),
     minMarketDurationHours: envNumber("MIN_MARKET_DURATION_HOURS", 48),
     watchBuyExisting: envBool("WATCH_BUY_EXISTING", false),
@@ -115,14 +125,48 @@ export function readConfig() {
     armFundingRetryMs: envInteger("ARM_FUNDING_RETRY_MS", 60000),
     armFundingHotRetryMs: envInteger("ARM_FUNDING_HOT_RETRY_MS", 1000),
     armFundingHotWindowMs: envInteger("ARM_FUNDING_HOT_WINDOW_MS", 600000),
-    armCatchUpAfterFunding: envBool("ARM_CATCH_UP_AFTER_FUNDING", true),
-    armCatchUpWindowMs: envInteger("ARM_CATCH_UP_WINDOW_MS", 45000),
+    armCatchUpAfterFunding: envBool("ARM_CATCH_UP_AFTER_FUNDING", false),
+    armCatchUpWindowMs: envInteger("ARM_CATCH_UP_WINDOW_MS", 0),
     autoSellEnabled: envBool("AUTO_SELL_ENABLED", true),
-    autoSellPollMs: envInteger("AUTO_SELL_POLL_MS", 30000),
+    autoSellPollMs: envInteger("AUTO_SELL_POLL_MS", 3000),
+    autoSellMinOutMode: envString("AUTO_SELL_MIN_OUT_MODE", "quote"),
+    autoSellManualMinOutUsdt: envNumber("AUTO_SELL_MANUAL_MIN_OUT_USDT", 0.000001),
+    autoSellOriginalEnabled: envBool("AUTO_SELL_ORIGINAL_ENABLED", true),
     autoSellProfitMultiplier: envNumber("AUTO_SELL_PROFIT_MULTIPLIER", 2),
     autoSellPercent: envNumber("AUTO_SELL_PERCENT", 50),
+    autoSellFixedTrailingEnabled: envBool("AUTO_SELL_FIXED_TRAILING_ENABLED", false),
+    autoSellTrailingStartDelaySeconds: envInteger("AUTO_SELL_TRAILING_START_DELAY_SECONDS", 30),
+    autoSellTrailingArmProfitPct: envNumber("AUTO_SELL_TRAILING_ARM_PROFIT_PCT", 30),
+    autoSellTrailingDrawdownPct: envNumber("AUTO_SELL_TRAILING_DRAWDOWN_PCT", 25),
+    autoSellTrailingPercent: envNumber("AUTO_SELL_TRAILING_PERCENT", 100),
+    autoSellAdaptiveTrailingEnabled: envBool("AUTO_SELL_ADAPTIVE_TRAILING_ENABLED", false),
+    autoSellAdaptiveStartDelaySeconds: envInteger("AUTO_SELL_ADAPTIVE_START_DELAY_SECONDS", 30),
+    autoSellAdaptiveArmProfitPct: envNumber("AUTO_SELL_ADAPTIVE_ARM_PROFIT_PCT", 30),
+    autoSellAdaptiveEarlySeconds: envInteger("AUTO_SELL_ADAPTIVE_EARLY_SECONDS", 180),
+    autoSellAdaptiveEarlyDrawdownPct: envNumber("AUTO_SELL_ADAPTIVE_EARLY_DRAWDOWN_PCT", 25),
+    autoSellAdaptiveWindowSeconds: envInteger("AUTO_SELL_ADAPTIVE_WINDOW_SECONDS", 120),
+    autoSellAdaptiveMinSamples: envInteger("AUTO_SELL_ADAPTIVE_MIN_SAMPLES", 8),
+    autoSellAdaptiveSmallJumpPct: envNumber("AUTO_SELL_ADAPTIVE_SMALL_JUMP_PCT", 8),
+    autoSellAdaptiveSmallRangePct: envNumber("AUTO_SELL_ADAPTIVE_SMALL_RANGE_PCT", 80),
+    autoSellAdaptiveSmallDrawdownPct: envNumber("AUTO_SELL_ADAPTIVE_SMALL_DRAWDOWN_PCT", 18),
+    autoSellAdaptiveNormalDrawdownPct: envNumber("AUTO_SELL_ADAPTIVE_NORMAL_DRAWDOWN_PCT", 22),
+    autoSellAdaptiveLargeJumpPct: envNumber("AUTO_SELL_ADAPTIVE_LARGE_JUMP_PCT", 18),
+    autoSellAdaptiveLargeRangePct: envNumber("AUTO_SELL_ADAPTIVE_LARGE_RANGE_PCT", 250),
+    autoSellAdaptiveLargeDrawdownPct: envNumber("AUTO_SELL_ADAPTIVE_LARGE_DRAWDOWN_PCT", 28),
+    autoSellAdaptivePercent: envNumber("AUTO_SELL_ADAPTIVE_PERCENT", 100),
+    autoSellWeakExitEnabled: envBool("AUTO_SELL_WEAK_EXIT_ENABLED", false),
+    autoSellWeakExitAfterOpenSeconds: envInteger("AUTO_SELL_WEAK_EXIT_AFTER_OPEN_SECONDS", 1800),
+    autoSellWeakExitMinPeakProfitPct: envNumber("AUTO_SELL_WEAK_EXIT_MIN_PEAK_PROFIT_PCT", 20),
+    autoSellWeakExitMaxCurrentProfitPct: envNumber("AUTO_SELL_WEAK_EXIT_MAX_CURRENT_PROFIT_PCT", 20),
+    autoSellWeakExitPercent: envNumber("AUTO_SELL_WEAK_EXIT_PERCENT", 100),
+    autoSellBreakevenEnabled: envBool("AUTO_SELL_BREAKEVEN_ENABLED", false),
+    autoSellBreakevenStartDelaySeconds: envInteger("AUTO_SELL_BREAKEVEN_START_DELAY_SECONDS", 30),
+    autoSellBreakevenArmProfitPct: envNumber("AUTO_SELL_BREAKEVEN_ARM_PROFIT_PCT", 30),
+    autoSellBreakevenExitProfitPct: envNumber("AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT", 3),
+    autoSellBreakevenPercent: envNumber("AUTO_SELL_BREAKEVEN_PERCENT", 100),
     autoSellPositionLimit: envInteger("AUTO_SELL_POSITION_LIMIT", 500),
     autoSellStateFile: envString("AUTO_SELL_STATE_FILE", "data/auto-sell-seen.json"),
+    autoSellPositionStateFile: envString("AUTO_SELL_POSITION_STATE_FILE", "data/auto-sell-position-state.json"),
     pushPlusEnabled: envBool("PUSHPLUS_ENABLED", Boolean(envString("PUSHPLUS_TOKEN", ""))),
     pushPlusToken: envString("PUSHPLUS_TOKEN", ""),
     pushPlusUrl: envString("PUSHPLUS_URL", "https://www.pushplus.plus/send"),
@@ -142,7 +186,6 @@ export function readConfig() {
   if (cfg.maxStakeUsdt <= 0) throw new Error("MAX_STAKE_USDT must be positive");
   if (cfg.maxMarketStakeUsdt <= 0) throw new Error("MAX_MARKET_STAKE_USDT must be positive");
   if (cfg.maxBatchStakeUsdt <= 0) throw new Error("MAX_BATCH_STAKE_USDT must be positive");
-  if (cfg.maxOutcomesPerMarket <= 0) throw new Error("MAX_OUTCOMES_PER_MARKET must be positive");
   if (cfg.eventOutcomeCount <= 0) throw new Error("EVENT_OUTCOME_COUNT must be positive");
   if (cfg.stakeUsdt > cfg.maxStakeUsdt) {
     throw new Error(`STAKE_USDT ${cfg.stakeUsdt} exceeds MAX_STAKE_USDT ${cfg.maxStakeUsdt}`);
@@ -168,11 +211,17 @@ export function readConfig() {
   if (cfg.restDiscoveryPollMs <= 0) {
     throw new Error("REST_DISCOVERY_POLL_MS must be positive");
   }
+  validateGasPriceGwei("GAS_PRICE_GWEI", cfg.gasPriceGwei);
+  validateGasPriceGwei("SELL_GAS_PRICE_GWEI", cfg.sellGasPriceGwei);
+  validateGasPriceGwei("OPERATOR_APPROVE_GAS_PRICE_GWEI", cfg.operatorApproveGasPriceGwei);
   if (!["next_batch", "upper_bound"].includes(cfg.watchFundingMode)) {
     throw new Error("WATCH_FUNDING_MODE must be next_batch or upper_bound");
   }
   if (cfg.fastGasLimit < 0) {
     throw new Error("FAST_GAS_LIMIT must be 0 or a positive integer");
+  }
+  if (cfg.fastSellGasLimit < 0) {
+    throw new Error("FAST_SELL_GAS_LIMIT must be 0 or a positive integer");
   }
   if (cfg.bundleFastGasLimit < 0) {
     throw new Error("BUNDLE_FAST_GAS_LIMIT must be 0 or a positive integer");
@@ -195,12 +244,42 @@ export function readConfig() {
   if (cfg.autoSellPollMs <= 0) {
     throw new Error("AUTO_SELL_POLL_MS must be positive");
   }
+  if (!["quote", "manual"].includes(cfg.autoSellMinOutMode)) {
+    throw new Error("AUTO_SELL_MIN_OUT_MODE must be quote or manual");
+  }
+  if (cfg.autoSellManualMinOutUsdt < 0) {
+    throw new Error("AUTO_SELL_MANUAL_MIN_OUT_USDT must be 0 or a positive number");
+  }
   if (cfg.autoSellProfitMultiplier <= 1) {
     throw new Error("AUTO_SELL_PROFIT_MULTIPLIER must be greater than 1");
   }
-  if (cfg.autoSellPercent <= 0 || cfg.autoSellPercent > 100) {
-    throw new Error("AUTO_SELL_PERCENT must be > 0 and <= 100");
-  }
+  validatePct("AUTO_SELL_PERCENT", cfg.autoSellPercent, { minExclusive: 0, max: 100 });
+  validateNonNegativeInteger("AUTO_SELL_TRAILING_START_DELAY_SECONDS", cfg.autoSellTrailingStartDelaySeconds);
+  validatePct("AUTO_SELL_TRAILING_ARM_PROFIT_PCT", cfg.autoSellTrailingArmProfitPct, { min: 0 });
+  validatePct("AUTO_SELL_TRAILING_DRAWDOWN_PCT", cfg.autoSellTrailingDrawdownPct, { minExclusive: 0, max: 100 });
+  validatePct("AUTO_SELL_TRAILING_PERCENT", cfg.autoSellTrailingPercent, { minExclusive: 0, max: 100 });
+  validateNonNegativeInteger("AUTO_SELL_ADAPTIVE_START_DELAY_SECONDS", cfg.autoSellAdaptiveStartDelaySeconds);
+  validatePct("AUTO_SELL_ADAPTIVE_ARM_PROFIT_PCT", cfg.autoSellAdaptiveArmProfitPct, { min: 0 });
+  validateNonNegativeInteger("AUTO_SELL_ADAPTIVE_EARLY_SECONDS", cfg.autoSellAdaptiveEarlySeconds);
+  validatePct("AUTO_SELL_ADAPTIVE_EARLY_DRAWDOWN_PCT", cfg.autoSellAdaptiveEarlyDrawdownPct, { minExclusive: 0, max: 100 });
+  validateNonNegativeInteger("AUTO_SELL_ADAPTIVE_WINDOW_SECONDS", cfg.autoSellAdaptiveWindowSeconds);
+  validatePositiveInteger("AUTO_SELL_ADAPTIVE_MIN_SAMPLES", cfg.autoSellAdaptiveMinSamples);
+  validatePct("AUTO_SELL_ADAPTIVE_SMALL_JUMP_PCT", cfg.autoSellAdaptiveSmallJumpPct, { min: 0 });
+  validatePct("AUTO_SELL_ADAPTIVE_SMALL_RANGE_PCT", cfg.autoSellAdaptiveSmallRangePct, { min: 0 });
+  validatePct("AUTO_SELL_ADAPTIVE_SMALL_DRAWDOWN_PCT", cfg.autoSellAdaptiveSmallDrawdownPct, { minExclusive: 0, max: 100 });
+  validatePct("AUTO_SELL_ADAPTIVE_NORMAL_DRAWDOWN_PCT", cfg.autoSellAdaptiveNormalDrawdownPct, { minExclusive: 0, max: 100 });
+  validatePct("AUTO_SELL_ADAPTIVE_LARGE_JUMP_PCT", cfg.autoSellAdaptiveLargeJumpPct, { min: 0 });
+  validatePct("AUTO_SELL_ADAPTIVE_LARGE_RANGE_PCT", cfg.autoSellAdaptiveLargeRangePct, { min: 0 });
+  validatePct("AUTO_SELL_ADAPTIVE_LARGE_DRAWDOWN_PCT", cfg.autoSellAdaptiveLargeDrawdownPct, { minExclusive: 0, max: 100 });
+  validatePct("AUTO_SELL_ADAPTIVE_PERCENT", cfg.autoSellAdaptivePercent, { minExclusive: 0, max: 100 });
+  validateNonNegativeInteger("AUTO_SELL_WEAK_EXIT_AFTER_OPEN_SECONDS", cfg.autoSellWeakExitAfterOpenSeconds);
+  validatePct("AUTO_SELL_WEAK_EXIT_MIN_PEAK_PROFIT_PCT", cfg.autoSellWeakExitMinPeakProfitPct, { min: 0 });
+  validatePct("AUTO_SELL_WEAK_EXIT_MAX_CURRENT_PROFIT_PCT", cfg.autoSellWeakExitMaxCurrentProfitPct, { min: -100 });
+  validatePct("AUTO_SELL_WEAK_EXIT_PERCENT", cfg.autoSellWeakExitPercent, { minExclusive: 0, max: 100 });
+  validateNonNegativeInteger("AUTO_SELL_BREAKEVEN_START_DELAY_SECONDS", cfg.autoSellBreakevenStartDelaySeconds);
+  validatePct("AUTO_SELL_BREAKEVEN_ARM_PROFIT_PCT", cfg.autoSellBreakevenArmProfitPct, { min: 0 });
+  validatePct("AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT", cfg.autoSellBreakevenExitProfitPct, { min: -100 });
+  validatePct("AUTO_SELL_BREAKEVEN_PERCENT", cfg.autoSellBreakevenPercent, { minExclusive: 0, max: 100 });
   if (cfg.autoSellPositionLimit <= 0) {
     throw new Error("AUTO_SELL_POSITION_LIMIT must be positive");
   }
@@ -209,6 +288,12 @@ export function readConfig() {
   }
   if (cfg.eventOpenWindowSeconds <= 0) {
     throw new Error("EVENT_OPEN_WINDOW_SECONDS must be positive");
+  }
+  if (cfg.eventBuyDelaySeconds < 0) {
+    throw new Error("EVENT_BUY_DELAY_SECONDS must be 0 or positive");
+  }
+  if (!cfg.allowLateBuy && cfg.eventBuyDelaySeconds >= cfg.eventOpenWindowSeconds) {
+    throw new Error("EVENT_BUY_DELAY_SECONDS must be lower than EVENT_OPEN_WINDOW_SECONDS unless ALLOW_LATE_BUY=1");
   }
   if (cfg.minMarketDurationHours < 0) {
     throw new Error("MIN_MARKET_DURATION_HOURS must be 0 or a positive number");
@@ -265,7 +350,29 @@ export function readConfig() {
   ensureParentDir(cfg.stateFile);
   ensureParentDir(cfg.fillsFile);
   ensureParentDir(cfg.runtimeStatusFile);
+  ensureParentDir(cfg.autoSellStateFile);
+  ensureParentDir(cfg.autoSellPositionStateFile);
   return cfg;
+}
+
+function validatePct(name, value, { min = undefined, minExclusive = undefined, max = undefined } = {}) {
+  if (!Number.isFinite(value)) throw new Error(`${name} must be a number`);
+  if (min !== undefined && value < min) throw new Error(`${name} must be >= ${min}`);
+  if (minExclusive !== undefined && value <= minExclusive) throw new Error(`${name} must be > ${minExclusive}`);
+  if (max !== undefined && value > max) throw new Error(`${name} must be <= ${max}`);
+}
+
+function validateNonNegativeInteger(name, value) {
+  if (!Number.isInteger(value) || value < 0) throw new Error(`${name} must be 0 or a positive integer`);
+}
+
+function validateGasPriceGwei(name, value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${name} must be a positive number`);
+}
+
+function validatePositiveInteger(name, value) {
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
 }
 
 function loadProviderEnv() {

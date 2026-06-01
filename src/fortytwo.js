@@ -25,8 +25,77 @@ export const ADDRESSES = {
   integrator: "0xc60E3415648684b1D0D0D97e85CB21E6a2bCb620",
   powerCurve: "0xDC26047458FEa8Bd45164217CCb7eE90b9bE10B8",
   powerLdaCurve: "0xa59096C20022a9ec5d7691E0DcDc7D46776b1b3d",
-  clockCurve: "0x495B31876c092c236d1b0Df5Cc953D45d41301F1"
+  clockCurve: "0x495B31876c092c236d1b0Df5Cc953D45d41301F1",
+  earlyResolutionCurve: "0x0443E04e70E4285a6cA73eacaC5267f3B4cBb7Da",
+  price8hCurve: "0x6E67193CDdb83cEeA17d9b4D218E54E6258635d9",
+  testingCurve: "0x46B3BE67Cbe3adE39AEFbcDFb7ef6d980672B976"
 };
+
+export const CURVE_NAMES = {
+  [ADDRESSES.powerCurve.toLowerCase()]: {
+    name: "powerCurve",
+    label: "powerCurve / normal event",
+    tone: "good"
+  },
+  [ADDRESSES.powerLdaCurve.toLowerCase()]: {
+    name: "powerLdaCurve",
+    label: "powerLdaCurve",
+    tone: "warn"
+  },
+  [ADDRESSES.clockCurve.toLowerCase()]: {
+    name: "clockCurve",
+    label: "clockCurve / legacy price",
+    tone: "warn"
+  },
+  [ADDRESSES.earlyResolutionCurve.toLowerCase()]: {
+    name: "earlyResolutionCurve",
+    label: "earlyResolutionCurve / long-term",
+    tone: "neutral"
+  },
+  [ADDRESSES.price8hCurve.toLowerCase()]: {
+    name: "price8hCurve",
+    label: "price8hCurve / 8h price",
+    tone: "warn"
+  },
+  [ADDRESSES.testingCurve.toLowerCase()]: {
+    name: "testingCurve",
+    label: "testingCurve / testing market",
+    tone: "bad"
+  }
+};
+
+export function curveInfo(curve) {
+  const address = normalizeAddressLoose(curve);
+  if (!address) {
+    return {
+      address: "",
+      name: "",
+      label: "curve unknown",
+      tone: "neutral",
+      known: false
+    };
+  }
+  const known = CURVE_NAMES[address.toLowerCase()];
+  if (known) {
+    return {
+      address,
+      ...known,
+      known: true
+    };
+  }
+  return {
+    address,
+    name: "unknownCurve",
+    label: "unknownCurve",
+    tone: "warn",
+    known: false
+  };
+}
+
+function normalizeAddressLoose(value) {
+  const text = String(value ?? "").trim();
+  return /^0x[0-9a-fA-F]{40}$/.test(text) ? text : "";
+}
 
 const INTEGRATOR_FEE_BPS = 40n;
 const DEFAULT_MAX_ITERATIONS_EXECUTE = 50n;
@@ -613,20 +682,12 @@ export function estimateSelectedOutcomeCount(market, cfg) {
   return Math.min(Number(cfg.eventOutcomeCount ?? 5), availableCount);
 }
 
-export function estimateMaxSelectedOutcomeCount(cfg) {
-  if ((cfg.eventOutcomeSelection ?? "lowest_odds") === "all") return cfg.maxOutcomesPerMarket;
-  return Math.min(Number(cfg.eventOutcomeCount ?? 5), cfg.maxOutcomesPerMarket);
-}
-
 export async function quoteBuyAllOutcomes(publicClient, market, cfg, overrides = {}) {
   if (Number(market.contractVersion) !== 2) {
     throw new Error("Event buy simulation currently supports only contractVersion=2 markets");
   }
   const availableOutcomes = sortOutcomes(market.outcomes ?? []);
   if (availableOutcomes.length === 0) throw new Error("Market has no outcomes");
-  if (availableOutcomes.length > cfg.maxOutcomesPerMarket) {
-    throw new Error(`Market has ${availableOutcomes.length} outcomes, above MAX_OUTCOMES_PER_MARKET ${cfg.maxOutcomesPerMarket}`);
-  }
   const selection = selectEventOutcomes(availableOutcomes, cfg);
   const outcomes = selection.outcomes;
 
@@ -676,9 +737,6 @@ export function buildDirectBuyAllOutcomesPlan(market, cfg, overrides = {}) {
   }
   const availableOutcomes = sortOutcomes(market.outcomes ?? []);
   if (availableOutcomes.length === 0) throw new Error("Market has no outcomes");
-  if (availableOutcomes.length > cfg.maxOutcomesPerMarket) {
-    throw new Error(`Market has ${availableOutcomes.length} outcomes, above MAX_OUTCOMES_PER_MARKET ${cfg.maxOutcomesPerMarket}`);
-  }
   const selection = selectEventOutcomes(availableOutcomes, cfg);
   const outcomes = selection.outcomes;
 
@@ -1174,6 +1232,73 @@ async function writeFastMulticallFanout(cfg, publicClient, account, request, cal
   }
 }
 
+async function writeContractWithOptionalFanout(cfg, publicClient, walletClient, account, request, {
+  gasLimit = null,
+  mode = "contract_fanout_raw"
+} = {}) {
+  if (cfg.fanoutBroadcast && cfg.broadcastRpcUrls.length > 1 && account?.signTransaction) {
+    return writeContractFanout(cfg, publicClient, account, request, { gasLimit, mode });
+  }
+  const txHash = await walletClient.writeContract(request);
+  return {
+    txHash,
+    mode: "single_rpc",
+    rpcCount: 1,
+    firstProvider: providerLabel(cfg.rpcUrl),
+    gasLimit: request.gas?.toString?.() ?? null
+  };
+}
+
+async function writeContractFanout(cfg, publicClient, account, request, { gasLimit = null, mode = "contract_fanout_raw" } = {}) {
+  const fallbackGas = gasLimit === null || gasLimit === undefined
+    ? BigInt(cfg.fastSellGasLimit || cfg.fastGasLimit || 1000000)
+    : BigInt(gasLimit);
+  if (!fallbackGas || fallbackGas <= 0n) throw new Error("A positive gas limit is required for fanout contract broadcast");
+  const gas = request.gas ?? fallbackGas;
+  const gasPrice = request.gasPrice ?? await publicClient.getGasPrice();
+  const nonce = request.nonce ?? await publicClient.getTransactionCount({
+    address: account.address,
+    blockTag: "pending"
+  });
+  const data = request.data ?? encodeFunctionData({
+    abi: request.abi,
+    functionName: request.functionName,
+    args: request.args
+  });
+  const serializedTransaction = await account.signTransaction({
+    chainId: bsc.id,
+    to: request.address,
+    data,
+    gas,
+    gasPrice,
+    nonce,
+    value: request.value ?? 0n,
+    type: "legacy"
+  });
+
+  const txHash = keccak256(serializedTransaction);
+  const attempts = cfg.broadcastRpcUrls.map((url) =>
+    sendRawTransactionVia(url, serializedTransaction, txHash, cfg.broadcastTimeoutMs)
+  );
+
+  try {
+    const first = await Promise.any(attempts);
+    return {
+      txHash: first.txHash,
+      mode,
+      rpcCount: cfg.broadcastRpcUrls.length,
+      firstProvider: first.provider,
+      gasLimit: gas.toString()
+    };
+  } catch {
+    const settled = await Promise.allSettled(attempts);
+    const messages = settled.map((item) =>
+      item.status === "rejected" ? item.reason?.message ?? String(item.reason) : "unexpected success"
+    );
+    throw new Error(`${mode} failed on all RPCs: ${messages.join(" | ")}`);
+  }
+}
+
 async function broadcastPreSignedFastTransaction(cfg, signed) {
   if (!signed?.serializedTransaction || !signed?.txHash) {
     throw new Error("Missing pre-signed fast transaction");
@@ -1388,6 +1513,126 @@ export async function quoteSellOutcome(publicClient, { market, tokenId, owner, a
   };
 }
 
+export async function buildFastSellOutcomePlan(publicClient, { market, tokenId, owner, amountOt, percent = 100, minOutUsdt = 0 }) {
+  const marketAddress = getAddress(market);
+  const ownerAddress = getAddress(owner);
+  const id = BigInt(tokenId);
+  const balance = await publicClient.readContract({
+    address: marketAddress,
+    abi: marketV2Abi,
+    functionName: "balanceOf",
+    args: [ownerAddress, id]
+  });
+  const amount = amountOt === undefined || amountOt === null || amountOt === ""
+    ? applyPercent(balance, percent)
+    : parseUnits(String(amountOt), 18);
+  if (amount <= 0n) throw new Error("Sell amount is zero");
+  if (amount > balance) {
+    throw new Error(`Sell amount ${formatUnits(amount, 18)} exceeds outcome balance ${formatUnits(balance, 18)}`);
+  }
+
+  const operatorApproved = await publicClient.readContract({
+    address: marketAddress,
+    abi: marketV2Abi,
+    functionName: "isOperator",
+    args: [ownerAddress, ADDRESSES.routerProxy]
+  });
+
+  return {
+    market: marketAddress,
+    owner: ownerAddress,
+    tokenId: id.toString(),
+    balance,
+    amount,
+    percent: Number(percent),
+    operatorApproved,
+    collateralOutBeforeIntegrator: 0n,
+    collateralToIntegrator: 0n,
+    expectedCollateralToUser: 0n,
+    minCollateralOut: parseUnits(String(minOutUsdt ?? 0), 18),
+    slippageBps: null,
+    minOutMode: "manual",
+    quoteSkipped: true,
+    skipSimulation: true
+  };
+}
+
+export async function approveMarketOperator(cfg, { market, owner } = {}) {
+  const { publicClient, walletClient, account } = makeClients(cfg);
+  const marketAddress = getAddress(market);
+  const ownerAddress = getAddress(owner ?? account?.address);
+  const router = ADDRESSES.routerProxy;
+  const currentApproval = await publicClient.readContract({
+    address: marketAddress,
+    abi: marketV2Abi,
+    functionName: "isOperator",
+    args: [ownerAddress, router]
+  });
+  const base = {
+    market: marketAddress,
+    owner: ownerAddress,
+    router,
+    alreadyApproved: Boolean(currentApproval),
+    operatorApproved: Boolean(currentApproval),
+    approved: false,
+    txHash: null,
+    status: currentApproval ? "already_approved" : "not_approved",
+    blockNumber: null,
+    broadcastMode: null,
+    broadcastRpcCount: null,
+    firstBroadcastProvider: null,
+    gasLimit: null,
+    waitedForReceipt: false,
+    receiptError: null
+  };
+  if (currentApproval) return base;
+  if (cfg.dryRun || !cfg.execute) return base;
+  assertSellExecutionAllowed(cfg);
+  if (ownerAddress.toLowerCase() !== account.address.toLowerCase()) {
+    throw new Error("Real operator approval wallet must match PRIVATE_KEY-derived address");
+  }
+
+  const request = {
+    address: marketAddress,
+    abi: marketV2Abi,
+    functionName: "setOperator",
+    args: [router, true],
+    account,
+    gas: 150000n,
+    ...operatorApproveGasPriceOption(cfg)
+  };
+  const broadcast = await writeContractWithOptionalFanout(
+    cfg,
+    publicClient,
+    walletClient,
+    account,
+    request,
+    { gasLimit: 150000n, mode: "operator_approval_fanout_raw" }
+  );
+  let receipt = null;
+  let receiptError = null;
+  try {
+    receipt = await waitForReceiptWithConfig(cfg, broadcast.txHash);
+  } catch (error) {
+    receiptError = error?.message ?? String(error);
+  }
+  const status = receipt?.status ?? "broadcast";
+  return {
+    ...base,
+    approved: status === "success",
+    operatorApproved: status === "success",
+    txHash: broadcast.txHash,
+    status,
+    blockNumber: receipt?.blockNumber?.toString() ?? null,
+    broadcastMode: broadcast.mode,
+    broadcastRpcCount: broadcast.rpcCount,
+    firstBroadcastProvider: broadcast.firstProvider,
+    gasLimit: broadcast.gasLimit ?? request.gas?.toString?.() ?? null,
+    waitedForReceipt: Boolean(receipt),
+    receiptError
+  };
+}
+
 export async function sellOutcome(cfg, sellPlan) {
   assertSellExecutionAllowed(cfg, sellPlan);
   const { publicClient, walletClient, account } = makeClients(cfg);
@@ -1408,6 +1653,7 @@ export async function sellOutcome(cfg, sellPlan) {
   }
 
   let operatorApprovalHash = null;
+  let operatorApprovalBroadcast = null;
   let operatorApproved = sellPlan.operatorApproved;
   if (!operatorApproved) {
     operatorApproved = await publicClient.readContract({
@@ -1418,13 +1664,26 @@ export async function sellOutcome(cfg, sellPlan) {
     });
   }
   if (!operatorApproved) {
-    operatorApprovalHash = await walletClient.writeContract({
+    const approvalRequest = {
       address: market,
       abi: marketV2Abi,
       functionName: "setOperator",
-      args: [ADDRESSES.routerProxy, true]
-    });
-    await publicClient.waitForTransactionReceipt({ hash: operatorApprovalHash });
+      args: [ADDRESSES.routerProxy, true],
+      account,
+      gas: 150000n,
+      ...operatorApproveGasPriceOption(cfg)
+    };
+    operatorApprovalBroadcast = await writeContractWithOptionalFanout(
+      cfg,
+      publicClient,
+      walletClient,
+      account,
+      approvalRequest,
+      { gasLimit: 150000n, mode: "sell_operator_fanout_raw" }
+    );
+    operatorApprovalHash = operatorApprovalBroadcast.txHash;
+    const approvalReceipt = await waitForReceiptWithConfig(cfg, operatorApprovalHash);
+    if (approvalReceipt.status !== "success") throw new Error(`Operator approval reverted: ${operatorApprovalHash}`);
     operatorApproved = true;
   }
 
@@ -1438,19 +1697,39 @@ export async function sellOutcome(cfg, sellPlan) {
     ADDRESSES.integrator,
     INTEGRATOR_FEE_BPS
   ];
-  const simulated = await publicClient.simulateContract({
-    address: ADDRESSES.routerProxy,
-    abi: routerAbi,
-    functionName: "swap",
-    args,
-    account: account.address
-  });
-  const request = {
-    ...simulated.request,
+  const request = sellPlan.skipSimulation
+    ? {
+        address: ADDRESSES.routerProxy,
+        abi: routerAbi,
+        functionName: "swap",
+        args,
+        account,
+        gas: BigInt(cfg.fastSellGasLimit || cfg.fastGasLimit || 1000000),
+        ...sellGasPriceOption(cfg)
+      }
+    : {
+        ...(await publicClient.simulateContract({
+          address: ADDRESSES.routerProxy,
+          abi: routerAbi,
+          functionName: "swap",
+          args,
+          account: account.address
+        })).request,
+        account,
+        ...sellGasPriceOption(cfg)
+      };
+  const sellBroadcast = await writeContractWithOptionalFanout(
+    cfg,
+    publicClient,
+    walletClient,
     account,
-    ...(cfg.gasPriceGwei ? { gasPrice: parseGwei(String(cfg.gasPriceGwei)) } : {})
-  };
-  const txHash = await walletClient.writeContract(request);
+    request,
+    {
+      gasLimit: BigInt(cfg.fastSellGasLimit || cfg.fastGasLimit || 1000000),
+      mode: sellPlan.skipSimulation ? "sell_fast_fanout_raw" : "sell_fanout_raw"
+    }
+  );
+  const txHash = sellBroadcast.txHash;
   let receipt = null;
   let receiptError = null;
   try {
@@ -1462,6 +1741,9 @@ export async function sellOutcome(cfg, sellPlan) {
   return {
     operatorApprovalHash,
     operatorApproved,
+    operatorApprovalBroadcastMode: operatorApprovalBroadcast?.mode ?? null,
+    operatorApprovalBroadcastRpcCount: operatorApprovalBroadcast?.rpcCount ?? null,
+    operatorApprovalFirstBroadcastProvider: operatorApprovalBroadcast?.firstProvider ?? null,
     txHash,
     status: receipt?.status ?? "broadcast",
     blockNumber: receipt?.blockNumber?.toString() ?? null,
@@ -1472,6 +1754,13 @@ export async function sellOutcome(cfg, sellPlan) {
     minCollateralOut: formatUnits(minOut, 18),
     expectedCollateralToUser: formatUnits(sellPlan.expectedCollateralToUser, 18),
     slippageBps: sellPlan.slippageBps,
+    minOutMode: sellPlan.minOutMode ?? "quote",
+    quoteSkipped: Boolean(sellPlan.quoteSkipped),
+    skipSimulation: Boolean(sellPlan.skipSimulation),
+    broadcastMode: sellBroadcast.mode,
+    broadcastRpcCount: sellBroadcast.rpcCount,
+    firstBroadcastProvider: sellBroadcast.firstProvider,
+    gasLimit: sellBroadcast.gasLimit ?? request.gas?.toString?.() ?? null,
     waitedForReceipt: Boolean(receipt),
     receiptError
   };
@@ -1535,6 +1824,9 @@ export function describeSellPlan(plan, overrides = {}) {
     expectedCollateralToUser: formatUnits(plan.expectedCollateralToUser, 18),
     minCollateralOut: formatUnits(plan.minCollateralOut, 18),
     slippageBps: plan.slippageBps,
+    minOutMode: plan.minOutMode ?? "quote",
+    quoteSkipped: Boolean(plan.quoteSkipped),
+    skipSimulation: Boolean(plan.skipSimulation),
     route: "FTRouterProxy.swap(isMint=false, isExactIn=true)"
   };
 }
@@ -1682,6 +1974,18 @@ function smartEps(amountUsdt) {
   if (amount < 5) return parseUnits("0.2", 18);
   if (amount <= 3000) return parseUnits("0.001", 18);
   return BigInt(Math.floor((1 / amount) * 1e18));
+}
+
+function gasPriceOption(gwei) {
+  return gwei ? { gasPrice: parseGwei(String(gwei)) } : {};
+}
+
+function sellGasPriceOption(cfg) {
+  return gasPriceOption(cfg.sellGasPriceGwei ?? cfg.gasPriceGwei);
+}
+
+function operatorApproveGasPriceOption(cfg) {
+  return gasPriceOption(cfg.operatorApproveGasPriceGwei ?? cfg.gasPriceGwei);
 }
 
 function fastTransactionOptions(cfg, isFastPlan) {

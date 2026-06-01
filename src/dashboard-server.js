@@ -7,8 +7,8 @@ import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readConfig } from "./config.js";
-import { fetchActivity, fetchMarkets } from "./fortytwo.js";
-import { isEventMarket, isPriceMarket, marketDurationHours, passesMinimumDuration } from "./event-strategy.js";
+import { curveInfo, fetchActivity, fetchMarket, fetchMarkets, fetchOpenPositions, makeClients, quoteBuyAllOutcomes } from "./fortytwo.js";
+import { isBlockedMarketAddress, isEventMarket, isPriceMarket, isTestingMarket, marketCurveBlockReason, marketDurationHours, passesMinimumDuration } from "./event-strategy.js";
 import { markdownLine, notifyPushPlusSafe, shortHash } from "./pushplus.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -34,6 +34,9 @@ const loginFailures = new Map();
 const marketMintTopic = "0xf2e90b10bd525a6b1fe02d09e8133d3e38c9a87376ed4850904ca21e6e27abec";
 let buySpeedCache = null;
 let buySpeedPromise = null;
+let positionsCache = null;
+let positionsPromise = null;
+const marketDiagnosticsCache = new Map();
 
 const configFields = [
   { key: "DRY_RUN", type: "boolean" },
@@ -45,19 +48,67 @@ const configFields = [
   { key: "MAX_MARKET_STAKE_USDT", type: "number", min: 0.01 },
   { key: "MAX_BATCH_STAKE_USDT", type: "number", min: 0.01 },
   { key: "EVENT_OPEN_WINDOW_SECONDS", type: "integer", min: 1 },
+  { key: "EVENT_BUY_DELAY_SECONDS", type: "integer", min: 0 },
+  { key: "ARM_CATCH_UP_AFTER_FUNDING", type: "boolean" },
+  { key: "ARM_CATCH_UP_WINDOW_MS", type: "integer", min: 0 },
+  { key: "REQUIRE_REST_BEFORE_BUY", type: "boolean" },
+  { key: "REQUIRE_REST_STATUS", type: "text" },
+  { key: "REQUIRE_QUOTE_BEFORE_BUY", type: "boolean" },
+  { key: "REQUIRE_CHAIN_MINT_BEFORE_BUY", type: "boolean" },
   { key: "GAS_PRICE_GWEI", type: "number", min: 0.01 },
+  { key: "SELL_GAS_PRICE_GWEI", type: "number", min: 0.01 },
+  { key: "OPERATOR_APPROVE_GAS_PRICE_GWEI", type: "number", min: 0.01 },
+  { key: "SLIPPAGE_BPS", type: "integer", min: 0, max: 5000 },
+  { key: "FAST_SELL_GAS_LIMIT", type: "integer", min: 0 },
   { key: "EVENT_DISCOVERY", type: "enum", values: ["ws", "chain", "rest"] },
   { key: "REST_DISCOVERY_ENABLED", type: "boolean" },
   { key: "REST_DISCOVERY_POLL_MS", type: "integer", min: 1 },
   { key: "WATCH_SCAN_LIMIT", type: "integer", min: 1 },
   { key: "MIN_MARKET_DURATION_HOURS", type: "number", min: 0 },
+  { key: "MARKET_ADDRESS_BLOCKLIST", type: "text" },
+  { key: "MARKET_QUESTION_BLOCKLIST", type: "text" },
+  { key: "ALLOW_ONCHAIN_ONLY_MARKETS", type: "boolean" },
   { key: "EVENT_BUY_MODE", type: "enum", values: ["fast", "quoted"] },
   { key: "EVENT_OUTCOME_SELECTION", type: "enum", values: ["lowest_odds", "all"] },
   { key: "EVENT_OUTCOME_SELECTION_FALLBACK", type: "enum", values: ["token_order", "error"] },
   { key: "WATCH_BUY_EXISTING", type: "boolean" },
   { key: "AUTO_SELL_ENABLED", type: "boolean" },
+  { key: "AUTO_SELL_POLL_MS", type: "integer", min: 1 },
+  { key: "AUTO_SELL_MIN_OUT_MODE", type: "enum", values: ["quote", "manual"] },
+  { key: "AUTO_SELL_MANUAL_MIN_OUT_USDT", type: "number", min: 0 },
+  { key: "AUTO_SELL_ORIGINAL_ENABLED", type: "boolean" },
   { key: "AUTO_SELL_PROFIT_MULTIPLIER", type: "number", min: 1.01 },
-  { key: "AUTO_SELL_PERCENT", type: "number", min: 1, max: 100 }
+  { key: "AUTO_SELL_PERCENT", type: "number", min: 1, max: 100 },
+  { key: "AUTO_SELL_FIXED_TRAILING_ENABLED", type: "boolean" },
+  { key: "AUTO_SELL_TRAILING_START_DELAY_SECONDS", type: "integer", min: 0 },
+  { key: "AUTO_SELL_TRAILING_ARM_PROFIT_PCT", type: "number", min: 0 },
+  { key: "AUTO_SELL_TRAILING_DRAWDOWN_PCT", type: "number", min: 0.01, max: 100 },
+  { key: "AUTO_SELL_TRAILING_PERCENT", type: "number", min: 1, max: 100 },
+  { key: "AUTO_SELL_ADAPTIVE_TRAILING_ENABLED", type: "boolean" },
+  { key: "AUTO_SELL_ADAPTIVE_START_DELAY_SECONDS", type: "integer", min: 0 },
+  { key: "AUTO_SELL_ADAPTIVE_ARM_PROFIT_PCT", type: "number", min: 0 },
+  { key: "AUTO_SELL_ADAPTIVE_EARLY_SECONDS", type: "integer", min: 0 },
+  { key: "AUTO_SELL_ADAPTIVE_EARLY_DRAWDOWN_PCT", type: "number", min: 0.01, max: 100 },
+  { key: "AUTO_SELL_ADAPTIVE_WINDOW_SECONDS", type: "integer", min: 0 },
+  { key: "AUTO_SELL_ADAPTIVE_MIN_SAMPLES", type: "integer", min: 1 },
+  { key: "AUTO_SELL_ADAPTIVE_SMALL_JUMP_PCT", type: "number", min: 0 },
+  { key: "AUTO_SELL_ADAPTIVE_SMALL_RANGE_PCT", type: "number", min: 0 },
+  { key: "AUTO_SELL_ADAPTIVE_SMALL_DRAWDOWN_PCT", type: "number", min: 0.01, max: 100 },
+  { key: "AUTO_SELL_ADAPTIVE_NORMAL_DRAWDOWN_PCT", type: "number", min: 0.01, max: 100 },
+  { key: "AUTO_SELL_ADAPTIVE_LARGE_JUMP_PCT", type: "number", min: 0 },
+  { key: "AUTO_SELL_ADAPTIVE_LARGE_RANGE_PCT", type: "number", min: 0 },
+  { key: "AUTO_SELL_ADAPTIVE_LARGE_DRAWDOWN_PCT", type: "number", min: 0.01, max: 100 },
+  { key: "AUTO_SELL_ADAPTIVE_PERCENT", type: "number", min: 1, max: 100 },
+  { key: "AUTO_SELL_WEAK_EXIT_ENABLED", type: "boolean" },
+  { key: "AUTO_SELL_WEAK_EXIT_AFTER_OPEN_SECONDS", type: "integer", min: 0 },
+  { key: "AUTO_SELL_WEAK_EXIT_MIN_PEAK_PROFIT_PCT", type: "number", min: 0 },
+  { key: "AUTO_SELL_WEAK_EXIT_MAX_CURRENT_PROFIT_PCT", type: "number", min: -100 },
+  { key: "AUTO_SELL_WEAK_EXIT_PERCENT", type: "number", min: 1, max: 100 },
+  { key: "AUTO_SELL_BREAKEVEN_ENABLED", type: "boolean" },
+  { key: "AUTO_SELL_BREAKEVEN_START_DELAY_SECONDS", type: "integer", min: 0 },
+  { key: "AUTO_SELL_BREAKEVEN_ARM_PROFIT_PCT", type: "number", min: 0 },
+  { key: "AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT", type: "number", min: -100 },
+  { key: "AUTO_SELL_BREAKEVEN_PERCENT", type: "number", min: 1, max: 100 }
 ];
 
 let overviewCache = null;
@@ -89,7 +140,12 @@ const server = http.createServer(async (req, res) => {
       return serveStatic(res, url.pathname);
     }
     if (url.pathname === "/api/overview" && req.method === "GET") {
-      return sendJson(res, await getOverview());
+      const force = url.searchParams.get("force") === "1" || url.searchParams.get("fast") === "1";
+      return sendJson(res, await getOverview({ force }));
+    }
+    if (url.pathname === "/api/positions" && req.method === "GET") {
+      const force = url.searchParams.get("force") === "1";
+      return sendJson(res, await getPositionsSnapshot({ force }));
     }
     if (url.pathname === "/api/config" && req.method === "GET") {
       return sendJson(res, getConfigEditorState());
@@ -97,11 +153,20 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/config" && req.method === "POST") {
       return sendJson(res, saveConfigEditorState(await readJsonBody(req)));
     }
+    if (url.pathname === "/api/market/diagnostics" && req.method === "POST") {
+      return sendJson(res, await diagnoseMarket(await readJsonBody(req)));
+    }
+    if (url.pathname === "/api/market/exclusion" && req.method === "POST") {
+      return sendJson(res, updateMarketExclusion(await readJsonBody(req)));
+    }
     if (url.pathname === "/api/watch/restart" && req.method === "POST") {
       return sendJson(res, await restartWatchService());
     }
     if (url.pathname === "/api/approve" && req.method === "POST") {
       return sendJson(res, await approveRouter(await readJsonBody(req)));
+    }
+    if (url.pathname === "/api/operator/approve" && req.method === "POST") {
+      return sendJson(res, await approveOperator(await readJsonBody(req)));
     }
     if (url.pathname === "/api/sell/quote" && req.method === "POST") {
       return sendJson(res, await sellQuote(await readJsonBody(req)));
@@ -119,9 +184,9 @@ server.listen(port, host, () => {
   console.log(`42 dashboard listening on http://${host}:${port}`);
 });
 
-async function getOverview() {
+async function getOverview({ force = false } = {}) {
   const now = Date.now();
-  if (overviewCache && now - overviewCache.at < 4000) return overviewCache.data;
+  if (!force && overviewCache && now - overviewCache.at < 4000) return overviewCache.data;
   if (overviewPromise) return overviewPromise;
   overviewPromise = buildOverview()
     .then((data) => {
@@ -144,6 +209,7 @@ async function buildOverview() {
     getBotState(),
     getBuySpeedStats(cfg)
   ]);
+  const marketFeed = await mergeBoughtMarketsIntoFeed(cfg, newMarkets, walletActivity);
   const holdings = normalizeHoldings(positions);
   const recentRows = readRecentActivity();
   return {
@@ -152,18 +218,106 @@ async function buildOverview() {
     bot: normalizeBot(bot, status),
     wallet: normalizeWallet(status.wallet),
     next: normalizeNext(status),
-    newMarkets: normalizeNewMarkets(newMarkets, status, walletActivity, recentRows),
+    newMarkets: normalizeNewMarkets(marketFeed, status, walletActivity, recentRows),
     holdings,
     analytics: buildAnalytics(positions, walletActivity),
     activity: normalizeActivity(recentRows, walletActivity),
     buySpeed,
     settings: {
       stakeText: `${status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5} 档 / ${status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5}U`,
-      windowText: `${status.watchConfig?.eventOpenWindowSeconds ?? 60}s`,
+      windowText: windowText(status.watchConfig, cfg),
       autoSellText: autoSellText(status.watchConfig, cfg),
       runtimeStatus: normalizeRuntimeStatus(readRuntimeStatus(), bot),
       config: configEditorPayload(cfg)
     }
+  };
+}
+
+async function getPositionsSnapshot({ force = false } = {}) {
+  const now = Date.now();
+  const cacheMs = Number(process.env.DASHBOARD_POSITIONS_CACHE_MS ?? 1000);
+  if (!force && positionsCache && now - positionsCache.at < cacheMs) return positionsCache.data;
+  if (positionsPromise) return positionsPromise;
+  positionsPromise = buildPositionsSnapshot()
+    .then((data) => {
+      positionsCache = { at: Date.now(), data };
+      return data;
+    })
+    .finally(() => {
+      positionsPromise = null;
+    });
+  return positionsPromise;
+}
+
+async function buildPositionsSnapshot() {
+  const startedAt = Date.now();
+  const cfg = readConfig();
+  const rawRows = await fetchOpenPositions(cfg, {
+    user: botWallet,
+    limit: Number(process.env.DASHBOARD_POSITIONS_LIMIT ?? 100)
+  });
+  const positions = rawRows.map(summarizeDashboardPosition);
+  const totals = positions.reduce(
+    (acc, row) => {
+      acc.costBasisUsdt += Number(row.costBasisUsdt ?? 0);
+      acc.cashPnlUsdt += Number(row.cashPnlUsdt ?? 0);
+      acc.markValueUsdt += Number(row.markValueUsdt ?? 0);
+      return acc;
+    },
+    { costBasisUsdt: 0, cashPnlUsdt: 0, markValueUsdt: 0 }
+  );
+  const raw = {
+    level: "dashboard-positions",
+    wallet: botWallet,
+    count: positions.length,
+    totals: {
+      costBasisUsdt: roundFixed(totals.costBasisUsdt),
+      cashPnlUsdt: roundFixed(totals.cashPnlUsdt),
+      markValueUsdt: roundFixed(totals.markValueUsdt)
+    },
+    positions
+  };
+  const holdings = normalizeHoldings(raw);
+  return {
+    ok: true,
+    updatedAt: new Date().toISOString(),
+    elapsedMs: Date.now() - startedAt,
+    wallet: botWallet,
+    holdings,
+    cards: positionSummaryCards(raw)
+  };
+}
+
+function summarizeDashboardPosition(position) {
+  const costBasisUsdt = Number(position.costBasis ?? 0);
+  const cashPnlUsdt = Number(position.cashPnl ?? 0);
+  return {
+    marketAddress: position.marketAddress,
+    question: position.question?.title ?? null,
+    outcome: position.outcome?.name ?? null,
+    tokenId: position.tokenId,
+    size: Number(position.size ?? 0),
+    avgPrice: Number(position.avgPrice ?? 0),
+    curPrice: Number(position.curPrice ?? 0),
+    costBasisUsdt: roundFixed(costBasisUsdt),
+    cashPnlUsdt: roundFixed(cashPnlUsdt),
+    markValueUsdt: roundFixed(costBasisUsdt + cashPnlUsdt),
+    percentPnl: roundFixed(Number(position.percentPnl ?? 0)),
+    payoutIfRightUsdt: roundFixed(Number(position.outcome?.payout ?? 0)),
+    isFinalized: Boolean(position.isFinalized),
+    isClaimed: Boolean(position.isClaimed),
+    isWinner: position.isWinner
+  };
+}
+
+function positionSummaryCards(raw) {
+  const totals = raw.totals ?? {};
+  const pnl = Number(totals.cashPnlUsdt ?? 0);
+  return {
+    openCost: money(totals.costBasisUsdt),
+    openValue: money(totals.markValueUsdt),
+    openPnl: money(totals.cashPnlUsdt, { sign: true }),
+    openPositive: pnl >= 0
   };
 }
 
@@ -190,6 +344,8 @@ function saveConfigEditorState(body) {
     throw new Error("No editable config values supplied");
   }
 
+  validateConfigEditorPatch(parsed, readConfig());
+
   writeEnvValues(localEnvFile, parsed);
   for (const [key, value] of Object.entries(parsed)) {
     process.env[key] = value;
@@ -200,6 +356,191 @@ function saveConfigEditorState(body) {
     ok: true,
     config: configEditorPayload(readConfig())
   };
+}
+
+function validateConfigEditorPatch(parsed, cfg) {
+  const eventOpenWindowSeconds = Number(
+    parsed.EVENT_OPEN_WINDOW_SECONDS ?? cfg.eventOpenWindowSeconds
+  );
+  const eventBuyDelaySeconds = Number(
+    parsed.EVENT_BUY_DELAY_SECONDS ?? cfg.eventBuyDelaySeconds
+  );
+  if (
+    !cfg.allowLateBuy &&
+    Number.isFinite(eventOpenWindowSeconds) &&
+    Number.isFinite(eventBuyDelaySeconds) &&
+    eventBuyDelaySeconds >= eventOpenWindowSeconds
+  ) {
+    throw new Error("开盘后延迟买入秒必须小于开盘容错截止秒，否则 Watch 会启动失败");
+  }
+}
+
+async function diagnoseMarket(body) {
+  const marketAddress = String(body?.market ?? "").trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(marketAddress)) throw new Error("Missing market");
+
+  const key = normAddress(marketAddress);
+  const cached = marketDiagnosticsCache.get(key);
+  const cacheMs = Number(process.env.DASHBOARD_MARKET_DIAGNOSTIC_CACHE_MS ?? 60000);
+  if (cached && Date.now() - cached.at < cacheMs) return cached.data;
+
+  const cfg = readConfig();
+  const evidence = localMarketExecutionEvidence(readJsonl(fillsFile, 2000), []).get(key) ?? null;
+  let market = null;
+  let restError = null;
+  try {
+    market = await fetchMarket(cfg, marketAddress);
+  } catch (error) {
+    restError = cleanError(error);
+  }
+
+  const checks = {
+    rest: {
+      ok: Boolean(market),
+      status: market?.status ?? null,
+      abnormal: market ? !["live", "not_started"].includes(String(market.status ?? "")) : true,
+      message: restError
+    },
+    quote: null,
+    chain: null,
+    wallet: summarizeExecutionEvidence(evidence)
+  };
+
+  if (market) {
+    checks.quote = await diagnoseMarketQuote(cfg, market);
+    checks.chain = await diagnoseMarketChain(cfg, market);
+  }
+
+  const data = {
+    ok: true,
+    market: marketAddress,
+    title: market?.question ?? body?.title ?? marketAddress,
+    checkedAt: new Date().toISOString(),
+    badges: marketDiagnosticBadges(market ?? { address: marketAddress, status: null }, evidence, checks),
+    checks
+  };
+  marketDiagnosticsCache.set(key, { at: Date.now(), data });
+  if (marketDiagnosticsCache.size > 128) marketDiagnosticsCache.delete(marketDiagnosticsCache.keys().next().value);
+  return data;
+}
+
+function updateMarketExclusion(body) {
+  const marketAddress = String(body?.market ?? "").trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(marketAddress)) throw new Error("Missing market");
+  const key = normAddress(marketAddress);
+  const action = String(body?.action ?? "exclude").toLowerCase();
+  const cfg = readConfig();
+  const raw = readEnvFile(localEnvFile);
+  const current = parseCsvList(raw.MARKET_ADDRESS_BLOCKLIST ?? cfg.marketAddressBlocklist.join(","));
+  const byAddress = new Map(current.map((item) => [normAddress(item), item]).filter(([address]) => address));
+
+  if (action === "exclude" || action === "add") {
+    byAddress.set(key, marketAddress);
+  } else if (action === "restore" || action === "remove" || action === "delete") {
+    byAddress.delete(key);
+  } else {
+    throw new Error("Invalid exclusion action");
+  }
+
+  const next = [...byAddress.values()];
+  const value = next.join(",");
+  writeEnvValues(localEnvFile, { MARKET_ADDRESS_BLOCKLIST: value });
+  process.env.MARKET_ADDRESS_BLOCKLIST = value;
+  overviewCache = null;
+
+  return {
+    ok: true,
+    market: marketAddress,
+    action,
+    excluded: byAddress.has(key),
+    blocklist: next,
+    config: configEditorPayload(readConfig())
+  };
+}
+
+async function diagnoseMarketQuote(cfg, market) {
+  const startedAt = Date.now();
+  try {
+    const stake = Math.max(0.01, Number(process.env.DASHBOARD_MARKET_DIAGNOSTIC_STAKE_USDT ?? 1));
+    const { publicClient } = makeClients(cfg);
+    const quoteCfg = {
+      ...cfg,
+      dryRun: true,
+      execute: false,
+      eventBuyMode: "quoted",
+      stakePerOutcomeUsdt: stake
+    };
+    const plan = await quoteBuyAllOutcomes(publicClient, market, quoteCfg, { stakePerOutcomeUsdt: stake });
+    return {
+      ok: true,
+      latencyMs: Date.now() - startedAt,
+      selectedCount: plan.outcomes?.length ?? 0,
+      totalStakeUsdt: plan.totalStakeUsdt,
+      sampleMinOut: plan.outcomes?.[0]?.minOut?.toString?.() ?? null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      latencyMs: Date.now() - startedAt,
+      message: cleanError(error)
+    };
+  }
+}
+
+async function diagnoseMarketChain(cfg, market) {
+  const startedAt = Date.now();
+  try {
+    const latest = hexNumber(await rpcCall(cfg, "eth_blockNumber", []));
+    const startTs = Math.floor(Date.parse(market.startDate ?? "") / 1000);
+    const blockCache = new Map();
+    let fromBlock = Math.max(1, latest - Number(process.env.DASHBOARD_MARKET_DIAGNOSTIC_BLOCK_WINDOW ?? 20000));
+    if (Number.isFinite(startTs)) {
+      const startBlock = await firstBlockAtOrAfter(cfg, startTs, latest, blockCache);
+      fromBlock = Math.max(1, startBlock.num - 20);
+    }
+    const maxBlocks = Number(process.env.DASHBOARD_MARKET_DIAGNOSTIC_BLOCK_WINDOW ?? 20000);
+    const toBlock = Math.min(latest, fromBlock + maxBlocks);
+    const chunkSize = Math.max(100, Number(process.env.DASHBOARD_MARKET_DIAGNOSTIC_CHUNK_BLOCKS ?? 2000));
+    let allLogs = 0;
+    let mintLogs = 0;
+    const mintTxs = new Set();
+    const topics = new Set();
+    for (let from = fromBlock; from <= toBlock; from += chunkSize) {
+      const to = Math.min(toBlock, from + chunkSize - 1);
+      const logs = await rpcCall(cfg, "eth_getLogs", [{
+        address: market.address,
+        fromBlock: toHex(from),
+        toBlock: toHex(to)
+      }]);
+      allLogs += logs.length;
+      for (const log of logs) {
+        const topic = String(log.topics?.[0] ?? "").toLowerCase();
+        if (topic) topics.add(topic);
+        if (topic === marketMintTopic) {
+          mintLogs += 1;
+          if (log.transactionHash) mintTxs.add(String(log.transactionHash).toLowerCase());
+        }
+      }
+    }
+    return {
+      ok: true,
+      latencyMs: Date.now() - startedAt,
+      fromBlock,
+      toBlock,
+      latestBlock: latest,
+      truncated: toBlock < latest,
+      allLogs,
+      mintLogs,
+      mintTxCount: mintTxs.size,
+      topicCount: topics.size
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      latencyMs: Date.now() - startedAt,
+      message: cleanError(error)
+    };
+  }
 }
 
 async function restartWatchService() {
@@ -268,19 +609,67 @@ function configValueFromRuntime(key, cfg) {
     MAX_MARKET_STAKE_USDT: cfg.maxMarketStakeUsdt,
     MAX_BATCH_STAKE_USDT: cfg.maxBatchStakeUsdt,
     EVENT_OPEN_WINDOW_SECONDS: cfg.eventOpenWindowSeconds,
+    EVENT_BUY_DELAY_SECONDS: cfg.eventBuyDelaySeconds,
+    ARM_CATCH_UP_AFTER_FUNDING: cfg.armCatchUpAfterFunding ? "1" : "0",
+    ARM_CATCH_UP_WINDOW_MS: cfg.armCatchUpWindowMs,
+    REQUIRE_REST_BEFORE_BUY: cfg.requireRestBeforeBuy ? "1" : "0",
+    REQUIRE_REST_STATUS: cfg.requireRestStatus.join(","),
+    REQUIRE_QUOTE_BEFORE_BUY: cfg.requireQuoteBeforeBuy ? "1" : "0",
+    REQUIRE_CHAIN_MINT_BEFORE_BUY: cfg.requireChainMintBeforeBuy ? "1" : "0",
     GAS_PRICE_GWEI: cfg.gasPriceGwei,
+    SELL_GAS_PRICE_GWEI: cfg.sellGasPriceGwei,
+    OPERATOR_APPROVE_GAS_PRICE_GWEI: cfg.operatorApproveGasPriceGwei,
+    SLIPPAGE_BPS: cfg.slippageBps,
+    FAST_SELL_GAS_LIMIT: cfg.fastSellGasLimit,
     EVENT_DISCOVERY: cfg.eventDiscovery,
     REST_DISCOVERY_ENABLED: cfg.restDiscoveryEnabled ? "1" : "0",
     REST_DISCOVERY_POLL_MS: cfg.restDiscoveryPollMs,
     WATCH_SCAN_LIMIT: cfg.watchScanLimit,
     MIN_MARKET_DURATION_HOURS: cfg.minMarketDurationHours,
+    MARKET_ADDRESS_BLOCKLIST: cfg.marketAddressBlocklist.join(","),
+    MARKET_QUESTION_BLOCKLIST: cfg.marketQuestionBlocklist.join(","),
+    ALLOW_ONCHAIN_ONLY_MARKETS: cfg.allowOnchainOnlyMarkets ? "1" : "0",
     EVENT_BUY_MODE: cfg.eventBuyMode,
     EVENT_OUTCOME_SELECTION: cfg.eventOutcomeSelection,
     EVENT_OUTCOME_SELECTION_FALLBACK: cfg.eventOutcomeSelectionFallback,
     WATCH_BUY_EXISTING: cfg.watchBuyExisting ? "1" : "0",
     AUTO_SELL_ENABLED: cfg.autoSellEnabled ? "1" : "0",
+    AUTO_SELL_POLL_MS: cfg.autoSellPollMs,
+    AUTO_SELL_MIN_OUT_MODE: cfg.autoSellMinOutMode,
+    AUTO_SELL_MANUAL_MIN_OUT_USDT: cfg.autoSellManualMinOutUsdt,
+    AUTO_SELL_ORIGINAL_ENABLED: cfg.autoSellOriginalEnabled ? "1" : "0",
     AUTO_SELL_PROFIT_MULTIPLIER: cfg.autoSellProfitMultiplier,
-    AUTO_SELL_PERCENT: cfg.autoSellPercent
+    AUTO_SELL_PERCENT: cfg.autoSellPercent,
+    AUTO_SELL_FIXED_TRAILING_ENABLED: cfg.autoSellFixedTrailingEnabled ? "1" : "0",
+    AUTO_SELL_TRAILING_START_DELAY_SECONDS: cfg.autoSellTrailingStartDelaySeconds,
+    AUTO_SELL_TRAILING_ARM_PROFIT_PCT: cfg.autoSellTrailingArmProfitPct,
+    AUTO_SELL_TRAILING_DRAWDOWN_PCT: cfg.autoSellTrailingDrawdownPct,
+    AUTO_SELL_TRAILING_PERCENT: cfg.autoSellTrailingPercent,
+    AUTO_SELL_ADAPTIVE_TRAILING_ENABLED: cfg.autoSellAdaptiveTrailingEnabled ? "1" : "0",
+    AUTO_SELL_ADAPTIVE_START_DELAY_SECONDS: cfg.autoSellAdaptiveStartDelaySeconds,
+    AUTO_SELL_ADAPTIVE_ARM_PROFIT_PCT: cfg.autoSellAdaptiveArmProfitPct,
+    AUTO_SELL_ADAPTIVE_EARLY_SECONDS: cfg.autoSellAdaptiveEarlySeconds,
+    AUTO_SELL_ADAPTIVE_EARLY_DRAWDOWN_PCT: cfg.autoSellAdaptiveEarlyDrawdownPct,
+    AUTO_SELL_ADAPTIVE_WINDOW_SECONDS: cfg.autoSellAdaptiveWindowSeconds,
+    AUTO_SELL_ADAPTIVE_MIN_SAMPLES: cfg.autoSellAdaptiveMinSamples,
+    AUTO_SELL_ADAPTIVE_SMALL_JUMP_PCT: cfg.autoSellAdaptiveSmallJumpPct,
+    AUTO_SELL_ADAPTIVE_SMALL_RANGE_PCT: cfg.autoSellAdaptiveSmallRangePct,
+    AUTO_SELL_ADAPTIVE_SMALL_DRAWDOWN_PCT: cfg.autoSellAdaptiveSmallDrawdownPct,
+    AUTO_SELL_ADAPTIVE_NORMAL_DRAWDOWN_PCT: cfg.autoSellAdaptiveNormalDrawdownPct,
+    AUTO_SELL_ADAPTIVE_LARGE_JUMP_PCT: cfg.autoSellAdaptiveLargeJumpPct,
+    AUTO_SELL_ADAPTIVE_LARGE_RANGE_PCT: cfg.autoSellAdaptiveLargeRangePct,
+    AUTO_SELL_ADAPTIVE_LARGE_DRAWDOWN_PCT: cfg.autoSellAdaptiveLargeDrawdownPct,
+    AUTO_SELL_ADAPTIVE_PERCENT: cfg.autoSellAdaptivePercent,
+    AUTO_SELL_WEAK_EXIT_ENABLED: cfg.autoSellWeakExitEnabled ? "1" : "0",
+    AUTO_SELL_WEAK_EXIT_AFTER_OPEN_SECONDS: cfg.autoSellWeakExitAfterOpenSeconds,
+    AUTO_SELL_WEAK_EXIT_MIN_PEAK_PROFIT_PCT: cfg.autoSellWeakExitMinPeakProfitPct,
+    AUTO_SELL_WEAK_EXIT_MAX_CURRENT_PROFIT_PCT: cfg.autoSellWeakExitMaxCurrentProfitPct,
+    AUTO_SELL_WEAK_EXIT_PERCENT: cfg.autoSellWeakExitPercent,
+    AUTO_SELL_BREAKEVEN_ENABLED: cfg.autoSellBreakevenEnabled ? "1" : "0",
+    AUTO_SELL_BREAKEVEN_START_DELAY_SECONDS: cfg.autoSellBreakevenStartDelaySeconds,
+    AUTO_SELL_BREAKEVEN_ARM_PROFIT_PCT: cfg.autoSellBreakevenArmProfitPct,
+    AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT: cfg.autoSellBreakevenExitProfitPct,
+    AUTO_SELL_BREAKEVEN_PERCENT: cfg.autoSellBreakevenPercent
   };
   return String(mapping[key] ?? "");
 }
@@ -320,6 +709,13 @@ function readEnvFile(file) {
     values[match[1]] = unquoteEnvValue(match[2].trim());
   }
   return values;
+}
+
+function parseCsvList(value) {
+  return String(value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function writeEnvValues(file, values) {
@@ -378,14 +774,16 @@ function normalizeRuntimeStatus(row, bot) {
   const serviceStartedMs = Date.parse(bot.startedAt ?? "");
   const snapshotMs = Date.parse(row.startedAt ?? row.fileMtime ?? "");
   const stale = Boolean(bot.running && serviceStartedMs && snapshotMs && snapshotMs + 15000 < serviceStartedMs);
+  const phaseText = runtimePhaseText(row.phase);
   return {
     present: true,
     stale,
     tone: !bot.running ? "bad" : stale ? "warn" : "good",
-    stateText: !bot.running ? "Watch 未运行" : stale ? "快照可能过期" : "Watch 运行中",
+    stateText: !bot.running ? "Watch 未运行" : stale ? "快照可能过期" : phaseText ?? "Watch 运行中",
     file: row.file,
     fileMtime: row.fileMtime,
     startedAt: row.startedAt,
+    phase: row.phase ?? null,
     command: row.command,
     pid: row.pid ?? null,
     servicePid: bot.pid ?? null,
@@ -398,6 +796,12 @@ function normalizeRuntimeStatus(row, bot) {
     preflight: row.watchPreflight ?? null,
     configSources: row.configSources ?? {}
   };
+}
+
+function runtimePhaseText(phase) {
+  if (phase === "waiting_for_funds") return "等待资金";
+  if (phase === "watching") return "Watch 运行中";
+  return null;
 }
 
 function ensureParentDir(file) {
@@ -419,10 +823,36 @@ function formatEnvValue(value) {
   return /[\s#"'\\]/.test(text) ? JSON.stringify(text) : text;
 }
 
+function windowText(watchConfig, cfg) {
+  const openWindow = watchConfig?.eventOpenWindowSeconds ?? cfg.eventOpenWindowSeconds ?? 60;
+  const delay = Number(watchConfig?.eventBuyDelaySeconds ?? cfg.eventBuyDelaySeconds ?? 0);
+  if (delay > 0) return `${openWindow}s / 延迟 ${delay}s`;
+  return `${openWindow}s`;
+}
+
 function autoSellText(watchConfig, cfg) {
   const enabled = Boolean(watchConfig?.autoSellEnabled ?? cfg.autoSellEnabled);
   if (!enabled) return "关闭";
-  return `${watchConfig?.autoSellProfitMultiplier ?? cfg.autoSellProfitMultiplier}x / 卖 ${watchConfig?.autoSellPercent ?? cfg.autoSellPercent}%`;
+  const parts = [];
+  if (Boolean(watchConfig?.autoSellOriginalEnabled ?? cfg.autoSellOriginalEnabled)) {
+    parts.push(`${watchConfig?.autoSellProfitMultiplier ?? cfg.autoSellProfitMultiplier}x/${watchConfig?.autoSellPercent ?? cfg.autoSellPercent}%`);
+  }
+  if (Boolean(watchConfig?.autoSellFixedTrailingEnabled ?? cfg.autoSellFixedTrailingEnabled)) {
+    parts.push(`固定${watchConfig?.autoSellTrailingArmProfitPct ?? cfg.autoSellTrailingArmProfitPct}%/${watchConfig?.autoSellTrailingDrawdownPct ?? cfg.autoSellTrailingDrawdownPct}%`);
+  }
+  if (Boolean(watchConfig?.autoSellAdaptiveTrailingEnabled ?? cfg.autoSellAdaptiveTrailingEnabled)) {
+    parts.push("自适应");
+  }
+  if (Boolean(watchConfig?.autoSellWeakExitEnabled ?? cfg.autoSellWeakExitEnabled)) {
+    parts.push("弱势退出");
+  }
+  if (Boolean(watchConfig?.autoSellBreakevenEnabled ?? cfg.autoSellBreakevenEnabled)) {
+    parts.push("保本");
+  }
+  parts.push(`${watchConfig?.autoSellPollMs ?? cfg.autoSellPollMs}ms`);
+  const minOutMode = watchConfig?.autoSellMinOutMode ?? cfg.autoSellMinOutMode;
+  parts.push(minOutMode === "manual" ? "手动minOut" : "报价minOut");
+  return parts.length ? parts.join(" / ") : "监控开，策略关";
 }
 
 async function approveRouter(body) {
@@ -464,9 +894,61 @@ async function approveRouter(body) {
   };
 }
 
+async function approveOperator(body) {
+  const market = String(body?.market ?? "").trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(market)) throw new Error("Missing market");
+  const title = String(body?.title ?? market).trim() || market;
+  const result = await runEvent(["operator-approve", "--wallet", botWallet, "--market", market], {
+    timeoutMs: 180000,
+    env: {
+      DRY_RUN: "0",
+      EXECUTE: "1",
+      I_UNDERSTAND_42_PRICE_MARKET_RISK: "YES",
+      I_AM_NOT_IN_RESTRICTED_JURISDICTION: "YES",
+      NO_GUI_PROMPT: "1"
+    }
+  });
+  const approval = normalizeOperatorApproval(result);
+  appendJsonl(actionsFile, {
+    type: "operator_approve",
+    at: new Date().toISOString(),
+    question: title,
+    market,
+    amount: approval.statusText,
+    status: approval.status,
+    txHash: approval.txHash ?? null,
+    broadcastMode: approval.broadcastMode,
+    broadcastRpcCount: approval.broadcastRpcCount,
+    firstBroadcastProvider: approval.firstBroadcastProvider,
+    receiptError: approval.receiptError
+  });
+  notifyPushPlusSafe(readConfig(), {
+    title: approval.alreadyApproved ? "42space 卖出授权已存在" : "42space 已提交卖出授权",
+    content: [
+      markdownLine("市场", title),
+      markdownLine("地址", shortHash(market)),
+      markdownLine("状态", approval.statusText),
+      markdownLine("交易", shortHash(approval.txHash)),
+      markdownLine("广播", approval.broadcastRpcCount ? `${approval.broadcastRpcCount} RPC / ${approval.firstBroadcastProvider ?? ""}` : ""),
+      markdownLine("错误", approval.receiptError)
+    ].filter(Boolean).join("\n")
+  });
+  overviewCache = null;
+  return {
+    ok: true,
+    operatorApproval: approval
+  };
+}
+
 async function sellQuote(body) {
   const args = sellArgs(body);
-  const result = await runEvent(["sell", "--wallet", botWallet, ...args], { timeoutMs: 30000 });
+  const result = await runEvent(["sell", "--wallet", botWallet, ...args, "--dry-run"], {
+    timeoutMs: 30000,
+    env: {
+      DRY_RUN: "1",
+      EXECUTE: "0"
+    }
+  });
   return {
     ok: true,
     quote: normalizeSellQuote(result)
@@ -495,6 +977,9 @@ async function sellExecute(body) {
     status: summary.status,
     rawStatus: summary.rawStatus,
     txHash: summary.txHash,
+    broadcastMode: summary.broadcastMode,
+    broadcastRpcCount: summary.broadcastRpcCount,
+    firstBroadcastProvider: summary.firstBroadcastProvider,
     receiptError: summary.receiptError
   });
   notifyPushPlusSafe(readConfig(), {
@@ -504,6 +989,7 @@ async function sellExecute(body) {
       markdownLine("选项", summary.outcome),
       markdownLine("收回", summary.receivedText),
       markdownLine("交易", shortHash(summary.txHash)),
+      markdownLine("广播", summary.broadcastRpcCount ? `${summary.broadcastRpcCount} RPC / ${summary.firstBroadcastProvider ?? ""}` : ""),
       markdownLine("错误", summary.receiptError)
     ].filter(Boolean).join("\n")
   });
@@ -519,6 +1005,12 @@ function sellArgs(body) {
   const percent = Number(body.percent ?? 100);
   if (!Number.isFinite(percent) || percent <= 0 || percent > 100) throw new Error("Invalid percent");
   const args = ["--market", String(body.market), "--percent", String(percent)];
+  if (body.quickSell || body.fastSell) {
+    const minOutUsdt = body.minOutUsdt ?? "0.000001";
+    const minOut = Number(minOutUsdt);
+    if (!Number.isFinite(minOut) || minOut < 0) throw new Error("Invalid fast sell minOut");
+    args.push("--fast-sell", "--min-out-usdt", String(minOutUsdt));
+  }
   if (body.all) {
     args.push("--all");
   } else {
@@ -584,19 +1076,49 @@ function normalizeNext(status) {
     count: markets.length,
     items: markets.slice(0, limit).map((market) => ({
       title: market.question,
-      startsAt: market.startDate,
+      ...marketTiming(market),
       stake: money(market.totalStakeUsdt),
       choices: market.outcomeCount,
+      outcomeCount: market.availableOutcomeCount ?? market.outcomeCount ?? 0,
+      curve: marketCurveSummary(market),
       ready: Boolean(market.prepared)
     })),
     first: next ? {
       title: next.question,
-      startsAt: next.startDate,
+      ...marketTiming(next),
       stake: money(next.totalStakeUsdt),
       choices: next.outcomeCount,
+      outcomeCount: next.availableOutcomeCount ?? next.outcomeCount ?? 0,
+      curve: marketCurveSummary(next),
       ready: Boolean(next.prepared)
     } : null
   };
+}
+
+function marketTiming(market) {
+  const durationHours = marketDurationHours(market);
+  return {
+    startsAt: market.startDate,
+    endsAt: market.endDate,
+    duration: marketDurationText(market),
+    durationHours: durationHours === null ? null : Math.round(durationHours * 100) / 100
+  };
+}
+
+function marketCurveSummary(market) {
+  const info = curveInfo(market?.curve);
+  return {
+    name: info.name,
+    label: info.label,
+    tone: info.tone,
+    known: info.known,
+    present: Boolean(info.address)
+  };
+}
+
+function marketCurveMeta(market) {
+  const info = marketCurveSummary(market);
+  return info.present ? info.label : "";
 }
 
 function normalizeNewMarkets(markets, status, walletRows, localRows) {
@@ -605,32 +1127,41 @@ function normalizeNewMarkets(markets, status, walletRows, localRows) {
   const bought = boughtMarketSet(walletRows, localRows);
   const skipped = skippedMarketSet(localRows);
   const future = new Map((status.future ?? []).map((market) => [normAddress(market.address), market]));
+  const executionEvidence = localMarketExecutionEvidence(readJsonl(fillsFile, 2000), walletRows);
   const rows = [];
   let excluded = 0;
 
   for (const market of markets) {
-    const rejectionReason = marketRejectionReason(market, cfg);
+    const key = normAddress(market.address);
+    const isBought = bought.has(key);
+    const rejectionReason = isBought ? "" : marketRejectionReason(market, cfg);
+    const evidence = executionEvidence.get(key) ?? null;
     if (rejectionReason) {
       excluded += 1;
-      rows.push(rejectedMarketRow(market, rejectionReason));
+      rows.push(rejectedMarketRow(market, rejectionReason, evidence, cfg));
       continue;
     }
-    const key = normAddress(market.address);
     const pending = future.get(key);
     const context = { bought, skipped, pending, openWindowSeconds };
-    const choices = Math.min(Number(status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5), market.outcomes?.length ?? 0);
+    const outcomeCount = market.outcomes?.length ?? 0;
+    const choices = Math.min(Number(status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5), outcomeCount);
     const state = marketState(market, context);
     rows.push({
+      market: market.address,
       title: market.question,
       category: firstCategory(market),
-      startsAt: market.startDate,
+      ...marketTiming(market),
+      outcomeCount,
       choices,
       stake: money(Number(status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5) *
         choices),
       state,
       tone: marketTone(market, context),
       bucket: marketBucketFor(market, context),
-      meta: marketMeta(firstCategory(market), choices)
+      manuallyExcluded: false,
+      curve: marketCurveSummary(market),
+      meta: marketMeta(firstCategory(market), choices, outcomeCount, marketCurveMeta(market)),
+      diagnostics: baseMarketDiagnostics(market, evidence)
     });
   }
 
@@ -646,6 +1177,11 @@ function marketRejectionReason(market, cfg) {
   if (!market) return "数据为空";
   if (!["live", "not_started"].includes(String(market.status ?? ""))) return `状态 ${market.status ?? "unknown"}`;
   if (!Array.isArray(market.outcomes) || market.outcomes.length === 0) return "没有选项";
+  const curveReason = marketCurveBlockReason(market);
+  if (curveReason) return `Curve ${curveReason}`;
+  if (isTestingMarket(market)) return "测试盘";
+  if (isBlockedMarketAddress(market, cfg)) return "手动排除";
+  if (containsAnyDashboard(market.question ?? "", cfg.marketQuestionBlocklist)) return "手动排除";
   if (isPriceMarket(market, cfg)) return "价格/8小时盘";
   if (!passesDashboardCategoryAllowlist(market, cfg)) return "分类不匹配";
   if (!passesMinimumDuration(market, cfg)) {
@@ -655,20 +1191,25 @@ function marketRejectionReason(market, cfg) {
   return "";
 }
 
-function rejectedMarketRow(market, reason) {
+function rejectedMarketRow(market, reason, evidence = null, cfg = {}) {
   const category = firstCategory(market);
   const duration = marketDurationText(market);
   return {
+    market: market.address,
     title: market.question ?? market.slug ?? market.address ?? "Unknown market",
     category,
-    startsAt: market.startDate,
+    ...marketTiming(market),
+    outcomeCount: market.outcomes?.length ?? 0,
     choices: market.outcomes?.length ?? 0,
     stake: "-",
     state: "被刷掉",
     tone: "neutral",
     bucket: "rejected",
+    manuallyExcluded: isBlockedMarketAddress(market, cfg),
     reason,
-    meta: [category || "Market", duration, reason].filter(Boolean).join(" · ")
+    curve: marketCurveSummary(market),
+    diagnostics: baseMarketDiagnostics(market, evidence),
+    meta: [category || "Market", marketCurveMeta(market), duration, reason].filter(Boolean).join(" · ")
   };
 }
 
@@ -680,6 +1221,152 @@ function passesDashboardCategoryAllowlist(market, cfg) {
 function containsAnyDashboard(text, needles = []) {
   const normalized = String(text ?? "").toLowerCase();
   return needles.some((needle) => normalized.includes(String(needle).toLowerCase()));
+}
+
+function localMarketExecutionEvidence(localRows, walletRows = []) {
+  const map = new Map();
+  for (const row of walletRows) {
+    if (String(row.type ?? "").toUpperCase() === "MINT" && row.marketAddress) {
+      addMarketExecutionEvidence(map, row.marketAddress, { chainBuySeen: 1, successCount: 1 });
+    }
+  }
+  for (const row of localRows) {
+    if (row.level === "event-execution-error" && row.market) {
+      addMarketExecutionEvidence(map, row.market, { failureCount: 1, lastFailureAt: row.at, lastFailure: row.message });
+      continue;
+    }
+    if (row.level === "event-receipt" && row.context?.market) {
+      const patch = row.status === "success"
+        ? { chainBuySeen: 1, successCount: 1, lastSuccessAt: row.at }
+        : { failureCount: 1, lastFailureAt: row.at, lastFailure: row.message ?? row.status };
+      addMarketExecutionEvidence(map, row.context.market, patch);
+      continue;
+    }
+    if (!row.result?.txHash) continue;
+    const markets = [];
+    if (row.plan?.market?.address) markets.push(row.plan.market.address);
+    if (row.bundle?.markets?.length) {
+      for (const market of row.bundle.markets) {
+        if (market?.address) markets.push(market.address);
+      }
+    }
+    for (const market of markets) {
+      const patch = row.result.status === "success"
+        ? { chainBuySeen: 1, successCount: 1, lastSuccessAt: row.at }
+        : row.result.status === "reverted"
+          ? { failureCount: 1, lastFailureAt: row.at, lastFailure: "transaction reverted" }
+          : { broadcastCount: 1, lastBroadcastAt: row.at };
+      addMarketExecutionEvidence(map, market, patch);
+    }
+  }
+  return map;
+}
+
+function addMarketExecutionEvidence(map, market, patch) {
+  const key = normAddress(market);
+  if (!key) return;
+  const row = map.get(key) ?? {
+    chainBuySeen: 0,
+    successCount: 0,
+    failureCount: 0,
+    broadcastCount: 0,
+    lastSuccessAt: null,
+    lastFailureAt: null,
+    lastBroadcastAt: null,
+    lastFailure: ""
+  };
+  row.chainBuySeen += Number(patch.chainBuySeen ?? 0);
+  row.successCount += Number(patch.successCount ?? 0);
+  row.failureCount += Number(patch.failureCount ?? 0);
+  row.broadcastCount += Number(patch.broadcastCount ?? 0);
+  row.lastSuccessAt = newestIso(row.lastSuccessAt, patch.lastSuccessAt);
+  row.lastFailureAt = newestIso(row.lastFailureAt, patch.lastFailureAt);
+  row.lastBroadcastAt = newestIso(row.lastBroadcastAt, patch.lastBroadcastAt);
+  if (patch.lastFailure) row.lastFailure = patch.lastFailure;
+  map.set(key, row);
+}
+
+function newestIso(a, b) {
+  if (!b) return a ?? null;
+  if (!a) return b;
+  return new Date(b).getTime() > new Date(a).getTime() ? b : a;
+}
+
+function baseMarketDiagnostics(market, evidence = null) {
+  return {
+    checkedAt: null,
+    badges: marketDiagnosticBadges(market, evidence, null),
+    evidence: evidence ? summarizeExecutionEvidence(evidence) : null
+  };
+}
+
+function marketDiagnosticBadges(market, evidence = null, checks = null) {
+  const badges = [];
+  const status = String(market?.status ?? "");
+  const curve = marketCurveSummary(market);
+  if (curve.present) {
+    badges.push({
+      key: "curve",
+      label: `Curve ${curve.name || "unknown"}`,
+      tone: curve.tone,
+      detail: curve.label
+    });
+  }
+  if (status && !["live", "not_started"].includes(status)) {
+    badges.push({ key: "rest_status_abnormal", label: "REST状态异常", tone: "warn", detail: status });
+  }
+  if (checks?.quote?.ok) {
+    badges.push({
+      key: "quote_ok",
+      label: "报价模拟通过",
+      tone: "good",
+      detail: `${checks.quote.selectedCount ?? "--"}项`
+    });
+  } else if (checks?.quote && checks.quote.ok === false) {
+    badges.push({ key: "quote_failed", label: "报价模拟失败", tone: "bad", detail: checks.quote.message ?? "" });
+  }
+  const chainSeen = Number(checks?.chain?.mintLogs ?? 0) > 0 || Number(evidence?.chainBuySeen ?? 0) > 0;
+  if (chainSeen) {
+    badges.push({
+      key: "chain_buy_seen",
+      label: "已有实盘成交",
+      tone: "good",
+      detail: checks?.chain?.mintLogs !== undefined ? `${checks.chain.mintLogs} logs` : `${evidence.chainBuySeen}笔`
+    });
+  } else if (checks?.chain?.ok) {
+    badges.push({ key: "no_chain_buy", label: "无链上成交", tone: "warn", detail: `${checks.chain.fromBlock}-${checks.chain.toBlock}` });
+  }
+  if (Number(evidence?.failureCount ?? 0) > 0) {
+    badges.push({
+      key: "wallet_buy_failed",
+      label: "本钱包交易失败",
+      tone: "bad",
+      detail: `${evidence.failureCount}笔`
+    });
+  }
+  return dedupeDiagnosticBadges(badges);
+}
+
+function dedupeDiagnosticBadges(badges) {
+  const seen = new Set();
+  return badges.filter((badge) => {
+    if (!badge?.key || seen.has(badge.key)) return false;
+    seen.add(badge.key);
+    return true;
+  });
+}
+
+function summarizeExecutionEvidence(evidence) {
+  return {
+    chainBuySeen: Number(evidence?.chainBuySeen ?? 0),
+    successCount: Number(evidence?.successCount ?? 0),
+    failureCount: Number(evidence?.failureCount ?? 0),
+    broadcastCount: Number(evidence?.broadcastCount ?? 0),
+    lastSuccessAt: evidence?.lastSuccessAt ?? null,
+    lastFailureAt: evidence?.lastFailureAt ?? null,
+    lastBroadcastAt: evidence?.lastBroadcastAt ?? null,
+    lastFailure: evidence?.lastFailure ?? ""
+  };
 }
 
 function boughtMarketSet(walletRows, localRows) {
@@ -698,7 +1385,7 @@ function boughtMarketSet(walletRows, localRows) {
 function skippedMarketSet(localRows) {
   const set = new Set();
   for (const row of localRows) {
-    if (row.label === "已跳过" && row.market) set.add(normAddress(row.market));
+    if ((row.label === "已跳过" || isSkipLogLevel(row.level)) && row.market) set.add(normAddress(row.market));
   }
   return set;
 }
@@ -725,8 +1412,10 @@ function marketBucketFor(market, { bought, skipped, pending, openWindowSeconds }
   return "pending";
 }
 
-function marketMeta(category, choices) {
-  return `${category || "Event Market"} · 买 ${choices} 档`;
+function marketMeta(category, choices, outcomeCount, curveLabel = "") {
+  return [category || "Event Market", curveLabel, `outcome ${Number(outcomeCount ?? 0)} 个`, `买 ${choices} 档`]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 function marketDurationText(market) {
@@ -914,14 +1603,16 @@ function normalizeSellQuote(result) {
   const quote = item?.quote ?? {};
   const positionCount = Number(result.selectedCount ?? result.positions?.length ?? 0);
   const isMarketSell = positionCount > 1;
+  const quoteSkipped = result.sellMode === "fast" || Boolean(quote.quoteSkipped);
   return {
     title: item?.question ?? "持仓",
     outcome: isMarketSell ? `全部 ${positionCount} 个仓位` : item?.outcome ?? "",
     positionCount,
+    quoteSkipped,
     balanceOt: isMarketSell ? "" : money(quote.balanceOt),
     sellAmountOt: isMarketSell ? "" : money(quote.sellAmountOt),
     percent: quote.percent ?? null,
-    expected: money(result.totals?.expectedCollateralToUserUsdt),
+    expected: quoteSkipped ? "未报价" : money(result.totals?.expectedCollateralToUserUsdt),
     minimum: money(result.totals?.minCollateralOutUsdt),
     fee: money(result.totals?.collateralToIntegratorUsdt),
     needsApproval: Number(result.totals?.positionsNeedingOperatorApproval ?? 0) > 0
@@ -933,15 +1624,21 @@ function normalizeSellExecution(result) {
   const executions = result.executions ?? [];
   const summary = sellExecutionsSummary(executions);
   const positionCount = Number(result.selectedCount ?? result.positions?.length ?? executions.length ?? 0);
+  const fastSell = result.sellMode === "fast" || result.positions?.some((row) => row.quote?.quoteSkipped);
   return {
     status: sellExecutionStatusText(summary),
     title: item?.question ?? "持仓",
     outcome: positionCount > 1 ? `全部 ${positionCount} 个仓位` : item?.outcome ?? "",
     positionCount,
-    receivedText: money(result.totals?.expectedCollateralToUserUsdt),
+    sellMode: fastSell ? "fast" : "quoted",
+    receivedText: fastSell ? "未报价" : money(result.totals?.expectedCollateralToUserUsdt),
+    minimumText: money(result.totals?.minCollateralOutUsdt),
     txHash: summary.txHashes[0] ?? "",
     txHashes: summary.txHashes,
     rawStatus: summary.rawStatus,
+    broadcastMode: summary.broadcastMode,
+    broadcastRpcCount: summary.broadcastRpcCount,
+    firstBroadcastProvider: summary.firstBroadcastProvider,
     waitedForReceipt: summary.waitedForReceipt,
     receiptError: summary.receiptError,
     confirmedCount: summary.confirmedCount,
@@ -959,6 +1656,9 @@ function sellExecutionsSummary(executions) {
   const txHashes = rows.map((row) => row.txHash).filter(Boolean);
   const broadcastCount = rows.filter((row) => row.status === "broadcast" || (row.txHash && row.status !== "reverted")).length;
   const receiptError = rows.find((row) => row.receiptError)?.receiptError ?? "";
+  const broadcastModes = [...new Set(rows.map((row) => row.broadcastMode).filter(Boolean))];
+  const broadcastRpcCount = Math.max(0, ...rows.map((row) => Number(row.broadcastRpcCount ?? 0)).filter(Number.isFinite));
+  const firstBroadcastProvider = rows.find((row) => row.firstBroadcastProvider)?.firstBroadcastProvider ?? "";
   let rawStatus = "processed";
   if (executionCount > 0 && failedCount === executionCount) rawStatus = "reverted";
   else if (failedCount > 0) rawStatus = "partial_failed";
@@ -971,6 +1671,9 @@ function sellExecutionsSummary(executions) {
     failedCount,
     txHashes,
     rawStatus,
+    broadcastMode: broadcastModes.join(","),
+    broadcastRpcCount,
+    firstBroadcastProvider,
     waitedForReceipt: rows.some((row) => row.waitedForReceipt),
     receiptError
   };
@@ -996,6 +1699,37 @@ function normalizeApproval(result) {
     approved: Boolean(approval.approved),
     resetHash: approval.resetHash ?? "",
     approveHash: approval.approveHash ?? ""
+  };
+}
+
+function normalizeOperatorApproval(result) {
+  const approval = result.result ?? result;
+  const status = approval.status ?? "";
+  const alreadyApproved = Boolean(approval.alreadyApproved);
+  const approved = Boolean(approval.approved || approval.operatorApproved || alreadyApproved || status === "success");
+  const statusText = alreadyApproved
+    ? "已授权"
+    : status === "success"
+      ? "已确认"
+      : status === "broadcast"
+        ? "已广播"
+        : status === "reverted"
+          ? "链上失败"
+          : "未授权";
+  return {
+    market: approval.market ?? "",
+    owner: approval.owner ?? "",
+    router: approval.router ?? "",
+    alreadyApproved,
+    approved,
+    operatorApproved: Boolean(approval.operatorApproved || approved),
+    status,
+    statusText,
+    txHash: approval.txHash ?? "",
+    broadcastMode: approval.broadcastMode ?? "",
+    broadcastRpcCount: approval.broadcastRpcCount ?? null,
+    firstBroadcastProvider: approval.firstBroadcastProvider ?? "",
+    receiptError: approval.receiptError ?? ""
   };
 }
 
@@ -1092,6 +1826,7 @@ function actionActivityStatus(row) {
     return "卖出";
   }
   if (row.type === "approve") return "授权";
+  if (row.type === "operator_approve") return "卖出授权";
   return "操作";
 }
 
@@ -1105,8 +1840,8 @@ function activityAmount(value) {
 function readRecentActivity() {
   const rows = [];
   for (const row of readJsonl(fillsFile, 120)) {
-    if (row.level === "event-skip-open-window") {
-      rows.push({ at: row.at, label: "已跳过", title: row.question, market: row.market, amount: "" });
+    if (isSkipLogLevel(row.level)) {
+      rows.push({ at: row.at, label: "已跳过", title: row.question, market: row.market, amount: row.reason ?? "" });
       continue;
     }
     if (row.level === "event-execution-error") {
@@ -1144,6 +1879,16 @@ function readRecentActivity() {
   return rows
     .filter((row) => row.at && row.title)
     .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+}
+
+function isSkipLogLevel(level) {
+  return [
+    "event-skip-open-window",
+    "event-skip-rest-live-deadline",
+    "event-skip-curve",
+    "event-skip-safety-gate",
+    "event-skip-catchup-disabled"
+  ].includes(String(level ?? ""));
 }
 
 async function getBotState() {
@@ -1242,55 +1987,100 @@ async function getBuySpeedStats(cfg) {
 }
 
 async function buildBuySpeedStats(cfg) {
-  const recent = recentBuyExecutions(6);
+  const limit = 6;
+  const groups = recentBuyExecutionGroups({
+    rowLimit: 2000,
+    marketLimit: Math.max(36, limit * 8),
+    txPerMarket: 8
+  });
   const blockCache = new Map();
-  const items = [];
-  for (const item of recent) {
-    try {
-      items.push(await computeBuySpeedStat(cfg, item, blockCache));
-    } catch (error) {
-      items.push({
-        ...item,
-        ok: false,
-        message: cleanError(error)
-      });
-    }
+  const computed = [];
+  for (const group of groups) {
+    computed.push(await computeBestBuySpeedStatForMarket(cfg, group, blockCache));
+    const visible = cleanBuySpeedStats(computed, limit);
+    const confirmed = visible.filter((item) => item.ok && !item.dirty).length;
+    if (visible.length >= limit && confirmed >= Math.min(3, limit)) break;
   }
+  const items = cleanBuySpeedStats(computed, limit);
   return {
     ok: true,
     updatedAt: new Date().toISOString(),
+    marketCandidateCount: groups.length,
+    computedMarketCount: computed.length,
+    validCount: computed.filter((item) => item.ok && !item.dirty).length,
+    dirtyCount: computed.filter((item) => item.dirty || !item.ok).length,
     items
   };
 }
 
-function recentBuyExecutions(limit) {
-  const rows = readJsonl(fillsFile, 400).reverse();
-  const seen = new Set();
-  const items = [];
+async function computeBestBuySpeedStatForMarket(cfg, group, blockCache) {
+  let best = null;
+  for (const item of group.items) {
+    let stat;
+    try {
+      stat = await computeBuySpeedStat(cfg, item, blockCache);
+    } catch (error) {
+      stat = {
+        ...item,
+        ok: false,
+        dirty: true,
+        dirtyReason: "stats_error",
+        message: cleanError(error)
+      };
+    }
+    if (!best || isBetterBuySpeedItem(stat, best)) best = stat;
+    if (stat.ok && !stat.dirty) break;
+  }
+  return best ?? {
+    ...group.items[0],
+    ok: false,
+    dirty: true,
+    dirtyReason: "missing_candidate",
+    message: "no buy candidate"
+  };
+}
+
+function recentBuyExecutionGroups({ rowLimit, marketLimit, txPerMarket }) {
+  const rows = readJsonl(fillsFile, rowLimit).reverse();
+  const groups = new Map();
   for (const row of rows) {
     const result = row.result;
     if (!result?.txHash || result.dryRun) continue;
     if (row.plan?.market?.address) {
       const item = buySpeedItemFromPlan(row, row.plan, result);
-      pushUniqueBuySpeedItem(items, seen, item);
+      pushBuySpeedGroupItem(groups, item, txPerMarket);
     }
     if (row.bundle?.markets?.length) {
       for (const market of row.bundle.markets) {
         const item = buySpeedItemFromBundleMarket(row, market, result);
-        pushUniqueBuySpeedItem(items, seen, item);
+        pushBuySpeedGroupItem(groups, item, txPerMarket);
       }
     }
-    if (items.length >= limit) break;
+    if (groups.size >= marketLimit && newestGroupsHaveEnoughCandidates(groups, txPerMarket)) break;
   }
-  return items.slice(0, limit);
+  return [...groups.values()].slice(0, marketLimit);
 }
 
-function pushUniqueBuySpeedItem(items, seen, item) {
+function pushBuySpeedGroupItem(groups, item, txPerMarket) {
   if (!item?.market || !item.txHash) return;
-  const key = `${normAddress(item.market)}:${String(item.txHash).toLowerCase()}`;
-  if (seen.has(key)) return;
-  seen.add(key);
-  items.push(item);
+  const key = normAddress(item.market);
+  const group = groups.get(key) ?? {
+    market: item.market,
+    title: item.title,
+    latestAt: item.at,
+    seenTxs: new Set(),
+    items: []
+  };
+  const txKey = String(item.txHash).toLowerCase();
+  if (!group.seenTxs.has(txKey) && group.items.length < txPerMarket) {
+    group.seenTxs.add(txKey);
+    group.items.push(item);
+  }
+  groups.set(key, group);
+}
+
+function newestGroupsHaveEnoughCandidates(groups, txPerMarket) {
+  return [...groups.values()].every((group) => group.items.length >= Math.min(2, txPerMarket));
 }
 
 function buySpeedItemFromPlan(row, plan, result) {
@@ -1349,6 +2139,39 @@ async function computeBuySpeedStat(cfg, item, blockCache) {
   }]);
   const groups = groupMintLogs(logs);
   const rankIndex = groups.findIndex((group) => group.hash === String(item.txHash).toLowerCase());
+  const txStatus = String(receipt.status ?? "").toLowerCase();
+  if (txStatus && txStatus !== "0x1") {
+    return {
+      ...item,
+      ok: false,
+      dirty: true,
+      dirtyReason: "receipt_reverted",
+      receiptStatus: txStatus,
+      blockNumber: receiptBlock,
+      txIndex: receiptIndex,
+      blockTime: new Date(receiptBlockData.ts * 1000).toISOString(),
+      openDeltaSec: Number.isFinite(startTs) ? receiptBlockData.ts - startTs : null,
+      gasGwei: formatGwei(tx?.gasPrice ?? receipt.effectiveGasPrice),
+      gasUsed: hexNumber(receipt.gasUsed),
+      message: "transaction reverted"
+    };
+  }
+  if (rankIndex < 0) {
+    return {
+      ...item,
+      ok: false,
+      dirty: true,
+      dirtyReason: "no_market_mint_logs",
+      receiptStatus: txStatus || null,
+      blockNumber: receiptBlock,
+      txIndex: receiptIndex,
+      blockTime: new Date(receiptBlockData.ts * 1000).toISOString(),
+      openDeltaSec: Number.isFinite(startTs) ? receiptBlockData.ts - startTs : null,
+      gasGwei: formatGwei(tx?.gasPrice ?? receipt.effectiveGasPrice),
+      gasUsed: hexNumber(receipt.gasUsed),
+      message: "no matching mint logs for this market"
+    };
+  }
   const peerHashes = groups.slice(0, 5).map((group) => group.hash);
   const peerTxs = await rpcBatch(cfg, peerHashes.map((hash, id) => ({
     jsonrpc: "2.0",
@@ -1372,6 +2195,7 @@ async function computeBuySpeedStat(cfg, item, blockCache) {
   return {
     ...item,
     ok: true,
+    dirty: false,
     rank: rankIndex >= 0 ? rankIndex + 1 : null,
     before: rankIndex >= 0 ? rankIndex : null,
     blockNumber: receiptBlock,
@@ -1384,6 +2208,59 @@ async function computeBuySpeedStat(cfg, item, blockCache) {
     peers,
     truncated
   };
+}
+
+function cleanBuySpeedStats(items, limit) {
+  const byMarket = new Map();
+  for (const item of items) {
+    if (!item?.market || !item.txHash) continue;
+    const key = normAddress(item.market);
+    const current = byMarket.get(key);
+    if (!current || isBetterBuySpeedItem(item, current)) {
+      byMarket.set(key, item);
+    }
+  }
+  return [...byMarket.values()]
+    .sort(compareBuySpeedRecentDesc)
+    .slice(0, limit);
+}
+
+function isBetterBuySpeedItem(candidate, current) {
+  if (!current) return true;
+  const candidateQuality = buySpeedQuality(candidate);
+  const currentQuality = buySpeedQuality(current);
+  if (candidateQuality !== currentQuality) return candidateQuality > currentQuality;
+  const candidateRank = Number(candidate.rank);
+  const currentRank = Number(current.rank);
+  if (Number.isFinite(candidateRank) && Number.isFinite(currentRank) && candidateRank !== currentRank) {
+    return candidateRank < currentRank;
+  }
+  const candidateBlock = Number(candidate.blockNumber);
+  const currentBlock = Number(current.blockNumber);
+  if (Number.isFinite(candidateBlock) && Number.isFinite(currentBlock) && candidateBlock !== currentBlock) {
+    return candidateBlock < currentBlock;
+  }
+  const candidateIndex = Number(candidate.txIndex);
+  const currentIndex = Number(current.txIndex);
+  if (Number.isFinite(candidateIndex) && Number.isFinite(currentIndex) && candidateIndex !== currentIndex) {
+    return candidateIndex < currentIndex;
+  }
+  return new Date(candidate.at).getTime() < new Date(current.at).getTime();
+}
+
+function buySpeedQuality(item) {
+  if (item?.ok && !item.dirty && Number.isFinite(Number(item.rank))) return 3;
+  if (item?.ok && !item.dirty) return 2;
+  if (item?.blockNumber && item?.txIndex !== undefined) return 1;
+  return 0;
+}
+
+function compareBuySpeedRecentDesc(a, b) {
+  const blockDelta = Number(b.blockNumber ?? 0) - Number(a.blockNumber ?? 0);
+  if (blockDelta !== 0) return blockDelta;
+  const indexDelta = Number(b.txIndex ?? 0) - Number(a.txIndex ?? 0);
+  if (indexDelta !== 0) return indexDelta;
+  return new Date(b.at ?? 0).getTime() - new Date(a.at ?? 0).getTime();
 }
 
 function groupMintLogs(logs) {
@@ -1520,6 +2397,34 @@ async function fetchNewMarketsFeed() {
   } catch {
     return [];
   }
+}
+
+async function mergeBoughtMarketsIntoFeed(cfg, feed, walletRows = []) {
+  const merged = new Map();
+  for (const market of feed ?? []) {
+    if (!market?.address) continue;
+    merged.set(normAddress(market.address), market);
+  }
+
+  const boughtAddresses = [];
+  const seen = new Set();
+  for (const row of walletRows ?? []) {
+    if (String(row.type ?? "").toUpperCase() !== "MINT") continue;
+    const address = normAddress(row.marketAddress ?? row.market);
+    if (!address || merged.has(address) || seen.has(address)) continue;
+    seen.add(address);
+    boughtAddresses.push(address);
+  }
+
+  const limit = Number(process.env.DASHBOARD_BOUGHT_MARKETS_LIMIT ?? 50);
+  const details = await Promise.allSettled(
+    boughtAddresses.slice(0, limit).map((address) => fetchMarket(cfg, address))
+  );
+  for (const result of details) {
+    if (result.status !== "fulfilled" || !result.value?.address) continue;
+    merged.set(normAddress(result.value.address), result.value);
+  }
+  return [...merged.values()];
 }
 
 function mergeDashboardMarkets(...lists) {
@@ -1825,6 +2730,11 @@ function pct(value) {
   const num = Number(value ?? 0);
   const prefix = num > 0 ? "+" : "";
   return `${prefix}${num.toFixed(1)}%`;
+}
+
+function roundFixed(value, digits = 4) {
+  const scale = 10 ** digits;
+  return Math.round(Number(value ?? 0) * scale) / scale;
 }
 
 function num(value) {

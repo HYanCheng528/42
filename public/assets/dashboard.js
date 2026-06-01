@@ -31,11 +31,24 @@ const state = {
   route: routeFromHash(),
   marketFilter: "all",
   configDirty: false,
+  configGroup: "buy",
   selected: null,
   sellPercent: 100,
+  quickSell: false,
+  quickSellMinOutUsdt: "0.000001",
   quoteRequest: 0,
   quoteTimer: null,
-  timer: null
+  timer: null,
+  positionsFastRefresh: false,
+  positionsTimer: null,
+  positionsLoading: false,
+  positionsPendingForce: false,
+  lastRefreshMs: null,
+  lastPositionsRefreshMs: null,
+  overviewLoading: false,
+  overviewPendingForce: false,
+  marketDiagnostics: {},
+  operatorApprovals: {}
 };
 
 const ICONS = {
@@ -45,6 +58,7 @@ const ICONS = {
   "calendar-clock": `<path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3.5"></path><path d="M16 2v4"></path><path d="M8 2v4"></path><path d="M3 10h5"></path><circle cx="16" cy="16" r="6"></circle><path d="M16 14v2l1.5 1.5"></path>`,
   "circle-dollar-sign": `<circle cx="12" cy="12" r="10"></circle><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"></path><path d="M12 18V6"></path>`,
   clock: `<circle cx="12" cy="12" r="10"></circle><path d="M12 6v6l4 2"></path>`,
+  "key-round": `<path d="M2 18v3h3l7.4-7.4"></path><circle cx="15.5" cy="8.5" r="5.5"></circle><path d="m14 10 2-2"></path>`,
   "loader-circle": `<path d="M21 12a9 9 0 1 1-6.219-8.56"></path>`,
   "layers-3": `<path d="m12 2 9 5-9 5-9-5 9-5Z"></path><path d="m3 12 9 5 9-5"></path><path d="m3 17 9 5 9-5"></path>`,
   radio: `<path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"></path><path d="M7.8 16.2a6 6 0 0 1 0-8.5"></path><circle cx="12" cy="12" r="2"></circle><path d="M16.2 7.8a6 6 0 0 1 0 8.5"></path><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"></path>`,
@@ -66,6 +80,10 @@ const $ = (id) => document.getElementById(id);
 const els = {
   updated: $("updated"),
   refreshBtn: $("refreshBtn"),
+  fastRefresh: $("fastRefresh"),
+  positionRefresh: $("positionRefresh"),
+  positionFastRefresh: $("positionFastRefresh"),
+  positionUpdated: $("positionUpdated"),
   viewKicker: $("viewKicker"),
   viewTitle: $("viewTitle"),
   viewLead: $("viewLead"),
@@ -108,6 +126,9 @@ const els = {
   sellPercentText: $("sellPercentText"),
   sellPercentRange: $("sellPercentRange"),
   sellPercentInput: $("sellPercentInput"),
+  quickSellBox: $("quickSellBox"),
+  quickSell: $("quickSell"),
+  quickSellMinOut: $("quickSellMinOut"),
   quoteBox: $("quoteBox"),
   quoteRefresh: $("quoteRefresh"),
   confirmSell: $("confirmSell"),
@@ -122,55 +143,326 @@ bindApprovalControls();
 setRoute(state.route, { replace: true });
 
 els.refreshBtn.addEventListener("click", () => loadOverview({ force: true }));
+if (els.fastRefresh) els.fastRefresh.hidden = true;
+els.positionRefresh?.addEventListener("click", () => loadPositions({ force: true }));
+els.positionFastRefresh?.addEventListener("click", () => setPositionsFastRefresh(!state.positionsFastRefresh));
 window.addEventListener("hashchange", () => setRoute(routeFromHash(), { replace: true }));
 
-const CONFIG_FIELDS = [
-  { key: "DRY_RUN", label: "模拟交易", type: "boolean" },
-  { key: "EXECUTE", label: "允许真实下单", type: "boolean", danger: true },
-  { key: "I_UNDERSTAND_42_PRICE_MARKET_RISK", label: "确认交易风险", type: "ack", danger: true },
-  { key: "I_AM_NOT_IN_RESTRICTED_JURISDICTION", label: "确认地区合规", type: "ack", danger: true },
-  { key: "STAKE_PER_OUTCOME_USDT", label: "每档金额 U", type: "number", min: "0.01", step: "0.01" },
-  { key: "EVENT_OUTCOME_COUNT", label: "买入档数", type: "number", min: "1", step: "1" },
-  { key: "MAX_MARKET_STAKE_USDT", label: "单场上限 U", type: "number", min: "0.01", step: "0.01" },
-  { key: "MAX_BATCH_STAKE_USDT", label: "批次上限 U", type: "number", min: "0.01", step: "0.01" },
-  { key: "EVENT_OPEN_WINDOW_SECONDS", label: "开盘窗口秒", type: "number", min: "1", step: "1" },
-  { key: "GAS_PRICE_GWEI", label: "Gas 价格 gwei", type: "number", min: "0.01", step: "0.01" },
-  { key: "EVENT_DISCOVERY", label: "发现方式", type: "select", options: ["ws", "chain", "rest"] },
-  { key: "REST_DISCOVERY_ENABLED", label: "REST 补漏", type: "boolean" },
-  { key: "REST_DISCOVERY_POLL_MS", label: "REST 补漏间隔 ms", type: "number", min: "1", step: "100" },
-  { key: "WATCH_SCAN_LIMIT", label: "扫描数量", type: "number", min: "1", step: "1" },
-  { key: "MIN_MARKET_DURATION_HOURS", label: "最小时长 h", type: "number", min: "0", step: "0.1" },
-  { key: "EVENT_BUY_MODE", label: "买入模式", type: "select", options: ["fast", "quoted"] },
-  { key: "EVENT_OUTCOME_SELECTION", label: "选择策略", type: "select", options: ["lowest_odds", "all"] },
-  { key: "EVENT_OUTCOME_SELECTION_FALLBACK", label: "赔率缺失兜底", type: "select", options: ["token_order", "error"] },
-  { key: "WATCH_BUY_EXISTING", label: "启动买现有场", type: "boolean" },
-  { key: "AUTO_SELL_ENABLED", label: "自动止盈", type: "boolean" },
-  { key: "AUTO_SELL_PROFIT_MULTIPLIER", label: "止盈倍数", type: "number", min: "1.01", step: "0.01" },
-  { key: "AUTO_SELL_PERCENT", label: "止盈卖出 %", type: "number", min: "1", max: "100", step: "1" }
+const BUY_ENTRY_MODES = [
+  {
+    id: "instant",
+    label: "0s 抢买",
+    tone: "danger",
+    description: "开盘即广播，和早期抢买逻辑一致，不等 REST live 或报价模拟。",
+    params: ["延迟 0s", "不要求 REST live", "不报价", "允许链上未确认盘", "赔率缺失用 token 顺序"],
+    values: {
+      EVENT_OPEN_WINDOW_SECONDS: "25",
+      EVENT_BUY_DELAY_SECONDS: "0",
+      REQUIRE_REST_BEFORE_BUY: false,
+      REQUIRE_REST_STATUS: "",
+      REQUIRE_QUOTE_BEFORE_BUY: false,
+      REQUIRE_CHAIN_MINT_BEFORE_BUY: false,
+      ALLOW_ONCHAIN_ONLY_MARKETS: true,
+      EVENT_OUTCOME_SELECTION_FALLBACK: "token_order",
+      ARM_CATCH_UP_AFTER_FUNDING: false,
+      ARM_CATCH_UP_WINDOW_MS: "0"
+    }
+  },
+  {
+    id: "anti",
+    label: "反狙击安全门",
+    tone: "safe",
+    description: "等待开盘后的安全窗口，到点只买 REST 已变 live 的市场。",
+    params: ["默认延迟 20s", "要求 REST live", "不买链上未确认盘", "赔率缺失直接跳过", "不做 60s 补追"],
+    values: {
+      EVENT_OPEN_WINDOW_SECONDS: "25",
+      EVENT_BUY_DELAY_SECONDS: "20",
+      REQUIRE_REST_BEFORE_BUY: true,
+      REQUIRE_REST_STATUS: "live",
+      REQUIRE_QUOTE_BEFORE_BUY: false,
+      REQUIRE_CHAIN_MINT_BEFORE_BUY: false,
+      ALLOW_ONCHAIN_ONLY_MARKETS: false,
+      EVENT_OUTCOME_SELECTION_FALLBACK: "error",
+      ARM_CATCH_UP_AFTER_FUNDING: false,
+      ARM_CATCH_UP_WINDOW_MS: "0"
+    }
+  }
 ];
 
+const CONFIG_GROUPS = [
+  {
+    id: "safety",
+    label: "安全/实盘",
+    description: "实盘开关和确认项",
+    sections: [
+      {
+        title: "交易权限",
+        fields: [
+          { key: "DRY_RUN", label: "模拟交易", type: "boolean" },
+          { key: "EXECUTE", label: "允许真实下单", type: "boolean", danger: true },
+          { key: "I_UNDERSTAND_42_PRICE_MARKET_RISK", label: "确认交易风险", type: "ack", danger: true },
+          { key: "I_AM_NOT_IN_RESTRICTED_JURISDICTION", label: "确认地区合规", type: "ack", danger: true }
+        ]
+      }
+    ]
+  },
+  {
+    id: "buy",
+    label: "买入策略",
+    description: "仓位、筛选和 outcome 选择",
+    sections: [
+      {
+        title: "仓位",
+        fields: [
+          { key: "STAKE_PER_OUTCOME_USDT", label: "每档金额 U", type: "number", min: "0.01", step: "0.01" },
+          { key: "EVENT_OUTCOME_COUNT", label: "买入档数", type: "number", min: "1", step: "1" },
+          { key: "MAX_MARKET_STAKE_USDT", label: "单场上限 U", type: "number", min: "0.01", step: "0.01" },
+          { key: "MAX_BATCH_STAKE_USDT", label: "批次上限 U", type: "number", min: "0.01", step: "0.01" }
+        ]
+      },
+      {
+        title: "入场模式",
+        custom: "buyEntryMode"
+      },
+      {
+        title: "入场参数",
+        fields: [
+          { key: "EVENT_OPEN_WINDOW_SECONDS", label: "开盘容错截止秒", type: "number", min: "1", step: "1" },
+          { key: "EVENT_BUY_DELAY_SECONDS", label: "开盘后延迟买入秒", type: "number", min: "0", step: "1" },
+          { key: "REQUIRE_REST_BEFORE_BUY", label: "买前要求 REST 同步", type: "boolean" },
+          { key: "REQUIRE_REST_STATUS", label: "允许 REST 状态", type: "text" },
+          { key: "REQUIRE_QUOTE_BEFORE_BUY", label: "买前报价模拟", type: "boolean" },
+          { key: "REQUIRE_CHAIN_MINT_BEFORE_BUY", label: "要求已有链上成交", type: "boolean", danger: true },
+          { key: "ALLOW_ONCHAIN_ONLY_MARKETS", label: "允许链上未确认盘", type: "boolean", danger: true },
+          { key: "ARM_CATCH_UP_AFTER_FUNDING", label: "资金恢复补追", type: "boolean", danger: true },
+          { key: "ARM_CATCH_UP_WINDOW_MS", label: "补追窗口 ms", type: "number", min: "0", step: "1000" }
+        ]
+      },
+      {
+        title: "市场筛选",
+        fields: [
+          { key: "MIN_MARKET_DURATION_HOURS", label: "最小时长 h", type: "number", min: "0", step: "0.1" },
+          { key: "MARKET_ADDRESS_BLOCKLIST", label: "手动去除市场地址", type: "text" },
+          { key: "MARKET_QUESTION_BLOCKLIST", label: "手动去除关键词", type: "text" },
+          { key: "WATCH_BUY_EXISTING", label: "启动买现有场", type: "boolean" }
+        ]
+      },
+      {
+        title: "买入方式",
+        fields: [
+          { key: "EVENT_BUY_MODE", label: "买入模式", type: "select", options: ["fast", "quoted"] },
+          { key: "EVENT_OUTCOME_SELECTION", label: "选择策略", type: "select", options: ["lowest_odds", "all"] },
+          { key: "EVENT_OUTCOME_SELECTION_FALLBACK", label: "赔率缺失兜底", type: "select", options: ["token_order", "error"] }
+        ]
+      }
+    ]
+  },
+  {
+    id: "sell",
+    label: "卖出策略",
+    description: "各策略可同时开启，触发任意一个就卖",
+    sections: [
+      {
+        title: "总开关",
+        fields: [
+          { key: "AUTO_SELL_ENABLED", label: "自动卖出总开关", type: "boolean" },
+          { key: "AUTO_SELL_POLL_MS", label: "止盈轮询 ms", type: "number", min: "1", step: "100" },
+          { key: "AUTO_SELL_MIN_OUT_MODE", label: "止盈 minOut", type: "select", options: ["quote", "manual"] },
+          { key: "AUTO_SELL_MANUAL_MIN_OUT_USDT", label: "手动 minOut U", type: "number", min: "0", step: "0.000001" }
+        ]
+      },
+      {
+        title: "原倍数止盈",
+        fields: [
+          { key: "AUTO_SELL_ORIGINAL_ENABLED", label: "启用原倍数止盈", type: "boolean" },
+          { key: "AUTO_SELL_PROFIT_MULTIPLIER", label: "止盈倍数", type: "number", min: "1.01", step: "0.01" },
+          { key: "AUTO_SELL_PERCENT", label: "卖出 %", type: "number", min: "1", max: "100", step: "1" }
+        ]
+      },
+      {
+        title: "固定移动止盈",
+        fields: [
+          { key: "AUTO_SELL_FIXED_TRAILING_ENABLED", label: "启用固定移动止盈", type: "boolean" },
+          { key: "AUTO_SELL_TRAILING_START_DELAY_SECONDS", label: "延迟触发秒", type: "number", min: "0", step: "1" },
+          { key: "AUTO_SELL_TRAILING_ARM_PROFIT_PCT", label: "启动盈利 %", type: "number", min: "0", step: "0.1" },
+          { key: "AUTO_SELL_TRAILING_DRAWDOWN_PCT", label: "峰值回撤 %", type: "number", min: "0.01", max: "100", step: "0.1" },
+          { key: "AUTO_SELL_TRAILING_PERCENT", label: "卖出 %", type: "number", min: "1", max: "100", step: "1" }
+        ]
+      },
+      {
+        title: "自适应移动止盈",
+        fields: [
+          { key: "AUTO_SELL_ADAPTIVE_TRAILING_ENABLED", label: "启用自适应移动止盈", type: "boolean" },
+          { key: "AUTO_SELL_ADAPTIVE_START_DELAY_SECONDS", label: "延迟触发秒", type: "number", min: "0", step: "1" },
+          { key: "AUTO_SELL_ADAPTIVE_ARM_PROFIT_PCT", label: "启动盈利 %", type: "number", min: "0", step: "0.1" },
+          { key: "AUTO_SELL_ADAPTIVE_PERCENT", label: "卖出 %", type: "number", min: "1", max: "100", step: "1" }
+        ]
+      },
+      {
+        title: "自适应高级参数",
+        collapsible: true,
+        fields: [
+          { key: "AUTO_SELL_ADAPTIVE_EARLY_SECONDS", label: "早期固定秒", type: "number", min: "0", step: "1" },
+          { key: "AUTO_SELL_ADAPTIVE_EARLY_DRAWDOWN_PCT", label: "早期回撤 %", type: "number", min: "0.01", max: "100", step: "0.1" },
+          { key: "AUTO_SELL_ADAPTIVE_WINDOW_SECONDS", label: "波动窗口秒", type: "number", min: "0", step: "1" },
+          { key: "AUTO_SELL_ADAPTIVE_MIN_SAMPLES", label: "最少样本", type: "number", min: "1", step: "1" },
+          { key: "AUTO_SELL_ADAPTIVE_SMALL_JUMP_PCT", label: "小波动跳动 %", type: "number", min: "0", step: "0.1" },
+          { key: "AUTO_SELL_ADAPTIVE_SMALL_RANGE_PCT", label: "小波动振幅 %", type: "number", min: "0", step: "0.1" },
+          { key: "AUTO_SELL_ADAPTIVE_SMALL_DRAWDOWN_PCT", label: "小波动回撤 %", type: "number", min: "0.01", max: "100", step: "0.1" },
+          { key: "AUTO_SELL_ADAPTIVE_NORMAL_DRAWDOWN_PCT", label: "正常波动回撤 %", type: "number", min: "0.01", max: "100", step: "0.1" },
+          { key: "AUTO_SELL_ADAPTIVE_LARGE_JUMP_PCT", label: "大波动跳动 %", type: "number", min: "0", step: "0.1" },
+          { key: "AUTO_SELL_ADAPTIVE_LARGE_RANGE_PCT", label: "大波动振幅 %", type: "number", min: "0", step: "0.1" },
+          { key: "AUTO_SELL_ADAPTIVE_LARGE_DRAWDOWN_PCT", label: "大波动回撤 %", type: "number", min: "0.01", max: "100", step: "0.1" }
+        ]
+      },
+      {
+        title: "弱势超时退出",
+        fields: [
+          { key: "AUTO_SELL_WEAK_EXIT_ENABLED", label: "启用弱势超时退出", type: "boolean" },
+          { key: "AUTO_SELL_WEAK_EXIT_AFTER_OPEN_SECONDS", label: "超时检查秒", type: "number", min: "0", step: "1" },
+          { key: "AUTO_SELL_WEAK_EXIT_MIN_PEAK_PROFIT_PCT", label: "需达到峰值盈利 %", type: "number", min: "0", step: "0.1" },
+          { key: "AUTO_SELL_WEAK_EXIT_MAX_CURRENT_PROFIT_PCT", label: "当前盈利低于 %", type: "number", min: "-100", step: "0.1" },
+          { key: "AUTO_SELL_WEAK_EXIT_PERCENT", label: "卖出 %", type: "number", min: "1", max: "100", step: "1" }
+        ]
+      },
+      {
+        title: "保本回落卖出",
+        fields: [
+          { key: "AUTO_SELL_BREAKEVEN_ENABLED", label: "启用保本回落卖出", type: "boolean" },
+          { key: "AUTO_SELL_BREAKEVEN_START_DELAY_SECONDS", label: "延迟触发秒", type: "number", min: "0", step: "1" },
+          { key: "AUTO_SELL_BREAKEVEN_ARM_PROFIT_PCT", label: "启动盈利 %", type: "number", min: "0", step: "0.1" },
+          { key: "AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT", label: "回落到盈利 %", type: "number", min: "-100", step: "0.1" },
+          { key: "AUTO_SELL_BREAKEVEN_PERCENT", label: "卖出 %", type: "number", min: "1", max: "100", step: "1" }
+        ]
+      }
+    ]
+  },
+  {
+    id: "advanced",
+    label: "高级",
+    description: "数据源、Gas 和扫描参数",
+    sections: [
+      {
+        title: "执行参数",
+        fields: [
+          { key: "GAS_PRICE_GWEI", label: "买入 Gas gwei", type: "number", min: "0.01", step: "0.01" },
+          { key: "SELL_GAS_PRICE_GWEI", label: "卖出 Gas gwei", type: "number", min: "0.01", step: "0.01" },
+          { key: "OPERATOR_APPROVE_GAS_PRICE_GWEI", label: "卖出授权 Gas gwei", type: "number", min: "0.01", step: "0.01" },
+          { key: "SLIPPAGE_BPS", label: "报价滑点 bps", type: "number", min: "0", max: "5000", step: "1" },
+          { key: "FAST_SELL_GAS_LIMIT", label: "极速卖出 Gas", type: "number", min: "0", step: "10000" }
+        ]
+      },
+      {
+        title: "发现和补漏",
+        fields: [
+          { key: "EVENT_DISCOVERY", label: "发现方式", type: "select", options: ["ws", "chain", "rest"] },
+          { key: "REST_DISCOVERY_ENABLED", label: "REST 补漏", type: "boolean" },
+          { key: "REST_DISCOVERY_POLL_MS", label: "REST 补漏间隔 ms", type: "number", min: "1", step: "100" },
+          { key: "WATCH_SCAN_LIMIT", label: "扫描数量", type: "number", min: "1", step: "1" }
+        ]
+      }
+    ]
+  }
+];
+
+const CONFIG_FIELDS = CONFIG_GROUPS.flatMap((group) =>
+  group.sections.flatMap((section) => section.fields ?? [])
+);
+
 loadOverview();
-state.timer = setInterval(() => {
-  updateCountdowns();
-  loadOverview();
-}, 5000);
+scheduleOverviewTimer();
+schedulePositionsTimer();
 setInterval(updateCountdowns, 1000);
 
 async function loadOverview({ force = false } = {}) {
+  if (state.overviewLoading) {
+    state.overviewPendingForce = state.overviewPendingForce || force;
+    return;
+  }
+  state.overviewLoading = true;
   if (force) els.refreshBtn.disabled = true;
+  const startedAt = performance.now();
   try {
-    const data = await api("/api/overview");
+    const query = force ? "?force=1" : "";
+    const data = await api(`/api/overview${query}`);
+    state.lastRefreshMs = Math.round(performance.now() - startedAt);
     state.data = data;
     render(data);
   } catch (error) {
     showToast(error.message || "刷新失败");
   } finally {
+    state.overviewLoading = false;
     els.refreshBtn.disabled = false;
+    if (state.overviewPendingForce) {
+      state.overviewPendingForce = false;
+      loadOverview({ force: true });
+    }
   }
 }
 
+function scheduleOverviewTimer() {
+  if (state.timer) clearInterval(state.timer);
+  state.timer = setInterval(() => {
+    updateCountdowns();
+    loadOverview();
+  }, 5000);
+}
+
+function schedulePositionsTimer() {
+  if (state.positionsTimer) clearInterval(state.positionsTimer);
+  state.positionsTimer = setInterval(() => {
+    if (state.positionsFastRefresh) loadPositions();
+  }, 1000);
+}
+
+function setPositionsFastRefresh(enabled) {
+  state.positionsFastRefresh = Boolean(enabled);
+  els.positionFastRefresh?.classList.toggle("isActive", state.positionsFastRefresh);
+  els.positionFastRefresh?.setAttribute("aria-pressed", state.positionsFastRefresh ? "true" : "false");
+  if (state.positionsFastRefresh) loadPositions({ force: true });
+}
+
+async function loadPositions({ force = false } = {}) {
+  if (state.positionsLoading) {
+    state.positionsPendingForce = state.positionsPendingForce || force;
+    return;
+  }
+  state.positionsLoading = true;
+  if (force && els.positionRefresh) els.positionRefresh.disabled = true;
+  const startedAt = performance.now();
+  try {
+    const query = force ? "?force=1" : "";
+    const data = await api(`/api/positions${query}`);
+    state.lastPositionsRefreshMs = Math.round(performance.now() - startedAt);
+    applyPositionsSnapshot(data);
+  } catch (error) {
+    showToast(error.message || "持仓刷新失败");
+  } finally {
+    state.positionsLoading = false;
+    if (els.positionRefresh) els.positionRefresh.disabled = false;
+    if (state.positionsPendingForce) {
+      state.positionsPendingForce = false;
+      loadPositions({ force: true });
+    }
+  }
+}
+
+function applyPositionsSnapshot(data) {
+  if (!state.data) return;
+  state.data.holdings = data.holdings;
+  state.data.analytics = state.data.analytics ?? {};
+  state.data.analytics.cards = {
+    ...(state.data.analytics.cards ?? {}),
+    ...(data.cards ?? {})
+  };
+  renderPositions(state.data);
+  updatePositionRefreshText(data.updatedAt, data.elapsedMs);
+}
+
 function render(data) {
-  els.updated.textContent = `更新 ${formatTime(data.updatedAt)}`;
+  const refreshText = state.lastRefreshMs === null ? "" : ` · ${state.lastRefreshMs}ms`;
+  const modeText = "";
+  els.updated.textContent = `更新 ${formatTime(data.updatedAt)}${refreshText}${modeText}`;
   els.botState.textContent = data.bot.label;
   els.botState.className = data.bot.tone;
   els.fundingState.textContent = data.wallet?.ready ? "够" : "不足";
@@ -183,6 +475,7 @@ function render(data) {
   renderBuySpeed(data.buySpeed);
   renderExecution(data.activity);
   renderStrategy(data);
+  updatePositionRefreshText(data.updatedAt, null);
   updateCountdowns();
 }
 
@@ -224,7 +517,8 @@ function renderOverview(data) {
   els.overviewNextAction.innerHTML = next ? `
     <div class="nextAction">
       <strong title="${escapeAttr(next.title)}">${escapeHtml(next.title)}</strong>
-      <span>${formatDate(next.startsAt)} · 买 ${next.choices} 档 · ${next.stake} U</span>
+      <span>${escapeHtml(marketScheduleText(next))}</span>
+      <span>outcome ${formatOutcomeCount(next)} 个 · 买 ${next.choices} 档 · ${next.stake} U</span>
       <span class="tag" data-countdown="${escapeAttr(next.startsAt)}">--</span>
     </div>
   ` : `<div class="empty">暂无待开盘市场</div>`;
@@ -249,22 +543,215 @@ function renderNewMarkets(feed) {
   els.newMarketList.innerHTML = `
     <div class="tableHeader marketRow">
       <span>Market</span>
-      <span>Start</span>
+      <span>时间</span>
+      <span>Outcome</span>
       <span>State</span>
       <span>Stake</span>
     </div>
     ${items.map((item) => `
       <div class="marketRow">
         <div class="marketQuestion">
-          <strong title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</strong>
-          <small>${escapeHtml(item.meta ?? `${item.category || "Event Market"} · 买 ${item.choices} 档`)}</small>
+          <div class="marketQuestionTop">
+            <strong title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</strong>
+            ${renderOperatorApprovalButton(item)}
+            ${renderMarketDiagnoseButton(item)}
+            ${renderMarketExclusionButton(item)}
+          </div>
+          <small>${escapeHtml(item.meta ?? marketInlineMeta(item))}</small>
+          ${renderMarketDiagnostics(item)}
         </div>
-        <div>${formatDate(item.startsAt)}</div>
+        <div class="marketTimes">${marketScheduleHtml(item)}</div>
+        <div class="outcomeCountCell"><strong>${formatOutcomeCount(item)}</strong><small>个</small></div>
         <div><span class="marketState ${marketStateTone(item.tone)}">${escapeHtml(item.state)}</span></div>
         <div>${item.stake} U</div>
       </div>
     `).join("")}
   `;
+  for (const button of document.querySelectorAll("[data-market-diagnose]")) {
+    button.addEventListener("click", () => diagnoseMarket(button.dataset.marketDiagnose));
+  }
+  bindOperatorApprovalButtons();
+  for (const button of document.querySelectorAll("[data-market-exclude-action]")) {
+    button.addEventListener("click", () => updateMarketExclusion(button.dataset.market, button.dataset.marketExcludeAction));
+  }
+}
+
+function renderOperatorApprovalButton(item) {
+  if (!item.market) return "";
+  const key = marketKey(item.market);
+  const stateItem = state.operatorApprovals[key] ?? {};
+  const loading = Boolean(stateItem.loading);
+  const approved = Boolean(stateItem.approved);
+  const pending = Boolean(stateItem.pending);
+  const label = approved ? "卖出授权已完成" : pending ? "卖出授权已广播" : loading ? "卖出授权中" : "提前授权卖出";
+  return `
+    <button class="ghost iconButton miniIconButton operatorApprovalBtn ${approved ? "isApproved" : ""}" type="button" title="${label}" aria-label="${label}" data-operator-approve="${escapeAttr(item.market)}" data-title="${escapeAttr(item.title ?? "")}" ${loading || pending || approved ? "disabled" : ""}>
+      ${icon(loading ? "loader-circle" : "key-round")}
+    </button>
+  `;
+}
+
+function renderMarketDiagnoseButton(item) {
+  if (!item.market) return "";
+  const key = marketKey(item.market);
+  const diagnostics = state.marketDiagnostics[key] ?? {};
+  const loading = Boolean(diagnostics.loading);
+  const label = loading ? "诊断中" : "诊断市场";
+  return `
+    <button class="ghost iconButton miniIconButton marketDiagnoseBtn" type="button" title="${label}" aria-label="${label}" data-market-diagnose="${escapeAttr(item.market)}" ${loading ? "disabled" : ""}>
+      ${icon(loading ? "loader-circle" : "shield-check")}
+    </button>
+  `;
+}
+
+function renderMarketExclusionButton(item) {
+  if (!item.market) return "";
+  const excluded = Boolean(item.manuallyExcluded);
+  const action = excluded ? "restore" : "exclude";
+  const label = excluded ? "恢复这个市场" : "去除这个市场";
+  return `
+    <button class="ghost iconButton miniIconButton ${excluded ? "isActive" : ""}" type="button" title="${label}" aria-label="${label}" data-market="${escapeAttr(item.market)}" data-market-exclude-action="${action}">
+      ${icon(excluded ? "refresh-cw" : "x")}
+    </button>
+  `;
+}
+
+function renderMarketDiagnostics(item) {
+  if (!item.market) return "";
+  const key = marketKey(item.market);
+  const override = state.marketDiagnostics[key];
+  const diagnostics = override ?? item.diagnostics ?? {};
+  const badges = diagnostics.badges ?? [];
+  const loading = Boolean(diagnostics.loading);
+  const error = diagnostics.error ?? "";
+  const checkedAt = diagnostics.checkedAt ? ` · ${formatTime(diagnostics.checkedAt)}` : "";
+  if (!badges.length && !loading && !error && !diagnostics.checkedAt) return "";
+  return `
+    <div class="marketEvidence">
+      ${badges.map(renderMarketEvidenceBadge).join("")}
+      ${loading ? `<span class="evidenceTag evidenceNeutral">诊断中</span>` : ""}
+      ${error ? `<span class="evidenceTag evidenceBad" title="${escapeAttr(error)}">诊断失败</span>` : ""}
+    </div>
+    ${diagnostics.checkedAt ? `<div class="marketEvidenceMeta">诊断 ${escapeHtml(checkedAt.replace(/^ · /, ""))}</div>` : ""}
+  `;
+}
+
+function renderMarketEvidenceBadge(badge) {
+  return `<span class="evidenceTag ${marketEvidenceTone(badge.tone)}" title="${escapeAttr(badge.detail ?? "")}">${escapeHtml(badge.label)}${badge.detail ? `<small>${escapeHtml(badge.detail)}</small>` : ""}</span>`;
+}
+
+function marketEvidenceTone(tone) {
+  if (tone === "good") return "evidenceGood";
+  if (tone === "warn") return "evidenceWarn";
+  if (tone === "bad") return "evidenceBad";
+  return "evidenceNeutral";
+}
+
+function bindOperatorApprovalButtons() {
+  for (const button of document.querySelectorAll("[data-operator-approve]")) {
+    if (button.dataset.operatorBound === "1") continue;
+    button.dataset.operatorBound = "1";
+    button.addEventListener("click", () => approveOperatorForMarket(button.dataset.operatorApprove, button.dataset.title));
+  }
+}
+
+async function approveOperatorForMarket(market, title = "") {
+  const key = marketKey(market);
+  if (!key) return;
+  const current = state.operatorApprovals[key] ?? {};
+  if (current.loading || current.approved) return;
+  const name = title || shortAddress(market);
+  const confirmed = window.confirm(`这会提交真实链上交易：给该市场开启卖出 operator 授权。它不按数量限制，会覆盖这个市场的全部 outcome 卖出权限，并消耗少量 BNB gas。继续授权「${name}」？`);
+  if (!confirmed) return;
+  state.operatorApprovals[key] = { ...current, loading: true, error: "" };
+  rerenderMarketViews();
+  try {
+    const data = await api("/api/operator/approve", {
+      method: "POST",
+      body: JSON.stringify({ market, title })
+    });
+    const approval = data.operatorApproval ?? {};
+    const approved = Boolean(approval.approved || approval.operatorApproved || approval.alreadyApproved);
+    const pending = approval.status === "broadcast" && !approved;
+    const statusText = approval.statusText || (approved ? "已授权" : "已广播");
+    state.operatorApprovals[key] = {
+      loading: false,
+      approved,
+      pending,
+      statusText,
+      txHash: approval.txHash || ""
+    };
+    showToast(approval.txHash ? `${statusText} · ${shortAddress(approval.txHash)}` : statusText);
+    await loadOverview({ force: true });
+  } catch (error) {
+    state.operatorApprovals[key] = {
+      loading: false,
+      approved: false,
+      error: error.message || "卖出授权失败"
+    };
+    showToast(error.message || "卖出授权失败");
+  } finally {
+    rerenderMarketViews();
+  }
+}
+
+function rerenderMarketViews() {
+  if (!state.data) return;
+  renderMarkets(state.data);
+  renderHoldings(state.data.holdings);
+}
+
+async function diagnoseMarket(market) {
+  const key = marketKey(market);
+  if (!key) return;
+  state.marketDiagnostics[key] = {
+    ...(state.marketDiagnostics[key] ?? {}),
+    loading: true,
+    error: ""
+  };
+  if (state.data) renderNewMarkets(state.data.newMarkets);
+  try {
+    const data = await api("/api/market/diagnostics", {
+      method: "POST",
+      body: JSON.stringify({ market })
+    });
+    state.marketDiagnostics[key] = {
+      ...data,
+      loading: false,
+      error: ""
+    };
+  } catch (error) {
+    state.marketDiagnostics[key] = {
+      ...(state.marketDiagnostics[key] ?? {}),
+      loading: false,
+      error: error.message || "诊断失败"
+    };
+    toast(error.message || "诊断失败", true);
+  }
+  if (state.data) renderNewMarkets(state.data.newMarkets);
+}
+
+async function updateMarketExclusion(market, action) {
+  if (!market) return;
+  const isRestore = action === "restore";
+  const message = isRestore ? "恢复这个市场进入候选？" : "把这个市场加入手动去除名单？";
+  if (!window.confirm(message)) return;
+  try {
+    const data = await api("/api/market/exclusion", {
+      method: "POST",
+      body: JSON.stringify({ market, action })
+    });
+    state.configDirty = false;
+    renderConfig(data.config, state.data?.settings?.runtimeStatus);
+    setRestartStatus(isRestore ? "已恢复市场，重启 Watch 后生效" : "已去除市场，重启 Watch 后生效", "warn");
+    showToast(isRestore ? "已从手动去除名单移除" : "已加入手动去除名单");
+    await loadOverview({ force: true });
+    if (window.confirm("立即重启 Watch 让手动去除名单生效？")) {
+      await restartWatch({ confirm: false });
+    }
+  } catch (error) {
+    showToast(error.message || "更新去除名单失败");
+  }
 }
 
 function renderNext(next) {
@@ -275,11 +762,42 @@ function renderNext(next) {
   }
   els.upcomingList.innerHTML = next.items.map((item) => `
     <div class="compactRow">
-      <strong title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</strong>
-      <span>${formatDate(item.startsAt)} · 买 ${item.choices} 档 · ${item.stake} U</span>
+      <div class="compactTop">
+        <strong title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</strong>
+        ${renderOperatorApprovalButton(item)}
+      </div>
+      <span>${escapeHtml(marketScheduleText(item))}</span>
+      <span>${escapeHtml(marketInlineMeta(item))} · ${item.stake} U</span>
       <span class="tag" data-countdown="${escapeAttr(item.startsAt)}">--</span>
     </div>
   `).join("");
+  bindOperatorApprovalButtons();
+}
+
+function formatOutcomeCount(item) {
+  const count = Number(item?.outcomeCount ?? item?.availableOutcomeCount ?? item?.choices ?? 0);
+  return Number.isFinite(count) ? String(count) : "0";
+}
+
+function marketInlineMeta(item) {
+  return [
+    item?.category || "Event Market",
+    item?.curve?.label || "",
+    `outcome ${formatOutcomeCount(item)} 个`,
+    `买 ${item?.choices ?? "--"} 档`
+  ].filter(Boolean).join(" · ");
+}
+
+function marketScheduleText(item) {
+  return `开 ${formatDate(item.startsAt)} · 闭 ${formatDate(item.endsAt)} · 持续 ${marketDurationLabel(item)}`;
+}
+
+function marketScheduleHtml(item) {
+  return `
+    <span>开 ${formatDate(item.startsAt)}</span>
+    <span>闭 ${formatDate(item.endsAt)}</span>
+    <small>持续 ${escapeHtml(marketDurationLabel(item))}</small>
+  `;
 }
 
 function renderPositions(data) {
@@ -292,6 +810,14 @@ function renderPositions(data) {
   `;
   renderHoldings(data.holdings);
   renderProjectStats(data.analytics.projects);
+}
+
+function updatePositionRefreshText(updatedAt, serverElapsedMs = null) {
+  if (!els.positionUpdated) return;
+  const clientMs = state.lastPositionsRefreshMs === null ? "" : ` · ${state.lastPositionsRefreshMs}ms`;
+  const serverMs = serverElapsedMs === null || serverElapsedMs === undefined ? "" : ` · 接口${serverElapsedMs}ms`;
+  const mode = state.positionsFastRefresh ? " · 收益1s" : "";
+  els.positionUpdated.textContent = `持仓 ${formatTime(updatedAt)}${clientMs}${serverMs}${mode}`;
 }
 
 function renderHoldings(holdings) {
@@ -309,6 +835,7 @@ function renderHoldings(holdings) {
         </div>
         <div class="marketActions">
           <strong class="${group.positive ? "good" : "bad"}">${group.pnl} U</strong>
+          ${renderOperatorApprovalButton({ market: group.market, title: group.title })}
           <button class="ghost iconButton marketSellBtn" data-sell='${escapeAttr(JSON.stringify(marketSellPayload(group)))}' ${group.sellable ? "" : "disabled"}>
             ${icon("badge-dollar-sign")}<span>卖本市场</span>
           </button>
@@ -323,6 +850,7 @@ function renderHoldings(holdings) {
   for (const button of document.querySelectorAll("[data-sell]")) {
     button.addEventListener("click", () => openSell(JSON.parse(button.dataset.sell)));
   }
+  bindOperatorApprovalButtons();
 }
 
 function marketSellPayload(group) {
@@ -389,13 +917,13 @@ function renderBuySpeed(speed) {
         <span>${formatTime(item.at)} · ${escapeHtml(item.stake || "--")} · ${escapeHtml(String(item.outcomes ?? "--"))} 档</span>
       </div>
       <div class="speedStats">
-        <div class="stat"><span>排名</span><strong>${item.ok && item.rank ? `第 ${item.rank}` : "--"}</strong></div>
-        <div class="stat"><span>Block</span><strong>${item.ok ? item.blockNumber : "--"}</strong></div>
-        <div class="stat"><span>TxIndex</span><strong>${item.ok ? item.txIndex : "--"}</strong></div>
+        <div class="stat"><span>排名</span><strong>${item.rank ? `第 ${item.rank}` : "--"}</strong></div>
+        <div class="stat"><span>Block</span><strong>${item.blockNumber ?? "--"}</strong></div>
+        <div class="stat"><span>TxIndex</span><strong>${item.txIndex ?? "--"}</strong></div>
         <div class="stat"><span>Gas</span><strong>${escapeHtml(item.gasGwei || "--")}</strong></div>
         <div class="stat"><span>开盘偏差</span><strong>${item.openDeltaSec === null || item.openDeltaSec === undefined ? "--" : `${item.openDeltaSec}s`}</strong></div>
       </div>
-      ${item.ok ? renderSpeedPeers(item.peers) : `<div class="speedError">${escapeHtml(item.message || "统计失败")}</div>`}
+      ${item.peers?.length ? renderSpeedPeers(item.peers) : `<div class="speedError">${escapeHtml(item.message || "未确认买入排名")}</div>`}
     </div>
   `).join("");
 }
@@ -472,6 +1000,10 @@ function renderConfig(config, runtimeStatus = null) {
   if (state.configDirty && els.configForm.contains(document.activeElement)) return;
   const values = config.values ?? {};
   const runtime = config.runtime ?? {};
+  const selectedGroup = CONFIG_GROUPS.some((group) => group.id === state.configGroup)
+    ? state.configGroup
+    : CONFIG_GROUPS[0].id;
+  state.configGroup = selectedGroup;
   els.configFileText.textContent = `${config.file ?? ".env.local"} · ${runtime.dryRun ? "dry-run" : "execute"}`;
   els.configForm.innerHTML = `
     ${renderWatchRuntime(runtimeStatus)}
@@ -480,8 +1012,124 @@ function renderConfig(config, runtimeStatus = null) {
       <span>私钥 ${runtime.privateKeyLoaded ? "已加载" : "未加载"}</span>
       <span>RPC ${runtime.rpcConfigured && runtime.wsConfigured ? "已配置" : "缺失"}</span>
     </div>
-    ${CONFIG_FIELDS.map((field) => renderConfigField(field, values[field.key])).join("")}
+    ${renderConfigTabs(selectedGroup)}
+    <div class="configGroups">
+      ${CONFIG_GROUPS.map((group) => renderConfigGroup(group, values, selectedGroup)).join("")}
+    </div>
   `;
+}
+
+function renderConfigTabs(selectedGroup) {
+  return `
+    <div class="configTabs" role="tablist" aria-label="配置分组">
+      ${CONFIG_GROUPS.map((group) => `
+        <button class="${group.id === selectedGroup ? "isActive" : ""}" type="button" role="tab" aria-selected="${group.id === selectedGroup ? "true" : "false"}" data-config-group="${escapeAttr(group.id)}">
+          ${escapeHtml(group.label)}
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderConfigGroup(group, values, selectedGroup) {
+  return `
+    <section class="configGroup ${group.id === selectedGroup ? "isActive" : ""}" data-config-panel="${escapeAttr(group.id)}" role="tabpanel">
+      <div class="configGroupHead">
+        <h4>${escapeHtml(group.label)}</h4>
+        <span>${escapeHtml(group.description)}</span>
+      </div>
+      ${group.sections.map((section) => renderConfigSection(section, values)).join("")}
+    </section>
+  `;
+}
+
+function renderConfigSection(section, values) {
+  if (section.custom === "buyEntryMode") return renderBuyEntryModeSection(section, values);
+
+  const content = `
+    <div class="configSectionGrid ${section.fields.length <= 2 ? "compact" : ""}">
+      ${section.fields.map((field) => renderConfigField(field, values[field.key])).join("")}
+    </div>
+  `;
+  if (section.collapsible) {
+    return `
+      <details class="configSection configSectionAdvanced">
+        <summary>${escapeHtml(section.title)}</summary>
+        ${content}
+      </details>
+    `;
+  }
+  return `
+    <section class="configSection">
+      <div class="configSectionHead">
+        <h5>${escapeHtml(section.title)}</h5>
+      </div>
+      ${content}
+    </section>
+  `;
+}
+
+function renderBuyEntryModeSection(section, values) {
+  const activeMode = detectBuyEntryMode(values);
+  return `
+    <section class="configSection">
+      <div class="configSectionHead">
+        <h5>${escapeHtml(section.title)}</h5>
+      </div>
+      <div class="buyEntryModes" data-buy-entry-current="${escapeAttr(activeMode)}">
+        ${BUY_ENTRY_MODES.map((mode) => renderBuyEntryModeCard(mode, activeMode)).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderBuyEntryModeCard(mode, activeMode) {
+  const active = activeMode === mode.id;
+  return `
+    <button class="buyEntryMode ${mode.tone ?? ""} ${active ? "isActive" : ""}" type="button" data-buy-entry-mode="${escapeAttr(mode.id)}">
+      <span class="buyEntryModeTop">
+        <strong>${escapeHtml(mode.label)}</strong>
+        <span>${active ? "当前" : "套用"}</span>
+      </span>
+      <small>${escapeHtml(mode.description)}</small>
+      <span class="buyEntryModeParams">
+        ${mode.params.map((item) => `<em>${escapeHtml(item)}</em>`).join("")}
+      </span>
+    </button>
+  `;
+}
+
+function detectBuyEntryMode(values) {
+  const delay = Number(values.EVENT_BUY_DELAY_SECONDS ?? 0);
+  const restStatus = String(values.REQUIRE_REST_STATUS ?? "").trim().toLowerCase();
+  const requireRest = truthy(values.REQUIRE_REST_BEFORE_BUY);
+  const requireQuote = truthy(values.REQUIRE_QUOTE_BEFORE_BUY);
+  const requireChainMint = truthy(values.REQUIRE_CHAIN_MINT_BEFORE_BUY);
+  const allowOnchainOnly = truthy(values.ALLOW_ONCHAIN_ONLY_MARKETS);
+  const fallback = String(values.EVENT_OUTCOME_SELECTION_FALLBACK ?? "").trim();
+
+  if (
+    delay === 0 &&
+    !requireRest &&
+    !restStatus &&
+    !requireQuote &&
+    !requireChainMint &&
+    allowOnchainOnly &&
+    fallback === "token_order"
+  ) {
+    return "instant";
+  }
+
+  if (
+    delay > 0 &&
+    (requireRest || restStatus.split(",").map((item) => item.trim()).includes("live")) &&
+    !allowOnchainOnly &&
+    fallback === "error"
+  ) {
+    return "anti";
+  }
+
+  return "custom";
 }
 
 function renderWatchRuntime(runtime) {
@@ -505,12 +1153,25 @@ function renderWatchRuntime(runtime) {
       <span>买入 ${strategy.eventOutcomeCount ?? "--"} 档 x ${strategy.stakePerOutcomeUsdt ?? "--"}U</span>
       <span>时长 ≥ ${strategy.minMarketDurationHours ?? "--"}h</span>
       <span>REST ${restText}</span>
-      <span>Gas ${runtime.execution?.gasPriceGwei ?? "--"} gwei</span>
+      <span>买 ${runtime.execution?.gasPriceGwei ?? "--"} / 卖 ${runtime.execution?.sellGasPriceGwei ?? runtime.execution?.gasPriceGwei ?? "--"} / 授权 ${runtime.execution?.operatorApproveGasPriceGwei ?? runtime.execution?.gasPriceGwei ?? "--"} gwei</span>
       <span>广播 ${dataSources.broadcastRpcCount ?? 0} 节点</span>
-      <span>止盈 ${autoSell.enabled ? `${autoSell.profitMultiplier}x / ${autoSell.percent}%` : "关"}</span>
+      <span>止盈 ${autoSellSummary(autoSell)}</span>
       <span>快照 ${runtime.file ?? "--"}</span>
     </div>
   `;
+}
+
+function autoSellSummary(autoSell) {
+  if (!autoSell?.enabled) return "关";
+  const parts = [];
+  if (autoSell.originalEnabled) parts.push(`${autoSell.profitMultiplier}x/${autoSell.percent}%`);
+  if (autoSell.fixedTrailing?.enabled) {
+    parts.push(`固定${autoSell.fixedTrailing.armProfitPct}%/${autoSell.fixedTrailing.drawdownPct}%`);
+  }
+  if (autoSell.adaptiveTrailing?.enabled) parts.push("自适应");
+  if (autoSell.weakExit?.enabled) parts.push("弱势");
+  if (autoSell.breakeven?.enabled) parts.push("保本");
+  return parts.length ? parts.join(" / ") : "监控开";
 }
 
 function renderConfigField(field, value) {
@@ -536,6 +1197,14 @@ function renderConfigField(field, value) {
       </label>
     `;
   }
+  if (field.type === "text") {
+    return `
+      <label class="configField" for="${id}">
+        <span>${escapeHtml(field.label)}</span>
+        <input id="${id}" data-config-key="${field.key}" data-config-type="${field.type}" type="text" value="${escapeAttr(value ?? "")}">
+      </label>
+    `;
+  }
   return `
     <label class="configField" for="${id}">
       <span>${escapeHtml(field.label)}</span>
@@ -546,12 +1215,80 @@ function renderConfigField(field, value) {
 
 function bindConfigControls() {
   if (els.configForm) {
+    els.configForm.addEventListener("click", (event) => {
+      const modeButton = event.target.closest("[data-buy-entry-mode]");
+      if (modeButton) {
+        event.preventDefault();
+        applyBuyEntryMode(modeButton.dataset.buyEntryMode);
+        return;
+      }
+      const button = event.target.closest("[data-config-group]");
+      if (!button) return;
+      event.preventDefault();
+      setConfigGroup(button.dataset.configGroup);
+    });
     els.configForm.addEventListener("input", () => {
       state.configDirty = true;
+      updateBuyEntryModeCards();
     });
   }
   if (els.saveConfig) els.saveConfig.addEventListener("click", saveConfig);
   if (els.restartWatch) els.restartWatch.addEventListener("click", restartWatch);
+}
+
+function applyBuyEntryMode(modeId) {
+  const mode = BUY_ENTRY_MODES.find((item) => item.id === modeId);
+  if (!mode) return;
+  for (const [key, value] of Object.entries(mode.values)) {
+    setConfigInputValue(key, value);
+  }
+  state.configDirty = true;
+  updateBuyEntryModeCards();
+  showToast(`已套用${mode.label}参数，保存并重启 Watch 后生效`);
+}
+
+function setConfigInputValue(key, value) {
+  const input = document.querySelector(`[data-config-key="${key}"]`);
+  if (!input) return;
+  if (input.type === "checkbox") {
+    input.checked = truthy(value);
+  } else {
+    input.value = value ?? "";
+  }
+}
+
+function updateBuyEntryModeCards() {
+  const container = els.configForm?.querySelector("[data-buy-entry-current]");
+  if (!container) return;
+  const values = {};
+  for (const field of CONFIG_FIELDS) {
+    const input = document.querySelector(`[data-config-key="${field.key}"]`);
+    if (!input) continue;
+    values[field.key] = input.type === "checkbox" ? input.checked : input.value;
+  }
+  const activeMode = detectBuyEntryMode(values);
+  container.dataset.buyEntryCurrent = activeMode;
+  container.querySelectorAll("[data-buy-entry-mode]").forEach((button) => {
+    const mode = BUY_ENTRY_MODES.find((item) => item.id === button.dataset.buyEntryMode);
+    const active = button.dataset.buyEntryMode === activeMode;
+    button.classList.toggle("isActive", active);
+    const badge = button.querySelector(".buyEntryModeTop span");
+    if (badge) badge.textContent = active ? "当前" : "套用";
+    if (mode) button.setAttribute("aria-label", `${active ? "当前" : "套用"}${mode.label}`);
+  });
+}
+
+function setConfigGroup(groupId) {
+  const nextGroup = CONFIG_GROUPS.some((group) => group.id === groupId) ? groupId : CONFIG_GROUPS[0].id;
+  state.configGroup = nextGroup;
+  els.configForm?.querySelectorAll("[data-config-group]").forEach((button) => {
+    const active = button.dataset.configGroup === nextGroup;
+    button.classList.toggle("isActive", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  els.configForm?.querySelectorAll("[data-config-panel]").forEach((panel) => {
+    panel.classList.toggle("isActive", panel.dataset.configPanel === nextGroup);
+  });
 }
 
 async function saveConfig() {
@@ -579,13 +1316,13 @@ async function saveConfig() {
   }
 }
 
-async function restartWatch() {
+async function restartWatch(options = {}) {
   if (state.configDirty) {
     setRestartStatus("有未保存配置，先保存再重启 Watch", "warn");
     showToast("先保存配置，再重启 Watch");
     return;
   }
-  if (!window.confirm("重启 Watch 会让买入监控中断几秒，确认继续？")) return;
+  if (options?.confirm !== false && !window.confirm("重启 Watch 会让买入监控中断几秒，确认继续？")) return;
 
   els.restartWatch.disabled = true;
   setButtonLabel(els.restartWatch, "loader-circle", "重启中");
@@ -673,6 +1410,8 @@ async function approveRouter() {
 function openSell(item) {
   state.selected = item;
   setSellPercent(100, { quote: false });
+  setQuickSell(false, { quote: false });
+  els.quickSellMinOut.value = state.quickSellMinOutUsdt;
   els.sellTitle.innerHTML = `${icon("badge-dollar-sign")}<span>卖出</span>`;
   els.sellOutcome.textContent = item.all ? "本市场全部仓位" : item.outcome;
   els.sellContext.innerHTML = `
@@ -698,6 +1437,10 @@ function closeSell() {
 
 async function requestSellQuote() {
   if (!state.selected) return;
+  if (state.quickSell) {
+    renderQuickSellWarning();
+    return;
+  }
   const requestId = ++state.quoteRequest;
   els.quoteBox.innerHTML = `<div class="empty">报价中</div>`;
   els.confirmSell.disabled = true;
@@ -719,6 +1462,10 @@ async function requestSellQuote() {
 }
 
 function renderQuote(quote) {
+  if (quote.quoteSkipped) {
+    renderQuickSellWarning();
+    return;
+  }
   els.quoteBox.innerHTML = `
     <div class="quoteIntro">
       <strong>${formatPercent(state.sellPercent)} 仓位</strong>
@@ -735,6 +1482,12 @@ function renderQuote(quote) {
 
 async function executeSell() {
   if (!state.selected) return;
+  if (state.quickSell) {
+    state.quickSellMinOutUsdt = String(els.quickSellMinOut.value || "0");
+    const scope = selectedSellScopeText();
+    const ok = window.confirm(`极速卖出将作用于：${scope}\n\n会跳过报价和卖出前模拟，按最低到帐 ${state.quickSellMinOutUsdt} U 直接广播。确认继续？`);
+    if (!ok) return;
+  }
   els.confirmSell.disabled = true;
   els.quoteRefresh.disabled = true;
   setButtonLabel(els.confirmSell, "loader-circle", "卖出中");
@@ -745,7 +1498,10 @@ async function executeSell() {
       body: JSON.stringify(sellRequestPayload())
     });
     const txText = data.sell.txHash ? ` · ${shortAddress(data.sell.txHash)}` : "";
-    showToast(`${data.sell.status}：${data.sell.receivedText} U${txText}`);
+    const received = data.sell.receivedText && data.sell.receivedText !== "未报价"
+      ? `${data.sell.receivedText} U`
+      : (data.sell.receivedText || "");
+    showToast(`${data.sell.status}：${received}${txText}`);
     submitted = data.sell.rawStatus !== "reverted";
     if (data.sell.rawStatus !== "reverted" && data.sell.rawStatus !== "partial_failed") closeSell();
   } catch (error) {
@@ -774,6 +1530,10 @@ function sellRequestPayload() {
   } else {
     payload.tokenId = state.selected.tokenId;
   }
+  if (state.quickSell) {
+    payload.quickSell = true;
+    payload.minOutUsdt = String(els.quickSellMinOut.value || state.quickSellMinOutUsdt || "0");
+  }
   return payload;
 }
 
@@ -787,10 +1547,48 @@ function setSellPercent(value, { quote = true } = {}) {
     button.classList.toggle("isActive", Number(button.dataset.sellPercent) === percent);
   }
   setButtonLabel(els.confirmSell, "send", `确认卖出 ${formatPercent(percent)}`);
-  if (quote && state.selected) {
+  if (quote && state.selected && !state.quickSell) {
     clearTimeout(state.quoteTimer);
     state.quoteTimer = setTimeout(() => requestSellQuote(), 300);
+  } else if (state.quickSell) {
+    renderQuickSellWarning();
   }
+}
+
+function setQuickSell(enabled, { quote = true } = {}) {
+  state.quickSell = Boolean(enabled);
+  els.quickSell.checked = state.quickSell;
+  els.quickSellBox.classList.toggle("isDanger", state.quickSell);
+  if (state.quickSell) {
+    renderQuickSellWarning();
+  } else if (quote && state.selected) {
+    requestSellQuote();
+  }
+}
+
+function renderQuickSellWarning() {
+  state.quoteRequest += 1;
+  clearTimeout(state.quoteTimer);
+  state.quickSellMinOutUsdt = String(els.quickSellMinOut.value || state.quickSellMinOutUsdt || "0");
+  const scope = selectedSellScopeText();
+  els.confirmSell.disabled = false;
+  els.quoteRefresh.disabled = true;
+  els.quoteBox.innerHTML = `
+    <div class="quoteIntro dangerText">
+      <strong>极速卖出，不使用报价</strong>
+      <span>范围：${escapeHtml(scope)}。最低到帐 ${escapeHtml(state.quickSellMinOutUsdt)} U；会跳过卖出前模拟，失败或严重滑点风险由这个 minOut 控制。</span>
+      <span>如果需要确认预计到帐，关闭极速模式后重新报价。</span>
+    </div>
+  `;
+}
+
+function selectedSellScopeText() {
+  if (!state.selected) return "当前仓位";
+  if (state.selected.all) {
+    const count = state.selected.positionCount ? ` ${state.selected.positionCount} 个` : "";
+    return `本市场全部${count}仓位`;
+  }
+  return state.selected.outcome || "当前 outcome";
 }
 
 function setDrawerOpen(open) {
@@ -823,6 +1621,11 @@ function bindSellControls() {
   els.quoteRefresh.addEventListener("click", requestSellQuote);
   els.sellPercentRange.addEventListener("input", () => setSellPercent(els.sellPercentRange.value));
   els.sellPercentInput.addEventListener("input", () => setSellPercent(els.sellPercentInput.value));
+  els.quickSell.addEventListener("change", () => setQuickSell(els.quickSell.checked));
+  els.quickSellMinOut.addEventListener("input", () => {
+    state.quickSellMinOutUsdt = String(els.quickSellMinOut.value || "0");
+    if (state.quickSell) renderQuickSellWarning();
+  });
   for (const button of document.querySelectorAll("[data-sell-percent]")) {
     button.addEventListener("click", () => setSellPercent(button.dataset.sellPercent));
   }
@@ -936,6 +1739,19 @@ function formatDate(value) {
   }).format(new Date(value));
 }
 
+function marketDurationLabel(item) {
+  const hours = Number(item?.durationHours);
+  if (!Number.isFinite(hours) || hours <= 0) return item?.duration || "--";
+  if (hours < 24) return `${formatCompactNumber(hours)}小时`;
+  return `${formatCompactNumber(hours / 24)}天`;
+}
+
+function formatCompactNumber(value) {
+  const rounded = Math.round(Number(value) * 10) / 10;
+  if (!Number.isFinite(rounded)) return "--";
+  return Number.isInteger(rounded) ? String(rounded) : String(rounded).replace(/\.0$/u, "");
+}
+
 function formatTime(value) {
   if (!value) return "--";
   return new Intl.DateTimeFormat("zh-CN", {
@@ -985,6 +1801,10 @@ function shortAddress(value) {
   const text = String(value ?? "");
   if (text.length <= 12) return text || "--";
   return `${text.slice(0, 6)}...${text.slice(-4)}`;
+}
+
+function marketKey(value) {
+  return String(value ?? "").trim().toLowerCase();
 }
 
 function escapeHtml(value) {

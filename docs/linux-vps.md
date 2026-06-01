@@ -34,7 +34,7 @@ sudo nano /etc/42space/event-bot.env
 
 Fill in `PRIVATE_KEY`, `WALLET_ADDRESS`, `BSC_RPC_URL`, `BSC_WS_URL`, `DASHBOARD_PASSWORD`, and `DASHBOARD_AUTH_SECRET`. Do not commit this file.
 
-This deployment template has `DRY_RUN=0`, `EXECUTE=1`, and `AUTO_SELL_ENABLED=1`. Set any of them back before starting systemd if you want a dry run or no automatic selling.
+This deployment template has `DRY_RUN=0`, `EXECUTE=1`, and `AUTO_SELL_ENABLED=1`. Per-strategy automatic exits are controlled separately, for example `AUTO_SELL_ORIGINAL_ENABLED`, `AUTO_SELL_FIXED_TRAILING_ENABLED`, `AUTO_SELL_ADAPTIVE_TRAILING_ENABLED`, `AUTO_SELL_WEAK_EXIT_ENABLED`, and `AUTO_SELL_BREAKEVEN_ENABLED`.
 
 The dashboard saves non-secret strategy overrides to `/opt/42space/data/bot-config.env`. Both systemd services read that file through `BOT_CONFIG_FILE`, so after changing strategy in the dashboard, restart the event bot service for the running watcher to pick up the new values.
 

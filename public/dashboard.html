@@ -36,6 +36,10 @@
         </div>
         <div class="topActions">
           <span id="updated" class="syncText">--</span>
+          <button id="fastRefresh" class="ghost iconButton" type="button" aria-pressed="false">
+            <span data-icon="timer"></span>
+            <span>极速 1s</span>
+          </button>
           <button id="refreshBtn" class="iconButton" type="button" aria-label="刷新">
             <span data-icon="refresh-cw"></span>
             <span>刷新</span>
@@ -166,7 +170,18 @@
                   <h3><i data-icon="layers-3"></i>持仓与退出</h3>
                   <p>选择仓位后在右侧面板报价和卖出</p>
                 </div>
-                <span id="holdingCount">--</span>
+                <div class="panelActions">
+                  <span id="positionUpdated" class="syncText">--</span>
+                  <button id="positionFastRefresh" class="ghost iconButton" type="button" aria-pressed="false">
+                    <span data-icon="timer"></span>
+                    <span>收益 1s</span>
+                  </button>
+                  <button id="positionRefresh" class="ghost iconButton" type="button">
+                    <span data-icon="refresh-cw"></span>
+                    <span>刷新持仓</span>
+                  </button>
+                  <span id="holdingCount">--</span>
+                </div>
               </div>
               <div id="holdingsList" class="holdings"></div>
             </section>
@@ -310,6 +325,17 @@
             <input id="sellPercentRange" type="range" min="1" max="100" step="1" value="100">
             <input id="sellPercentInput" type="number" min="1" max="100" step="1" value="100" aria-label="卖出百分比">
           </div>
+        </div>
+        <div id="quickSellBox" class="quickSellBox">
+          <label class="quickSellToggle">
+            <input id="quickSell" type="checkbox">
+            <span>极速卖出模式</span>
+          </label>
+          <label class="quickSellMinOut">
+            <span>最低到帐 U</span>
+            <input id="quickSellMinOut" type="number" min="0" step="0.000001" value="0.000001">
+          </label>
+          <p>跳过报价和卖出前模拟，直接按手动 minOut 广播。只在需要马上退出且接受滑点风险时使用。</p>
         </div>
         <div id="quoteBox" class="quoteBox"></div>
         <div class="dialogActions">

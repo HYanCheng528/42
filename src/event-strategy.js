@@ -1,4 +1,6 @@
-import { ADDRESSES } from "./fortytwo.js";
+import { ADDRESSES, curveInfo } from "./fortytwo.js";
+
+const blockedCurveNames = new Set(["testingCurve", "powerLdaCurve"]);
 
 export function filterEventMarkets(markets, cfg, options = {}) {
   return markets
@@ -8,13 +10,39 @@ export function filterEventMarkets(markets, cfg, options = {}) {
 }
 
 export function isEventMarket(market, cfg, options = {}) {
+  if (!isEventMarketBeforeCurveCheck(market, cfg, options)) return false;
+  if (marketCurveBlockReason(market)) return false;
+  return true;
+}
+
+export function isEventMarketBeforeCurveCheck(market, cfg, options = {}) {
   const statuses = options.statuses ?? ["live"];
   if (!market || !statuses.includes(String(market.status ?? ""))) return false;
   if (!Array.isArray(market.outcomes) || market.outcomes.length === 0) return false;
+  if (isTestingMarket(market)) return false;
+  if (isBlockedMarketAddress(market, cfg)) return false;
+  if (isBlockedQuestion(market, cfg)) return false;
+  if (!passesOnchainOnlyPolicy(market, cfg)) return false;
   if (isPriceMarket(market, cfg)) return false;
   if (!passesCategoryAllowlist(market, cfg)) return false;
   if (!passesMinimumDuration(market, cfg)) return false;
   return true;
+}
+
+export function isCurveBlockNotificationCandidate(market, cfg, options = {}) {
+  return Boolean(
+    marketCurveBlockReason(market) &&
+    isEventMarketBeforeCurveCheck(market, cfg, options) &&
+    passesCreatedAtFloor(market, cfg)
+  );
+}
+
+export function marketCurveBlockReason(market) {
+  const info = curveInfo(market?.curve);
+  if (!info.address) return "";
+  if (blockedCurveNames.has(info.name)) return info.name;
+  if (!info.known) return "unknownCurve";
+  return "";
 }
 
 export function isPriceMarket(market, cfg) {
@@ -33,6 +61,7 @@ export function isPriceMarket(market, cfg) {
   if (containsAny(categoryText, cfg.marketCategoryBlocklist)) return true;
   if (containsAny(tagText, cfg.marketTagBlocklist)) return true;
   if (market.curve && String(market.curve).toLowerCase() === ADDRESSES.clockCurve.toLowerCase()) return true;
+  if (market.curve && String(market.curve).toLowerCase() === ADDRESSES.price8hCurve.toLowerCase()) return true;
   return /price\s+range|8\s*hour|clock\s*curve/i.test(haystack);
 }
 
@@ -84,6 +113,32 @@ function passesCategoryAllowlist(market, cfg) {
   return containsAny((market.categories ?? []).join(" "), cfg.marketCategoryAllowlist);
 }
 
+function isBlockedQuestion(market, cfg) {
+  return containsAny(market.question ?? "", cfg.marketQuestionBlocklist);
+}
+
+export function isTestingMarket(market) {
+  return /\btesting\b/i.test([
+    market?.question,
+    market?.slug
+  ].filter(Boolean).join(" "));
+}
+
+export function isBlockedMarketAddress(market, cfg) {
+  const address = normalizeAddress(market?.address);
+  if (!address) return false;
+  const blocked = new Set((cfg.marketAddressBlocklist ?? []).map(normalizeAddress).filter(Boolean));
+  return blocked.has(address);
+}
+
+function passesOnchainOnlyPolicy(market, cfg) {
+  if (cfg.allowOnchainOnlyMarkets) return true;
+  const tags = (market.tags ?? []).map((tag) => String(tag).toLowerCase());
+  const categories = market.categories ?? [];
+  const onchainOnly = tags.includes("onchain") && !market.oddsHydratedFrom && categories.length === 0;
+  return !onchainOnly;
+}
+
 function passesCreatedAtFloor(market, cfg) {
   if (!cfg.minMarketCreatedAt) return true;
   const createdAt = new Date(market.createdAt).getTime();
@@ -108,6 +163,11 @@ export function passesMinimumDuration(market, cfg) {
 function containsAny(text, needles = []) {
   const normalized = String(text ?? "").toLowerCase();
   return needles.some((needle) => normalized.includes(String(needle).toLowerCase()));
+}
+
+function normalizeAddress(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return /^0x[0-9a-f]{40}$/.test(text) ? text : "";
 }
 
 function compareCreatedAtDesc(a, b) {

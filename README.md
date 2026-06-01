@@ -79,7 +79,7 @@ npm run event:sell -- --wallet 0x... --market 0x... --all --percent 100
 DRY_RUN=0 EXECUTE=1 I_UNDERSTAND_42_PRICE_MARKET_RISK=YES I_AM_NOT_IN_RESTRICTED_JURISDICTION=YES npm run event:sell -- --market 0x... --token-id 16 --percent 100
 ```
 
-自动止盈按真实链上卖出报价判断，不按页面展示赔率判断。默认规则是：某个 outcome 的 100% 可卖出报价达到当前成本的 `2x` 后，只卖出该 outcome 的 `50%`，且同一个 outcome 只自动触发一次：
+自动卖出按真实链上卖出报价判断，不按页面展示赔率判断。每个 outcome 独立评估，支持原倍数止盈、固定移动止盈、自适应移动止盈、弱势超时退出、保本回落卖出；多个策略同时触发时执行卖出比例最大的那一个，已触发的策略会写入状态文件避免重复卖出：
 
 ```bash
 npm run event:autosell
@@ -122,17 +122,18 @@ STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run 
 - `npm run event:rpc`：预热并测速 broadcast RPC 池，只输出 provider 域名、区块号、延迟和错误摘要，不打印 RPC URL。
 - `npm run event:presign-test`：离线验证“pending records -> pre-signed bundle -> cached bundle reuse”链路；使用公开测试私钥，只签名不广播。
 - `npm run event:due-test`：离线验证“cached pre-signed bundle -> due drain -> executeDueBundle dry-run”链路；使用公开测试私钥预签、强制到期、dry-run 执行，不广播。
-- `npm run event:catchup-test`：离线验证“资金恢复后发现刚开盘未买 markets -> catch-up bundle dry-run”链路；强制把下一批未来 markets 当成刚开盘，不广播。
+- `npm run event:catchup-test`：离线验证旧的 catch-up bundle dry-run 链路；生产默认关闭，只用于回归测试，不广播。
 - `npm run event:deadline-test`：离线验证“开盘窗口过期 -> 标记跳过 -> 不再广播”的硬截止链路，不广播。
 - `EVENT_DISCOVERY=ws`：通过 WebSocket 订阅 `FTControllerV2` 的 `CreateNewQuestionV2` / `AddOutcome` / `CreateNewMarket` 日志。默认值，最快，优先使用 `BSC_WS_URL` / `CHAINSTACK_BSC_WS_URL` / `ANKR_BSC_WS_URL` / `ANKR_BSC_WS_RPC_URL`。
 - `EVENT_DISCOVERY=chain`：HTTP 轮询同一组 controller 日志，要求 `BSC_RPC_URL` 支持 `eth_getLogs`。
 - `EVENT_DISCOVERY=rest`：REST 轮询兜底。
-- `WATCH_FUNDING_MODE=next_batch`：实盘 watch 启动前按已知下一批同一开盘时间的 Event Markets 合计资金校验；设为 `upper_bound` 时只按单场 `STAKE_PER_OUTCOME_USDT * min(EVENT_OUTCOME_COUNT, MAX_OUTCOMES_PER_MARKET)` 校验。
+- `WATCH_FUNDING_MODE=next_batch`：实盘 watch 启动前按已知下一批同一开盘时间的 Event Markets 合计资金校验；设为 `upper_bound` 时，指定数量模式按 `STAKE_PER_OUTCOME_USDT * EVENT_OUTCOME_COUNT` 校验，全部买入模式按 `MAX_MARKET_STAKE_USDT` 校验。
 - `BUNDLE_DUE_MARKETS=1`、`MAX_BATCH_STAKE_USDT=100`：同一 `startDate` 的多个 due Event Markets 会合并成一笔 `FTRouterProxy.multicall`，用批次上限控制总风险。
 - `EVENT_OUTCOME_SELECTION=lowest_odds`、`EVENT_OUTCOME_COUNT=5`：每个 Event Market 只买赔率最低的 5 个 outcome。链上日志缺少赔率字段时，程序会先用 42 单市场 REST 接口按地址补全 outcomes；赔率优先用 `payout` 排序，其次用 `price`，再按 `EVENT_OUTCOME_SELECTION_FALLBACK` 兜底。
-- `EVENT_OUTCOME_SELECTION_FALLBACK=token_order`：刚开场链上日志缺少赔率字段时，仍按 token 顺序选 5 个并继续抢；设为 `error` 则缺少赔率数据时直接跳过/报错，保证只在能判断赔率时下单。
+- `EVENT_OUTCOME_SELECTION_FALLBACK=error`：缺少完整 payout/price 时不再按 token 顺序盲买；设为 `token_order` 才允许极限速度兜底，但会增加买到测试盘/未完整公开盘的风险。
+- 题目含 `Testing` 的测试盘会被硬过滤，不能手动放开。`MARKET_ADDRESS_BLOCKLIST=` 是你主观手动去除的具体市场地址，逗号分隔；前端市场行的去除按钮会写这里。不设置时不会按项目地址去除。`MARKET_QUESTION_BLOCKLIST=` 是可选关键词去除，默认空，避免同名误伤。`ALLOW_ONCHAIN_ONLY_MARKETS=0` 会拒绝只有链上日志、没有 REST/赔率确认的 onchain-only 盘。
 - `EVENT_OUTCOME_SELECTION=all`：恢复旧策略，买入该市场全部 outcome。
-- `AUTO_SELL_ENABLED=1`、`AUTO_SELL_PROFIT_MULTIPLIER=2`、`AUTO_SELL_PERCENT=50`：长期守护进程会轮询持仓，真实卖出报价达到成本 2 倍后自动卖出一半；已触发的 outcome 会写入 `AUTO_SELL_STATE_FILE`，避免重复半仓卖出。
+- `AUTO_SELL_ENABLED=1`：自动卖出总开关。`AUTO_SELL_ORIGINAL_ENABLED=1` 保留旧的 `2x / 50%` 原倍数止盈；`AUTO_SELL_FIXED_TRAILING_ENABLED=1` 可启用固定移动止盈，默认 `30%` 启动、峰值回撤 `25%` 卖出 `100%`。`AUTO_SELL_ADAPTIVE_TRAILING_ENABLED`、`AUTO_SELL_WEAK_EXIT_ENABLED`、`AUTO_SELL_BREAKEVEN_ENABLED` 分别控制自适应移动止盈、弱势超时退出、保本回落卖出。
 - `EVENT_BUY_MODE=fast`：不逐个报价，直接 `minOut=1` 买入选中的 outcome。抢新场默认用这个。
 - `EVENT_BUY_MODE=quoted`：先模拟再买，慢但输出更完整。
 - `FAST_SKIP_PREFLIGHT=1`：触发时不再查余额/allowance，依赖启动前 `event:preflight` 和 `event:approve`。
@@ -141,25 +142,28 @@ STAKE_PER_OUTCOME_USDT=5 EVENT_OUTCOME_COUNT=5 MAX_MARKET_STAKE_USDT=25 npm run 
 - `PRE_SIGN_FAST_TX=1`、`PRE_SIGN_WINDOW_MS=5000`：已知未来场进入开盘前窗口时预签 raw transaction；开盘瞬间只做广播。窗口不要设得太大，避免远期交易提前占用 nonce。
 - `PRE_SIGN_RETRY_MS=250`：预签窗口内如果遇到瞬时错误，会按这个间隔重试；nonce 只在签名成功后递增，避免失败预签占用 nonce。
 - `NONCE_SYNC_BEFORE_PRESIGN=1`、`NONCE_SYNC_MIN_INTERVAL_MS=250`：预签前按节流频率读取 pending nonce。如果 watch 启动后发生了别的交易，程序会把本地 nonce 推进到链上 pending nonce，避免签出已失效的 raw tx。若预签广播返回 stale nonce 类错误，fallback 会立即读取最新 pending nonce 并重新签名。
-- `FANOUT_BROADCAST=1`：fast 实盘广播时签一次 raw transaction，并向多个 HTTP RPC 同时发送；默认从 `BSC_RPC_URL`、`CHAINSTACK_BSC_RPC_URL`、`ANKR_BSC_RPC_URL` 去重生成。
+- `FANOUT_BROADCAST=1`：fast 实盘买入、手动卖出和自动止盈卖出会签一次 raw transaction，并向多个 HTTP RPC 同时发送；默认从 `BSC_RPC_URL`、`CHAINSTACK_BSC_RPC_URL`、`ANKR_BSC_RPC_URL` 去重生成。
 - `BROADCAST_TIMEOUT_MS=1200`：单个广播 RPC 的超时窗口。目标是尽快拿到第一个成功广播，而不是等所有 RPC 慢慢返回。
 - `RPC_WARMUP_TIMEOUT_MS=2500`：`event:rpc` 和实盘 `event:watch` 启动时预热 broadcast RPC 的超时窗口。实盘开跑前会先创建并连通 raw-tx client，避免开盘瞬间才初始化 HTTP transport。
 - `DOCTOR_CHECK_WS=0`：`event:doctor` 默认不打开 WSS 长连接；要单独测 WSS 时设为 `1`。
 - `WATCH_STARTUP_RETRY_MS=5000`：启动时如果 REST 补种、链上回放或 chain watch 初始区块读取遇到瞬时网络错误，按这个间隔告警/重试；WS 模式下 REST/链上补种失败不会直接退出主进程。
 - `ARM_WAIT_FOR_FUNDING=1`、`ARM_FUNDING_RETRY_MS=60000`：长期守护进程资金不足时不退出，按普通间隔复查 BUSDT/BNB/allowance；资金补足后自动进入 WS watch。
 - `ARM_FUNDING_HOT_WINDOW_MS=600000`、`ARM_FUNDING_HOT_RETRY_MS=1000`：距离下一批开盘小于热窗口时，资金复查自动切到 1 秒，避免临近开盘补款后最多睡 60 秒。
-- `ARM_CATCH_UP_AFTER_FUNDING=1`、`ARM_CATCH_UP_WINDOW_MS=60000`：如果守护进程因为资金不足没进入 watch，资金补足后启动时会追赶刚开盘 60 秒内、尚未买过的 Event Markets；catch-up 会为缺少 odds 的 due market 补一次 REST 赔率以尽量严格选择最低 3 档，超过窗口仍标记 seen，避免误买老盘。
+- `ARM_CATCH_UP_AFTER_FUNDING=0`、`ARM_CATCH_UP_WINDOW_MS=0`：默认不再做“资金恢复/重启后补买刚开盘市场”。当前策略以 `EVENT_BUY_DELAY_SECONDS=20` 和 `REQUIRE_REST_STATUS=live` 为安全门；到点未通过就跳过，不用 60 秒补追。
 - `EVENT_LOG_LOOKBACK_BLOCKS=50000`：启动时回放最近 controller 日志，把已创建但未开盘的未来 Event Market 放入 pending，避免开盘时漏买。
 - `LOG_CHUNK_BLOCKS=5000`：HTTP 回放/轮询时分块 `eth_getLogs`，避免 Chainstack 这类付费 RPC 的 block range 限制。
 - `HOT_POLL_MS=50`、`PREOPEN_HOT_MS=5000`：已知未来开盘场进入开盘前热窗口后，把 pending 检查从普通 `POLL_MS` 切到更高频；最后一跳会按剩余毫秒贴近开盘/预广播点醒来，而不是固定多睡一个完整 hot poll。
 - `PREBROADCAST_MS=0`：默认不提前广播。设为几百毫秒时，程序会在开盘前进入广播窗口，可能更快进入 mempool，但如果交易被过早打包，存在 revert 和 nonce 占用风险。
 - `WS_RECEIPT_FALLBACK_MS=0`：WS 收到 `CreateNewMarket` 但本地 buffer 里还没齐 outcome 日志时，默认立刻用交易 receipt 补齐同 tx 日志，避免等待 `POLL_MS`。
 - WSS receipt fallback 会按 txHash 复用已拉取并解析的创建交易 receipt，避免同一笔创建交易里多个 market 重复 `getTransactionReceipt/getBlock`。
-- `FAST_GAS_LIMIT=5000000`、`BUNDLE_FAST_GAS_LIMIT=12000000`、`GAS_PRICE_GWEI=0.12`：避免触发时估 gas 和查 gas price。bundle 会按本批 market/outcome 数计算动态 gas limit，并以 `BUNDLE_FAST_GAS_LIMIT` 作为上限；最近真买样本里 3 outcome 单场约 0.95M gas、9 outcome 单场约 2.70M gas。
+- `FAST_GAS_LIMIT=5000000`、`BUNDLE_FAST_GAS_LIMIT=12000000`、`GAS_PRICE_GWEI=0.12`：买入侧避免触发时估 gas 和查 gas price。bundle 会按本批 market/outcome 数计算动态 gas limit，并以 `BUNDLE_FAST_GAS_LIMIT` 作为上限；最近真买样本里 3 outcome 单场约 0.95M gas、9 outcome 单场约 2.70M gas。
+- `SELL_GAS_PRICE_GWEI=0.12`、`OPERATOR_APPROVE_GAS_PRICE_GWEI=0.12`：分别控制卖出 swap 和市场级卖出 operator 授权的 gas price；未配置时都会沿用 `GAS_PRICE_GWEI`。
+- `FAST_SELL_GAS_LIMIT=1000000`：仅用于前端“极速卖出模式”，这条路径会跳过卖出前报价/模拟并直接广播，所以必须同时设置很低但可接受的手动 `minOut`。
+- `AUTO_SELL_POLL_MS=3000`、`AUTO_SELL_MIN_OUT_MODE=quote|manual`、`AUTO_SELL_MANUAL_MIN_OUT_USDT=0.000001`：自动止盈仍然先用报价判断策略；卖出时默认使用报价算出的 minOut，也可切成手动 minOut。触发 100% 卖出时复用策略判断那次 100% 报价，不再二次报价。
 - `WAIT_FOR_RECEIPT=1`：广播后等待 receipt，再把 market 标记为已处理；这会让“拿到 hash 但没上链/没成交”的情况暴露出来，避免误判完成。
 - `ASYNC_RECEIPT_WATCH=1`、`RECEIPT_WATCH_TIMEOUT_MS=120000`、`RECEIPT_WATCH_POLLING_MS=1000`：如果显式设 `WAIT_FOR_RECEIPT=0`，真实广播后会改为后台等待 receipt，并把成功/失败写入 `FILLS_FILE`。
-- `EXECUTION_RETRY_MS=500`：买入执行失败、receipt 未成功或返回非 success 时，不写 seen，保留 pending 并短间隔重试，避免 WS 即时路径丢失新场。
-- `EVENT_OPEN_WINDOW_SECONDS=60`：硬截止。市场开盘超过 60 秒仍未成功买入时，程序写入 `event-skip-open-window`，把该 market 加入 seen，并从 pending 删除；之后不会再主动为这个 market 发起买入。
+- `EXECUTION_RETRY_MS=500`：买入执行失败、receipt 未成功或返回非 success 时，不写 seen，保留 pending 并短间隔重试；重试只应发生在很短的开盘容错窗口内。
+- `EVENT_OPEN_WINDOW_SECONDS=25`：开盘容错截止。配合 `EVENT_BUY_DELAY_SECONDS=20` 时，只给到点广播、RPC 抖动和极短重试留几秒余量，不再允许开盘后 60 秒补买。
 
 对于已经创建但未来才开盘的 Event Market，watch 会在 pending 阶段提前构建 fast plan；实盘有 signer/receiver 时会进一步预编码 `FTRouterProxy.multicall` calldata。开盘瞬间只做 nonce/gas 已知路径上的签名与广播；同一 startDate 同时开盘的多个 Event Markets 会并行触发，并在广播前立即预留本地 nonce，避免并行交易复用 nonce。
 
