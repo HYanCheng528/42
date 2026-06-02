@@ -63,8 +63,10 @@ const PUBLIC_TEST_RECEIVER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const REST_DISCOVERY_STATUSES = ["live", "not_started"];
 const MARKET_MINT_TOPIC = "0xf2e90b10bd525a6b1fe02d09e8133d3e38c9a87376ed4850904ca21e6e27abec";
 const activeDiscoveryKeys = new Set();
-const fundingWaitDiscoveryNotifications = new Set();
 const persistentNotificationSets = new Map();
+const pendingPersistentNotifications = new Set();
+const PERSISTENT_NOTIFICATION_RETRY_MS = 5000;
+const PERSISTENT_NOTIFICATION_MAX_RETRIES = 2;
 const PROCESS_STARTED_AT = new Date().toISOString();
 
 async function main() {
@@ -1402,15 +1404,19 @@ async function selfTest(cfg) {
       notificationStateFile: path.join(stateDir, "notifications.json"),
       stateFile: path.join(stateDir, "readonly-seen.json"),
       fillsFile: path.join(stateDir, "readonly-fills.jsonl"),
-      pushPlusEnabled: false,
-      pushPlusToken: ""
+      pushPlusEnabled: true,
+      pushPlusToken: "self-test-token"
+    };
+    const notifyImmediately = (_cfg, _message, { onSuccess = null } = {}) => {
+      onSuccess?.({ ok: true });
+      return true;
     };
     const notificationMarket = mockEventMarket({
       address: "0x0000000000000000000000000000000000000058"
     });
     assertSelfTest(
-      notifyMarketDiscovered(notificationCfg, notificationMarket, null, "self-test") &&
-        !notifyMarketDiscovered(notificationCfg, notificationMarket, null, "self-test"),
+      notifyMarketDiscovered(notificationCfg, notificationMarket, null, "self-test", notifyImmediately) &&
+        !notifyMarketDiscovered(notificationCfg, notificationMarket, null, "self-test", notifyImmediately),
       "market discovery notifications should persistently dedupe by market"
     );
     assertSelfTest(
@@ -1427,7 +1433,7 @@ async function selfTest(cfg) {
     handleFundingWaitWsMarkets({
       ...notificationCfg,
       allowOnchainOnlyMarkets: false
-    }, [readonlyWsMarket], "self-test");
+    }, [readonlyWsMarket], "self-test", { notifySender: notifyImmediately });
     assertSelfTest(
       loadSeen(notificationCfg.notificationStateFile).has(marketNotificationKey("discovered", readonlyWsMarket)),
       "funding wait WSS should persistently notify a chain-only candidate"
@@ -1435,6 +1441,22 @@ async function selfTest(cfg) {
     assertSelfTest(
       !fs.existsSync(notificationCfg.stateFile),
       "funding wait WSS should not mutate the buy seen state"
+    );
+    const failedNotificationKey = "discovered:self-test-failed-notification";
+    const failImmediately = (_cfg, _message, { onError = null } = {}) => {
+      onError?.(new Error("self-test failure"));
+      return true;
+    };
+    queuePersistentMarketNotification(
+      notificationCfg,
+      failedNotificationKey,
+      { title: "self-test", content: "" },
+      failImmediately,
+      PERSISTENT_NOTIFICATION_MAX_RETRIES
+    );
+    assertSelfTest(
+      !loadSeen(notificationCfg.notificationStateFile).has(failedNotificationKey),
+      "failed PushPlus notifications should not be persistently marked as delivered"
     );
     passed.push("seen and notification state writes are atomic; readonly WSS notifications persist without mutating buy state");
   } finally {
@@ -2327,8 +2349,7 @@ function startFundingWaitDiscoveryMonitor(cfg) {
       let seededLive = 0;
       for (const market of markets) {
         const key = marketNotificationKey("discovered", market);
-        if (fundingWaitDiscoveryNotifications.has(key) || hasPersistentMarketNotification(cfg, key)) continue;
-        fundingWaitDiscoveryNotifications.add(key);
+        if (hasPersistentMarketNotification(cfg, key)) continue;
         if (!initialized && msUntilStart(market) <= 0) {
           rememberPersistentMarketNotification(cfg, key);
           seededLive += 1;
@@ -2341,7 +2362,7 @@ function startFundingWaitDiscoveryMonitor(cfg) {
           level: "event-funding-wait-discovery",
           alerted,
           seededLive,
-          tracked: fundingWaitDiscoveryNotifications.size,
+          tracked: persistentMarketNotifications(cfg).size,
           at: new Date().toISOString()
         }));
       }
@@ -3679,11 +3700,11 @@ async function drainFundingWaitWsLogBuffers(publicClient, txBuffers, cfg) {
   }
 }
 
-function handleFundingWaitWsMarkets(cfg, markets, source) {
+function handleFundingWaitWsMarkets(cfg, markets, source, { notifySender = notifyPushPlusSafe } = {}) {
   for (const market of markets) {
     const curveReason = marketCurveBlockReason(market);
     if (curveReason) {
-      if (notifyBlockedCurveMarket(cfg, market, curveReason, source)) {
+      if (notifyBlockedCurveMarket(cfg, market, curveReason, source, notifySender)) {
         const row = {
           level: "event-skip-curve",
           source,
@@ -3706,7 +3727,7 @@ function handleFundingWaitWsMarkets(cfg, markets, source) {
       allowOnchainOnlyMarkets: true
     });
     if (chainCandidate.length === 0) continue;
-    if (!notifyMarketDiscovered(cfg, market, null, source)) continue;
+    if (!notifyMarketDiscovered(cfg, market, null, source, notifySender)) continue;
     console.log(JSON.stringify({
       level: "event-funding-wait-ws-discovery",
       source,
@@ -5406,8 +5427,7 @@ async function trackReceipt(cfg, txHash, context) {
   notifyReceipt(cfg, row);
 }
 
-function notifyMarketDiscovered(cfg, market, record, source) {
-  if (!rememberPersistentMarketNotification(cfg, marketNotificationKey("discovered", market))) return false;
+function notifyMarketDiscovered(cfg, market, record, source, notifySender = notifyPushPlusSafe) {
   const plan = record?.preparedPlan;
   const lines = [
     markdownLine("来源", source),
@@ -5418,17 +5438,13 @@ function notifyMarketDiscovered(cfg, market, record, source) {
     markdownLine("计划金额", plan?.totalStakeUsdt ? `${plan.totalStakeUsdt} U` : ""),
     markdownLine("状态", market.status)
   ].filter(Boolean);
-  notifyPushPlusSafe(cfg, {
+  return queuePersistentMarketNotification(cfg, marketNotificationKey("discovered", market), {
     title: "42space 发现符合策略的新市场",
     content: lines.join("\n")
-  });
-  return true;
+  }, notifySender);
 }
 
-function notifyBlockedCurveMarket(cfg, market, curveReason, source) {
-  if (!rememberPersistentMarketNotification(cfg, marketNotificationKey("blocked-curve", market, curveReason))) {
-    return false;
-  }
+function notifyBlockedCurveMarket(cfg, market, curveReason, source, notifySender = notifyPushPlusSafe) {
   const lines = [
     markdownLine("来源", source),
     markdownLine("市场", market.question),
@@ -5437,11 +5453,10 @@ function notifyBlockedCurveMarket(cfg, market, curveReason, source) {
     markdownLine("Curve", curveReason),
     markdownLine("动作", "已跳过，不买")
   ].filter(Boolean);
-  notifyPushPlusSafe(cfg, {
+  return queuePersistentMarketNotification(cfg, marketNotificationKey("blocked-curve", market, curveReason), {
     title: "42space 跳过风险 Curve 市场",
     content: lines.join("\n")
-  });
-  return true;
+  }, notifySender);
 }
 
 function marketNotificationKey(kind, market, detail = "") {
@@ -5472,6 +5487,29 @@ function rememberPersistentMarketNotification(cfg, key) {
   seen.add(key);
   saveSeen(cfg.notificationStateFile, seen);
   return true;
+}
+
+function queuePersistentMarketNotification(cfg, key, message, notifySender = notifyPushPlusSafe, retryCount = 0) {
+  if (!cfg?.pushPlusEnabled || !cfg.pushPlusToken || !key) return false;
+  if (hasPersistentMarketNotification(cfg, key) || pendingPersistentNotifications.has(key)) return false;
+  pendingPersistentNotifications.add(key);
+
+  const release = () => pendingPersistentNotifications.delete(key);
+  const started = notifySender(cfg, message, {
+    onSuccess: () => {
+      rememberPersistentMarketNotification(cfg, key);
+      release();
+    },
+    onError: () => {
+      release();
+      if (retryCount >= PERSISTENT_NOTIFICATION_MAX_RETRIES) return;
+      setTimeout(() => {
+        queuePersistentMarketNotification(cfg, key, message, notifySender, retryCount + 1);
+      }, PERSISTENT_NOTIFICATION_RETRY_MS);
+    }
+  });
+  if (!started) release();
+  return Boolean(started);
 }
 
 function notifyBuyExecution(cfg, eventPlan, result) {

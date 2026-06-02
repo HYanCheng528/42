@@ -1,6 +1,9 @@
-export function notifyPushPlusSafe(cfg, message) {
-  if (!cfg?.pushPlusEnabled || !cfg.pushPlusToken) return;
-  void sendPushPlus(cfg, message).catch((error) => {
+export function notifyPushPlusSafe(cfg, message, { onSuccess = null, onError = null } = {}) {
+  if (!cfg?.pushPlusEnabled || !cfg.pushPlusToken) return false;
+  void sendPushPlus(cfg, message).then((result) => {
+    onSuccess?.(result);
+  }).catch((error) => {
+    onError?.(error);
     console.error(JSON.stringify({
       level: "warn",
       source: "pushplus",
@@ -8,6 +11,7 @@ export function notifyPushPlusSafe(cfg, message) {
       at: new Date().toISOString()
     }));
   });
+  return true;
 }
 
 export async function sendPushPlus(cfg, { title, content }) {
@@ -18,6 +22,7 @@ export async function sendPushPlus(cfg, { title, content }) {
   const response = await fetch(cfg.pushPlusUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
+    signal: AbortSignal.timeout(cfg.pushPlusTimeoutMs ?? 10000),
     body: JSON.stringify({
       token: cfg.pushPlusToken,
       title: String(title ?? "42space bot"),

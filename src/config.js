@@ -171,6 +171,7 @@ export function readConfig() {
     pushPlusToken: envString("PUSHPLUS_TOKEN", ""),
     pushPlusUrl: envString("PUSHPLUS_URL", "https://www.pushplus.plus/send"),
     pushPlusTemplate: envString("PUSHPLUS_TEMPLATE", "markdown"),
+    pushPlusTimeoutMs: envInteger("PUSHPLUS_TIMEOUT_MS", 10000),
     notificationStateFile: envString("NOTIFICATION_STATE_FILE", "data/notified-markets.json"),
     runtimeStatusFile: envString("RUNTIME_STATUS_FILE", "data/runtime-status.json"),
     scanLimit: envInteger("SCAN_LIMIT", 10),
@@ -340,6 +341,9 @@ export function readConfig() {
   }
   if (cfg.armCatchUpWindowMs < 0) {
     throw new Error("ARM_CATCH_UP_WINDOW_MS must be 0 or a positive integer");
+  }
+  if (cfg.pushPlusTimeoutMs <= 0) {
+    throw new Error("PUSHPLUS_TIMEOUT_MS must be positive");
   }
   if (!["binance_volume_projection", "binance_price_projection", "cheapest", "configured"].includes(cfg.strategy)) {
     throw new Error("STRATEGY must be binance_volume_projection, binance_price_projection, cheapest, or configured");
