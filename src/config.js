@@ -171,6 +171,7 @@ export function readConfig() {
     pushPlusToken: envString("PUSHPLUS_TOKEN", ""),
     pushPlusUrl: envString("PUSHPLUS_URL", "https://www.pushplus.plus/send"),
     pushPlusTemplate: envString("PUSHPLUS_TEMPLATE", "markdown"),
+    notificationStateFile: envString("NOTIFICATION_STATE_FILE", "data/notified-markets.json"),
     runtimeStatusFile: envString("RUNTIME_STATUS_FILE", "data/runtime-status.json"),
     scanLimit: envInteger("SCAN_LIMIT", 10),
     openWindowSeconds: envInteger("OPEN_WINDOW_SECONDS", 45),
@@ -349,6 +350,7 @@ export function readConfig() {
 
   ensureParentDir(cfg.stateFile);
   ensureParentDir(cfg.fillsFile);
+  ensureParentDir(cfg.notificationStateFile);
   ensureParentDir(cfg.runtimeStatusFile);
   ensureParentDir(cfg.autoSellStateFile);
   ensureParentDir(cfg.autoSellPositionStateFile);

@@ -63,8 +63,8 @@ const PUBLIC_TEST_RECEIVER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const REST_DISCOVERY_STATUSES = ["live", "not_started"];
 const MARKET_MINT_TOPIC = "0xf2e90b10bd525a6b1fe02d09e8133d3e38c9a87376ed4850904ca21e6e27abec";
 const activeDiscoveryKeys = new Set();
-const blockedCurveNotifications = new Set();
 const fundingWaitDiscoveryNotifications = new Set();
+const persistentNotificationSets = new Map();
 const PROCESS_STARTED_AT = new Date().toISOString();
 
 async function main() {
@@ -1397,7 +1397,23 @@ async function selfTest(cfg) {
       recovered.has("market-a") && recovered.has("market-b"),
       "corrupt seen file should recover from backup"
     );
-    passed.push("seen state write is atomic and backup-recoverable");
+    const notificationCfg = {
+      ...testCfg,
+      notificationStateFile: path.join(stateDir, "notifications.json")
+    };
+    const notificationMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000000058"
+    });
+    assertSelfTest(
+      notifyMarketDiscovered(notificationCfg, notificationMarket, null, "self-test") &&
+        !notifyMarketDiscovered(notificationCfg, notificationMarket, null, "self-test"),
+      "market discovery notifications should persistently dedupe by market"
+    );
+    assertSelfTest(
+      loadSeen(notificationCfg.notificationStateFile).has(marketNotificationKey("discovered", notificationMarket)),
+      "market discovery notification key should be persisted"
+    );
+    passed.push("seen and notification state writes are atomic, recoverable and persistently deduped");
   } finally {
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2273,15 +2289,15 @@ function startFundingWaitDiscoveryMonitor(cfg) {
       let alerted = 0;
       let seededLive = 0;
       for (const market of markets) {
-        const key = eventSeenKey(market, cfg);
-        if (fundingWaitDiscoveryNotifications.has(key)) continue;
+        const key = marketNotificationKey("discovered", market);
+        if (fundingWaitDiscoveryNotifications.has(key) || hasPersistentMarketNotification(cfg, key)) continue;
         fundingWaitDiscoveryNotifications.add(key);
         if (!initialized && msUntilStart(market) <= 0) {
+          rememberPersistentMarketNotification(cfg, key);
           seededLive += 1;
           continue;
         }
-        notifyMarketDiscovered(cfg, market, null, "funding-wait-rest-readonly");
-        alerted += 1;
+        if (notifyMarketDiscovered(cfg, market, null, "funding-wait-rest-readonly")) alerted += 1;
       }
       if (alerted > 0 || seededLive > 0) {
         console.log(JSON.stringify({
@@ -3089,6 +3105,7 @@ async function seedExistingRestMarkets(cfg, seen, pending, runtime = null, optio
       const record = await preparePendingRecord(cfg, market, runtime);
       if (record.preparedPlan) preparedFutureMarkets += 1;
       pending.set(eventSeenKey(market, cfg), record);
+      notifyMarketDiscovered(cfg, market, record, "startup-rest-future");
     } else if (shouldCatchUpLiveMarket(cfg, market, options)) {
       catchUpMarkets.push(market);
     } else {
@@ -3133,6 +3150,7 @@ async function seedRecentChainMarkets(cfg, seen, pending, runtime = null, option
       if (record.preparedPlan) preparedFuture += 1;
       pending.set(key, record);
       pendingFuture += 1;
+      notifyMarketDiscovered(cfg, market, record, "startup-chain-future");
     } else if (shouldCatchUpLiveMarket(cfg, market, options)) {
       catchUpMarkets.push(market);
     } else {
@@ -5052,8 +5070,7 @@ function notifyBlockedCurveMarkets(cfg, markets, source) {
   for (const market of markets ?? []) {
     const curveReason = marketCurveBlockReason(market);
     if (!curveReason) continue;
-    const key = String(market?.address ?? market?.question ?? "").toLowerCase();
-    if (!key || blockedCurveNotifications.has(key)) continue;
+    if (!notifyBlockedCurveMarket(cfg, market, curveReason, source)) continue;
     const row = {
       level: "event-skip-curve",
       source,
@@ -5067,7 +5084,6 @@ function notifyBlockedCurveMarkets(cfg, markets, source) {
     };
     appendJsonl(cfg.fillsFile, row);
     console.log(JSON.stringify(row));
-    notifyBlockedCurveMarket(cfg, market, curveReason, source);
   }
 }
 
@@ -5196,6 +5212,7 @@ async function trackReceipt(cfg, txHash, context) {
 }
 
 function notifyMarketDiscovered(cfg, market, record, source) {
+  if (!rememberPersistentMarketNotification(cfg, marketNotificationKey("discovered", market))) return false;
   const plan = record?.preparedPlan;
   const lines = [
     markdownLine("来源", source),
@@ -5210,12 +5227,13 @@ function notifyMarketDiscovered(cfg, market, record, source) {
     title: "42space 发现符合策略的新市场",
     content: lines.join("\n")
   });
+  return true;
 }
 
 function notifyBlockedCurveMarket(cfg, market, curveReason, source) {
-  const key = String(market?.address ?? market?.question ?? "").toLowerCase();
-  if (!key || blockedCurveNotifications.has(key)) return;
-  blockedCurveNotifications.add(key);
+  if (!rememberPersistentMarketNotification(cfg, marketNotificationKey("blocked-curve", market, curveReason))) {
+    return false;
+  }
   const lines = [
     markdownLine("来源", source),
     markdownLine("市场", market.question),
@@ -5228,6 +5246,37 @@ function notifyBlockedCurveMarket(cfg, market, curveReason, source) {
     title: "42space 跳过风险 Curve 市场",
     content: lines.join("\n")
   });
+  return true;
+}
+
+function marketNotificationKey(kind, market, detail = "") {
+  const identity = String(market?.address ?? market?.question ?? "").trim().toLowerCase();
+  if (!identity) return "";
+  const suffix = detail ? `:${String(detail).trim().toLowerCase()}` : "";
+  return `${kind}:${identity}${suffix}`;
+}
+
+function persistentMarketNotifications(cfg) {
+  const file = path.resolve(cfg.notificationStateFile);
+  let seen = persistentNotificationSets.get(file);
+  if (!seen) {
+    seen = loadSeen(file);
+    persistentNotificationSets.set(file, seen);
+  }
+  return seen;
+}
+
+function hasPersistentMarketNotification(cfg, key) {
+  return Boolean(key && persistentMarketNotifications(cfg).has(key));
+}
+
+function rememberPersistentMarketNotification(cfg, key) {
+  if (!key) return false;
+  const seen = persistentMarketNotifications(cfg);
+  if (seen.has(key)) return false;
+  seen.add(key);
+  saveSeen(cfg.notificationStateFile, seen);
+  return true;
 }
 
 function notifyBuyExecution(cfg, eventPlan, result) {
