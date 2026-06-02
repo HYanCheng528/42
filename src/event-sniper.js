@@ -64,6 +64,7 @@ const REST_DISCOVERY_STATUSES = ["live", "not_started"];
 const MARKET_MINT_TOPIC = "0xf2e90b10bd525a6b1fe02d09e8133d3e38c9a87376ed4850904ca21e6e27abec";
 const activeDiscoveryKeys = new Set();
 const blockedCurveNotifications = new Set();
+const fundingWaitDiscoveryNotifications = new Set();
 const PROCESS_STARTED_AT = new Date().toISOString();
 
 async function main() {
@@ -1690,15 +1691,21 @@ async function arm(cfg, args) {
 
   let fundingRecovery = null;
   let fundingWaitAutoSellMonitor = null;
+  let fundingWaitDiscoveryMonitor = null;
   if (cfg.armWaitForFunding) {
     const waitingSince = Date.now();
     fundingWaitAutoSellMonitor = startAutoSellMonitor(cfg, null);
+    fundingWaitDiscoveryMonitor = startFundingWaitDiscoveryMonitor(cfg);
     const fundingStatus = await waitForWatchFunding(cfg, {
       autoSellMonitor: fundingWaitAutoSellMonitor
     });
     if (fundingWaitAutoSellMonitor) {
       clearInterval(fundingWaitAutoSellMonitor);
       fundingWaitAutoSellMonitor = null;
+    }
+    if (fundingWaitDiscoveryMonitor) {
+      clearInterval(fundingWaitDiscoveryMonitor);
+      fundingWaitDiscoveryMonitor = null;
     }
     fundingRecovery = {
       enabled: cfg.armCatchUpAfterFunding,
@@ -2249,6 +2256,56 @@ function startAutoSellMonitor(cfg, runtime = null) {
   };
 
   const timer = setInterval(tick, cfg.autoSellPollMs);
+  void tick();
+  return timer;
+}
+
+function startFundingWaitDiscoveryMonitor(cfg) {
+  if (!cfg.pushPlusEnabled || !cfg.pushPlusToken) return null;
+  let running = false;
+  let initialized = false;
+
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const markets = await loadRestDiscoveryEventMarkets(cfg);
+      let alerted = 0;
+      let seededLive = 0;
+      for (const market of markets) {
+        const key = eventSeenKey(market, cfg);
+        if (fundingWaitDiscoveryNotifications.has(key)) continue;
+        fundingWaitDiscoveryNotifications.add(key);
+        if (!initialized && msUntilStart(market) <= 0) {
+          seededLive += 1;
+          continue;
+        }
+        notifyMarketDiscovered(cfg, market, null, "funding-wait-rest-readonly");
+        alerted += 1;
+      }
+      if (alerted > 0 || seededLive > 0) {
+        console.log(JSON.stringify({
+          level: "event-funding-wait-discovery",
+          alerted,
+          seededLive,
+          tracked: fundingWaitDiscoveryNotifications.size,
+          at: new Date().toISOString()
+        }));
+      }
+      initialized = true;
+    } catch (error) {
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "funding-wait-rest-discovery",
+        message: errorMessage(error),
+        at: new Date().toISOString()
+      }));
+    } finally {
+      running = false;
+    }
+  };
+
+  const timer = setInterval(tick, Math.max(250, cfg.restDiscoveryPollMs));
   void tick();
   return timer;
 }
