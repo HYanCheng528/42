@@ -1399,7 +1399,11 @@ async function selfTest(cfg) {
     );
     const notificationCfg = {
       ...testCfg,
-      notificationStateFile: path.join(stateDir, "notifications.json")
+      notificationStateFile: path.join(stateDir, "notifications.json"),
+      stateFile: path.join(stateDir, "readonly-seen.json"),
+      fillsFile: path.join(stateDir, "readonly-fills.jsonl"),
+      pushPlusEnabled: false,
+      pushPlusToken: ""
     };
     const notificationMarket = mockEventMarket({
       address: "0x0000000000000000000000000000000000000058"
@@ -1413,7 +1417,26 @@ async function selfTest(cfg) {
       loadSeen(notificationCfg.notificationStateFile).has(marketNotificationKey("discovered", notificationMarket)),
       "market discovery notification key should be persisted"
     );
-    passed.push("seen and notification state writes are atomic, recoverable and persistently deduped");
+    const readonlyWsMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000000059",
+      categories: [],
+      tags: ["onchain"],
+      startDate: new Date(baseStart).toISOString(),
+      endDate: new Date(baseStart + 49 * 3600000).toISOString()
+    });
+    handleFundingWaitWsMarkets({
+      ...notificationCfg,
+      allowOnchainOnlyMarkets: false
+    }, [readonlyWsMarket], "self-test");
+    assertSelfTest(
+      loadSeen(notificationCfg.notificationStateFile).has(marketNotificationKey("discovered", readonlyWsMarket)),
+      "funding wait WSS should persistently notify a chain-only candidate"
+    );
+    assertSelfTest(
+      !fs.existsSync(notificationCfg.stateFile),
+      "funding wait WSS should not mutate the buy seen state"
+    );
+    passed.push("seen and notification state writes are atomic; readonly WSS notifications persist without mutating buy state");
   } finally {
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
@@ -1708,12 +1731,15 @@ async function arm(cfg, args) {
   let fundingRecovery = null;
   let fundingWaitAutoSellMonitor = null;
   let fundingWaitDiscoveryMonitor = null;
+  let fundingWaitWsDiscoveryMonitor = null;
   if (cfg.armWaitForFunding) {
     const waitingSince = Date.now();
     fundingWaitAutoSellMonitor = startAutoSellMonitor(cfg, null);
     fundingWaitDiscoveryMonitor = startFundingWaitDiscoveryMonitor(cfg);
+    fundingWaitWsDiscoveryMonitor = startFundingWaitWsDiscoveryMonitor(cfg);
     const fundingStatus = await waitForWatchFunding(cfg, {
-      autoSellMonitor: fundingWaitAutoSellMonitor
+      autoSellMonitor: fundingWaitAutoSellMonitor,
+      fundingWaitWsDiscoveryMonitor
     });
     if (fundingWaitAutoSellMonitor) {
       clearInterval(fundingWaitAutoSellMonitor);
@@ -1722,6 +1748,10 @@ async function arm(cfg, args) {
     if (fundingWaitDiscoveryMonitor) {
       clearInterval(fundingWaitDiscoveryMonitor);
       fundingWaitDiscoveryMonitor = null;
+    }
+    if (fundingWaitWsDiscoveryMonitor) {
+      fundingWaitWsDiscoveryMonitor.stop();
+      fundingWaitWsDiscoveryMonitor = null;
     }
     fundingRecovery = {
       enabled: cfg.armCatchUpAfterFunding,
@@ -2058,6 +2088,7 @@ function buildWatchRuntimeStatus(cfg, {
   wsStartupSeedDeferred = false,
   fundingRecovery = null,
   autoSellMonitor = null,
+  fundingWaitWsDiscoveryMonitor = null,
   phase = "watching"
 } = {}) {
   const autoSellRuntimeEnabled = Boolean(
@@ -2187,7 +2218,13 @@ function buildWatchRuntimeStatus(cfg, {
     broadcastWarmup,
     startupWarnings,
     wsStartupSeedDeferred,
-    fundingRecovery: describeFundingRecovery(fundingRecovery)
+    fundingRecovery: describeFundingRecovery(fundingRecovery),
+    fundingWaitMonitoring: phase === "waiting_for_funds"
+      ? {
+          restReadonly: Boolean(cfg.pushPlusEnabled && cfg.pushPlusToken),
+          wsReadonly: Boolean(fundingWaitWsDiscoveryMonitor)
+        }
+      : null
   };
 }
 
@@ -2324,6 +2361,95 @@ function startFundingWaitDiscoveryMonitor(cfg) {
   const timer = setInterval(tick, Math.max(250, cfg.restDiscoveryPollMs));
   void tick();
   return timer;
+}
+
+function startFundingWaitWsDiscoveryMonitor(cfg) {
+  if (!cfg.pushPlusEnabled || !cfg.pushPlusToken || !cfg.wsUrl) return null;
+  const { publicClient } = makeClients(cfg);
+  const queue = [];
+  const txBuffers = new Map();
+  let unwatch = null;
+  let running = false;
+  let stopped = false;
+  let reconnectAfterMs = 0;
+
+  const disconnect = () => {
+    const stopWatching = unwatch;
+    unwatch = null;
+    try {
+      stopWatching?.();
+    } catch {
+      // The transport is already unavailable.
+    }
+  };
+
+  const connect = () => {
+    if (stopped || unwatch || Date.now() < reconnectAfterMs) return;
+    try {
+      const wsClient = makeWsClient(cfg);
+      unwatch = watchControllerLogs(wsClient, {
+        onLogs: (logs) => {
+          queue.push(...logs);
+          void tick();
+        },
+        onError: (error) => {
+          disconnect();
+          reconnectAfterMs = Date.now() + cfg.watchStartupRetryMs;
+          console.error(JSON.stringify({
+            level: "warn",
+            source: "funding-wait-ws-readonly",
+            message: errorMessage(error),
+            retryInMs: cfg.watchStartupRetryMs,
+            at: new Date().toISOString()
+          }));
+        }
+      });
+      console.log(JSON.stringify({
+        level: "funding-wait-ws-readonly",
+        status: "watching",
+        url: redactSecretUrls(cfg.wsUrl),
+        at: new Date().toISOString()
+      }));
+    } catch (error) {
+      reconnectAfterMs = Date.now() + cfg.watchStartupRetryMs;
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "funding-wait-ws-readonly-startup",
+        message: errorMessage(error),
+        retryInMs: cfg.watchStartupRetryMs,
+        at: new Date().toISOString()
+      }));
+    }
+  };
+
+  async function tick() {
+    if (stopped || running) return;
+    running = true;
+    try {
+      connect();
+      while (queue.length > 0) addBufferedControllerLog(txBuffers, queue.shift());
+      await drainFundingWaitWsLogBuffers(publicClient, txBuffers, cfg);
+    } catch (error) {
+      console.error(JSON.stringify({
+        level: "warn",
+        source: "funding-wait-ws-readonly-drain",
+        message: errorMessage(error),
+        at: new Date().toISOString()
+      }));
+    } finally {
+      running = false;
+    }
+  }
+
+  connect();
+  const timer = setInterval(() => void tick(), Math.max(25, Math.min(250, cfg.hotPollMs)));
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+      disconnect();
+    }
+  };
 }
 
 async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), runtime = null, source = "manual" } = {}) {
@@ -2901,7 +3027,8 @@ async function waitForWatchFunding(cfg, options = {}) {
     ready: false,
     message: "Waiting for funding check"
   }, {
-    autoSellMonitor: options.autoSellMonitor ?? null
+    autoSellMonitor: options.autoSellMonitor ?? null,
+    fundingWaitWsDiscoveryMonitor: options.fundingWaitWsDiscoveryMonitor ?? null
   });
   while (true) {
     let retryMs = cfg.armFundingRetryMs;
@@ -2923,7 +3050,8 @@ async function waitForWatchFunding(cfg, options = {}) {
       }
       retryMs = nextFundingRetryMs(cfg, fundingStatus);
       writeFundingWaitRuntimeStatus(cfg, fundingStatus, {
-        autoSellMonitor: options.autoSellMonitor ?? null
+        autoSellMonitor: options.autoSellMonitor ?? null,
+        fundingWaitWsDiscoveryMonitor: options.fundingWaitWsDiscoveryMonitor ?? null
       });
       console.error(JSON.stringify({
         level: "event-arm-waiting-for-funds",
@@ -2941,7 +3069,8 @@ async function waitForWatchFunding(cfg, options = {}) {
         error: true,
         message: errorMessage(error)
       }, {
-        autoSellMonitor: options.autoSellMonitor ?? null
+        autoSellMonitor: options.autoSellMonitor ?? null,
+        fundingWaitWsDiscoveryMonitor: options.fundingWaitWsDiscoveryMonitor ?? null
       });
       console.error(JSON.stringify({
         level: "event-arm-waiting-error",
@@ -3520,6 +3649,72 @@ async function drainControllerLogBuffers(publicClient, txBuffers, cfg, seen, pen
     for (const error of decodeErrors) {
       console.error(JSON.stringify({ level: "warn", source: "ws-decode", ...error }));
     }
+  }
+}
+
+async function drainFundingWaitWsLogBuffers(publicClient, txBuffers, cfg) {
+  const now = Date.now();
+  for (const [txHash, bucket] of [...txBuffers]) {
+    if (!bucket.logs.some(isCreationLog)) continue;
+
+    const hasOutcomeData = bucket.logs.some(
+      (log) => log.eventName === "CreateNewQuestionV2" || log.eventName === "AddOutcome"
+    );
+    const fallback = hasOutcomeData || now - bucket.firstSeenMs >= cfg.wsReceiptFallbackMs;
+    const { decoded, decodeErrors } = await decodeControllerMarketLogs(publicClient, bucket.logs, {
+      createdAt: new Date().toISOString(),
+      fallback
+    });
+    if (decoded.length === 0) {
+      if (!fallback) continue;
+      bucket.fallbackAttempts = (bucket.fallbackAttempts ?? 0) + 1;
+      if (bucket.fallbackAttempts <= cfg.wsReceiptFallbackRetries) continue;
+    }
+
+    txBuffers.delete(txHash);
+    handleFundingWaitWsMarkets(cfg, sortMarketsByChainDesc(decoded), "funding-wait-ws-readonly");
+    for (const error of decodeErrors) {
+      console.error(JSON.stringify({ level: "warn", source: "funding-wait-ws-decode", ...error }));
+    }
+  }
+}
+
+function handleFundingWaitWsMarkets(cfg, markets, source) {
+  for (const market of markets) {
+    const curveReason = marketCurveBlockReason(market);
+    if (curveReason) {
+      if (notifyBlockedCurveMarket(cfg, market, curveReason, source)) {
+        const row = {
+          level: "event-skip-curve",
+          source,
+          market: market.address,
+          question: market.question,
+          startDate: market.startDate,
+          curve: market.curve ?? null,
+          curveReason,
+          reason: `blocked curve: ${curveReason}`,
+          at: new Date().toISOString()
+        };
+        appendJsonl(cfg.fillsFile, row);
+        console.log(JSON.stringify(row));
+      }
+      continue;
+    }
+
+    const chainCandidate = filterEventMarkets([market], {
+      ...cfg,
+      allowOnchainOnlyMarkets: true
+    });
+    if (chainCandidate.length === 0) continue;
+    if (!notifyMarketDiscovered(cfg, market, null, source)) continue;
+    console.log(JSON.stringify({
+      level: "event-funding-wait-ws-discovery",
+      source,
+      market: market.address,
+      question: market.question,
+      startDate: market.startDate,
+      at: new Date().toISOString()
+    }));
   }
 }
 
