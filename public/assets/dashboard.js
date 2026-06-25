@@ -31,6 +31,7 @@ const state = {
   route: routeFromHash(),
   marketFilter: "all",
   configDirty: false,
+  configRendered: false,
   configGroup: "buy",
   selected: null,
   sellPercent: 100,
@@ -47,8 +48,13 @@ const state = {
   lastPositionsRefreshMs: null,
   overviewLoading: false,
   overviewPendingForce: false,
+  walletDataGeneration: 0,
   marketDiagnostics: {},
-  operatorApprovals: {}
+  operatorApprovals: {},
+  outcomeSelectorMarket: null,
+  outcomeDrafts: {},
+  outcomeSaving: {},
+  walletSwitching: false
 };
 
 const ICONS = {
@@ -198,6 +204,7 @@ const CONFIG_GROUPS = [
       {
         title: "交易权限",
         fields: [
+          { key: "WALLET_ADDRESS", label: "钱包地址", type: "address" },
           { key: "DRY_RUN", label: "模拟交易", type: "boolean" },
           { key: "EXECUTE", label: "允许真实下单", type: "boolean", danger: true },
           { key: "I_UNDERSTAND_42_PRICE_MARKET_RISK", label: "确认交易风险", type: "ack", danger: true },
@@ -216,6 +223,7 @@ const CONFIG_GROUPS = [
         fields: [
           { key: "STAKE_PER_OUTCOME_USDT", label: "每档金额 U", type: "number", min: "0.01", step: "0.01" },
           { key: "EVENT_OUTCOME_COUNT", label: "买入档数", type: "number", min: "1", step: "1" },
+          { key: "MAX_STAKE_USDT", label: "单档上限 U", type: "number", min: "0.01", step: "0.01" },
           { key: "MAX_MARKET_STAKE_USDT", label: "单场上限 U", type: "number", min: "0.01", step: "0.01" },
           { key: "MAX_BATCH_STAKE_USDT", label: "批次上限 U", type: "number", min: "0.01", step: "0.01" }
         ]
@@ -228,7 +236,7 @@ const CONFIG_GROUPS = [
         title: "入场参数",
         fields: [
           { key: "EVENT_OPEN_WINDOW_SECONDS", label: "开盘容错截止秒", type: "number", min: "1", step: "1" },
-          { key: "EVENT_BUY_DELAY_SECONDS", label: "开盘后延迟买入秒", type: "number", min: "0", step: "1" },
+          { key: "EVENT_BUY_DELAY_SECONDS", label: "开盘后延迟买入秒", type: "number", min: "0", step: "0.1" },
           { key: "REQUIRE_REST_BEFORE_BUY", label: "买前要求 REST 同步", type: "boolean" },
           { key: "REQUIRE_REST_STATUS", label: "允许 REST 状态", type: "text" },
           { key: "REQUIRE_QUOTE_BEFORE_BUY", label: "买前报价模拟", type: "boolean" },
@@ -242,6 +250,7 @@ const CONFIG_GROUPS = [
         title: "市场筛选",
         fields: [
           { key: "MIN_MARKET_DURATION_HOURS", label: "最小时长 h", type: "number", min: "0", step: "0.1" },
+          { key: "WORLD_CUP_SCORE_MODE", label: "世界杯25项比分盘模式", type: "boolean" },
           { key: "MARKET_ADDRESS_BLOCKLIST", label: "手动去除市场地址", type: "text" },
           { key: "MARKET_QUESTION_BLOCKLIST", label: "手动去除关键词", type: "text" },
           { key: "WATCH_BUY_EXISTING", label: "启动买现有场", type: "boolean" }
@@ -251,7 +260,7 @@ const CONFIG_GROUPS = [
         title: "买入方式",
         fields: [
           { key: "EVENT_BUY_MODE", label: "买入模式", type: "select", options: ["fast", "quoted"] },
-          { key: "EVENT_OUTCOME_SELECTION", label: "选择策略", type: "select", options: ["lowest_odds", "all"] },
+          { key: "EVENT_OUTCOME_SELECTION", label: "选择策略", type: "select", options: ["lowest_odds", "last_outcomes", "all"] },
           { key: "EVENT_OUTCOME_SELECTION_FALLBACK", label: "赔率缺失兜底", type: "select", options: ["token_order", "error"] }
         ]
       }
@@ -265,6 +274,7 @@ const CONFIG_GROUPS = [
       {
         title: "总开关",
         fields: [
+          { key: "AUTO_APPROVE_MARKET_AFTER_BUY", label: "买入后自动卖出授权", type: "boolean" },
           { key: "AUTO_SELL_ENABLED", label: "自动卖出总开关", type: "boolean" },
           { key: "AUTO_SELL_POLL_MS", label: "止盈轮询 ms", type: "number", min: "1", step: "100" },
           { key: "AUTO_SELL_MIN_OUT_MODE", label: "止盈 minOut", type: "select", options: ["quote", "manual"] },
@@ -334,6 +344,14 @@ const CONFIG_GROUPS = [
           { key: "AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT", label: "回落到盈利 %", type: "number", min: "-100", step: "0.1" },
           { key: "AUTO_SELL_BREAKEVEN_PERCENT", label: "卖出 %", type: "number", min: "1", max: "100", step: "1" }
         ]
+      },
+      {
+        title: "开盘定时极速卖出",
+        fields: [
+          { key: "AUTO_SELL_TIMED_EXIT_ENABLED", label: "启用定时极速卖出", type: "boolean" },
+          { key: "AUTO_SELL_TIMED_EXIT_AFTER_OPEN_SECONDS", label: "开盘后秒数", type: "number", min: "0", step: "1" },
+          { key: "AUTO_SELL_TIMED_EXIT_PERCENT", label: "卖出 %", type: "number", min: "1", max: "100", step: "1" }
+        ]
       }
     ]
   },
@@ -380,16 +398,18 @@ async function loadOverview({ force = false } = {}) {
     return;
   }
   state.overviewLoading = true;
+  const generation = state.walletDataGeneration;
   if (force) els.refreshBtn.disabled = true;
   const startedAt = performance.now();
   try {
     const query = force ? "?force=1" : "";
     const data = await api(`/api/overview${query}`);
+    if (generation !== state.walletDataGeneration) return;
     state.lastRefreshMs = Math.round(performance.now() - startedAt);
     state.data = data;
     render(data);
   } catch (error) {
-    showToast(error.message || "刷新失败");
+    if (generation === state.walletDataGeneration) showToast(error.message || "刷新失败");
   } finally {
     state.overviewLoading = false;
     els.refreshBtn.disabled = false;
@@ -428,15 +448,17 @@ async function loadPositions({ force = false } = {}) {
     return;
   }
   state.positionsLoading = true;
+  const generation = state.walletDataGeneration;
   if (force && els.positionRefresh) els.positionRefresh.disabled = true;
   const startedAt = performance.now();
   try {
     const query = force ? "?force=1" : "";
     const data = await api(`/api/positions${query}`);
+    if (generation !== state.walletDataGeneration) return;
     state.lastPositionsRefreshMs = Math.round(performance.now() - startedAt);
     applyPositionsSnapshot(data);
   } catch (error) {
-    showToast(error.message || "持仓刷新失败");
+    if (generation === state.walletDataGeneration) showToast(error.message || "持仓刷新失败");
   } finally {
     state.positionsLoading = false;
     if (els.positionRefresh) els.positionRefresh.disabled = false;
@@ -449,6 +471,10 @@ async function loadPositions({ force = false } = {}) {
 
 function applyPositionsSnapshot(data) {
   if (!state.data) return;
+  const expectedWallet = state.data.settings?.config?.runtime?.walletAddress
+    ?? state.data.dashboardWallet?.address
+    ?? "";
+  if (data?.wallet && expectedWallet && !sameWalletAddress(data.wallet, expectedWallet)) return;
   state.data.holdings = data.holdings;
   state.data.analytics = state.data.analytics ?? {};
   state.data.analytics.cards = {
@@ -533,9 +559,14 @@ function renderMarkets(data) {
 }
 
 function renderNewMarkets(feed) {
-  const items = feed.items.filter((item) => marketMatchesFilter(item, state.marketFilter));
+  const matchedItems = feed.items
+    .filter((item) => marketMatchesFilter(item, state.marketFilter))
+    .sort(compareMarketsByOpenTime);
+  const items = state.marketFilter === "all" ? matchedItems.slice(0, 120) : matchedItems;
   const baseCount = feed.excluded ? `${feed.count} 个 · 刷掉 ${feed.excluded}` : `${feed.count} 个`;
-  els.newMarketCount.textContent = state.marketFilter === "all" ? baseCount : `${items.length} / ${feed.count}`;
+  els.newMarketCount.textContent = state.marketFilter === "all"
+    ? `${baseCount}${matchedItems.length > items.length ? ` · 展示 ${items.length}` : ""}`
+    : `${items.length} / ${feed.count}`;
   if (!items.length) {
     els.newMarketList.innerHTML = `<div class="empty">暂无匹配市场</div>`;
     return;
@@ -543,29 +574,12 @@ function renderNewMarkets(feed) {
   els.newMarketList.innerHTML = `
     <div class="tableHeader marketRow">
       <span>Market</span>
-      <span>时间</span>
+      <span>时间 UTC+8</span>
       <span>Outcome</span>
       <span>State</span>
       <span>Stake</span>
     </div>
-    ${items.map((item) => `
-      <div class="marketRow">
-        <div class="marketQuestion">
-          <div class="marketQuestionTop">
-            <strong title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</strong>
-            ${renderOperatorApprovalButton(item)}
-            ${renderMarketDiagnoseButton(item)}
-            ${renderMarketExclusionButton(item)}
-          </div>
-          <small>${escapeHtml(item.meta ?? marketInlineMeta(item))}</small>
-          ${renderMarketDiagnostics(item)}
-        </div>
-        <div class="marketTimes">${marketScheduleHtml(item)}</div>
-        <div class="outcomeCountCell"><strong>${formatOutcomeCount(item)}</strong><small>个</small></div>
-        <div><span class="marketState ${marketStateTone(item.tone)}">${escapeHtml(item.state)}</span></div>
-        <div>${item.stake} U</div>
-      </div>
-    `).join("")}
+    ${items.map(renderMarketRow).join("")}
   `;
   for (const button of document.querySelectorAll("[data-market-diagnose]")) {
     button.addEventListener("click", () => diagnoseMarket(button.dataset.marketDiagnose));
@@ -574,19 +588,218 @@ function renderNewMarkets(feed) {
   for (const button of document.querySelectorAll("[data-market-exclude-action]")) {
     button.addEventListener("click", () => updateMarketExclusion(button.dataset.market, button.dataset.marketExcludeAction));
   }
+  bindOutcomeSelectionControls();
+}
+
+function renderMarketRow(item) {
+  const key = marketKey(item.market);
+  const expanded = key && state.outcomeSelectorMarket === key;
+  const manualCount = item.manualOutcomeSelection?.tokenIds?.length ?? 0;
+  return `
+    <div class="marketRow ${manualCount > 0 ? "hasManualOutcomes" : ""}">
+      <div class="marketQuestion">
+        <div class="marketQuestionTop">
+          <strong title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</strong>
+          ${renderOutcomeSelectionButton(item)}
+          ${renderOperatorApprovalButton(item)}
+          ${renderMarketDiagnoseButton(item)}
+          ${renderMarketExclusionButton(item)}
+        </div>
+        <small>${escapeHtml(item.meta ?? marketInlineMeta(item))}</small>
+        ${renderMarketDiagnostics(item)}
+      </div>
+      <div class="marketTimes">${marketScheduleHtml(item)}</div>
+      <div class="outcomeCountCell">
+        <strong>${formatOutcomeCount(item)}</strong><small>个</small>
+        ${manualCount > 0 ? `<em>手选 ${manualCount}</em>` : ""}
+      </div>
+      <div><span class="marketState ${marketStateTone(item.tone)}">${escapeHtml(item.state)}</span></div>
+      <div>${item.stake} U</div>
+    </div>
+    ${expanded ? renderOutcomeSelectionPanel(item) : ""}
+  `;
+}
+
+function renderOutcomeSelectionButton(item) {
+  if (!item.market || !Array.isArray(item.outcomes) || item.outcomes.length === 0) return "";
+  const key = marketKey(item.market);
+  const active = Boolean(item.manualOutcomeSelection?.active);
+  const expanded = key && state.outcomeSelectorMarket === key;
+  const label = active ? "已手选 outcome" : "选择买入 outcome";
+  return `
+    <button class="ghost iconButton miniIconButton outcomeSelectBtn ${active ? "isActive" : ""} ${expanded ? "isExpanded" : ""}" type="button" title="${label}" aria-label="${label}" data-outcome-select="${escapeAttr(item.market)}">
+      ${icon("sliders-horizontal")}
+    </button>
+  `;
+}
+
+function renderOutcomeSelectionPanel(item) {
+  const key = marketKey(item.market);
+  const outcomes = item.outcomes ?? [];
+  const draft = outcomeDraftFor(item);
+  const selected = new Set(draft);
+  const saving = Boolean(state.outcomeSaving[key]);
+  return `
+    <div class="outcomeSelectorRow" data-outcome-panel="${escapeAttr(item.market)}">
+      <div class="outcomeSelectorHead">
+        <div>
+          <strong>手动选择买入 outcome</strong>
+          <span>${selected.size ? `已选 ${selected.size} 个；保存后覆盖默认选择策略` : "未选择时使用默认选择策略"}</span>
+        </div>
+        <div class="outcomeSelectorActions">
+          <button class="ghost iconButton" type="button" data-outcome-clear="${escapeAttr(item.market)}" ${saving || selected.size === 0 ? "disabled" : ""}>
+            <span>${saving ? "处理中" : "清空"}</span>
+          </button>
+          <button class="iconButton" type="button" data-outcome-save="${escapeAttr(item.market)}" ${saving ? "disabled" : ""}>
+            ${icon(saving ? "loader-circle" : "save")}
+            <span>${saving ? "保存中" : "保存选择"}</span>
+          </button>
+        </div>
+      </div>
+      <div class="outcomeChoiceGrid">
+        ${outcomes.map((outcome) => renderOutcomeChoice(item, outcome, selected)).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderOutcomeChoice(item, outcome, selected) {
+  const tokenId = String(outcome.tokenId ?? "");
+  const active = selected.has(tokenId);
+  const detail = [
+    outcome.payout !== null && outcome.payout !== undefined ? `payout ${formatOutcomeMetric(outcome.payout)}` : "",
+    outcome.price !== null && outcome.price !== undefined ? `price ${formatOutcomeMetric(outcome.price)}` : ""
+  ].filter(Boolean).join(" · ");
+  return `
+    <button class="outcomeChoice ${active ? "isSelected" : ""}" type="button" data-outcome-toggle="${escapeAttr(item.market)}" data-token-id="${escapeAttr(tokenId)}">
+      <strong>${escapeHtml(outcome.name ?? tokenId)}</strong>
+      <small>${escapeHtml(detail || `token ${shortTokenId(tokenId)}`)}</small>
+    </button>
+  `;
+}
+
+function bindOutcomeSelectionControls() {
+  for (const button of document.querySelectorAll("[data-outcome-select]")) {
+    button.addEventListener("click", () => toggleOutcomeSelector(button.dataset.outcomeSelect));
+  }
+  for (const button of document.querySelectorAll("[data-outcome-toggle]")) {
+    button.addEventListener("click", () => toggleOutcomeDraftToken(button.dataset.outcomeToggle, button.dataset.tokenId));
+  }
+  for (const button of document.querySelectorAll("[data-outcome-save]")) {
+    button.addEventListener("click", () => saveOutcomeSelection(button.dataset.outcomeSave));
+  }
+  for (const button of document.querySelectorAll("[data-outcome-clear]")) {
+    button.addEventListener("click", () => saveOutcomeSelection(button.dataset.outcomeClear, []));
+  }
+}
+
+function toggleOutcomeSelector(market) {
+  const key = marketKey(market);
+  if (!key) return;
+  const item = findMarketFeedItem(market);
+  if (item) outcomeDraftFor(item);
+  state.outcomeSelectorMarket = state.outcomeSelectorMarket === key ? null : key;
+  if (state.data) renderNewMarkets(state.data.newMarkets);
+}
+
+function toggleOutcomeDraftToken(market, tokenId) {
+  const key = marketKey(market);
+  if (!key || !tokenId) return;
+  const item = findMarketFeedItem(market);
+  const current = new Set(item ? outcomeDraftFor(item) : state.outcomeDrafts[key] ?? []);
+  if (current.has(tokenId)) current.delete(tokenId);
+  else current.add(tokenId);
+  state.outcomeDrafts[key] = [...current];
+  if (state.data) renderNewMarkets(state.data.newMarkets);
+}
+
+function outcomeDraftFor(item) {
+  const key = marketKey(item?.market);
+  if (!key) return [];
+  if (!Array.isArray(state.outcomeDrafts[key])) {
+    state.outcomeDrafts[key] = [...(item?.manualOutcomeSelection?.tokenIds ?? [])].map(String);
+  }
+  return state.outcomeDrafts[key];
+}
+
+async function saveOutcomeSelection(market, forcedTokenIds = null) {
+  const key = marketKey(market);
+  if (!key) return;
+  const tokenIds = Array.isArray(forcedTokenIds) ? forcedTokenIds : [...(state.outcomeDrafts[key] ?? [])];
+  state.outcomeSaving[key] = true;
+  if (state.data) renderNewMarkets(state.data.newMarkets);
+  try {
+    await api("/api/market/outcomes", {
+      method: "POST",
+      body: JSON.stringify({ market, tokenIds })
+    });
+    delete state.outcomeDrafts[key];
+    setRestartStatus(tokenIds.length ? "已保存手动 outcome 选择，重启 Watch 后生效" : "已清空手动 outcome 选择，重启 Watch 后恢复默认", "warn");
+    showToast(tokenIds.length ? `已保存 ${tokenIds.length} 个手选 outcome` : "已清空手选 outcome，恢复默认逻辑");
+    await loadOverview({ force: true });
+  } catch (error) {
+    showToast(error.message || "保存 outcome 选择失败");
+  } finally {
+    state.outcomeSaving[key] = false;
+    if (state.data) renderNewMarkets(state.data.newMarkets);
+  }
+}
+
+function findMarketFeedItem(market) {
+  const key = marketKey(market);
+  return state.data?.newMarkets?.items?.find((item) => marketKey(item.market) === key) ?? null;
+}
+
+function formatOutcomeMetric(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value ?? "");
+  if (number >= 1000) return number.toFixed(0);
+  if (number >= 10) return number.toFixed(2).replace(/\.?0+$/u, "");
+  return number.toFixed(4).replace(/\.?0+$/u, "");
+}
+
+function shortTokenId(value) {
+  const text = String(value ?? "");
+  if (text.length <= 10) return text || "--";
+  return `${text.slice(0, 5)}...${text.slice(-4)}`;
 }
 
 function renderOperatorApprovalButton(item) {
   if (!item.market) return "";
   const key = marketKey(item.market);
-  const stateItem = state.operatorApprovals[key] ?? {};
+  const transient = state.operatorApprovals[key] ?? {};
+  const serverState = item.operatorApproval ?? {};
+  const stateItem = transient.loading || transient.pending || transient.error || transient.approved
+    ? transient
+    : serverState;
   const loading = Boolean(stateItem.loading);
   const approved = Boolean(stateItem.approved);
-  const pending = Boolean(stateItem.pending);
-  const label = approved ? "卖出授权已完成" : pending ? "卖出授权已广播" : loading ? "卖出授权中" : "提前授权卖出";
+  const pending = Boolean(stateItem.pending || stateItem.status === "pending");
+  const failed = Boolean(stateItem.failed || stateItem.error || stateItem.status === "failed");
+  const statusText = approved
+    ? "已授权"
+    : pending || loading
+      ? "授权中"
+      : failed
+        ? "授权失败"
+        : stateItem.status === "unknown"
+          ? "状态未知"
+          : "未授权";
+  const label = stateItem.error
+    ? `${statusText}：${stateItem.error}`
+    : approved
+      ? "卖出授权已完成"
+      : pending
+        ? "卖出授权已广播"
+        : loading
+          ? "卖出授权中"
+          : "点击提前授权卖出";
+  const visibleStatus = Boolean(item.showStatus);
   return `
-    <button class="ghost iconButton miniIconButton operatorApprovalBtn ${approved ? "isApproved" : ""}" type="button" title="${label}" aria-label="${label}" data-operator-approve="${escapeAttr(item.market)}" data-title="${escapeAttr(item.title ?? "")}" ${loading || pending || approved ? "disabled" : ""}>
-      ${icon(loading ? "loader-circle" : "key-round")}
+    <button class="ghost iconButton ${visibleStatus ? "operatorStatusButton" : "miniIconButton"} operatorApprovalBtn ${approved ? "isApproved" : ""} ${failed ? "isFailed" : ""}" type="button" title="${escapeAttr(label)}" aria-label="${escapeAttr(label)}" data-operator-approve="${escapeAttr(item.market)}" data-title="${escapeAttr(item.title ?? "")}" ${loading || pending || approved ? "disabled" : ""}>
+      ${visibleStatus
+        ? `<span class="operatorStatusDot ${approved ? "isApproved" : pending || loading ? "isPending" : failed ? "isFailed" : "isUnapproved"}"></span><span>${statusText}</span>`
+        : icon(loading ? "loader-circle" : "key-round")}
     </button>
   `;
 }
@@ -670,7 +883,10 @@ async function approveOperatorForMarket(market, title = "") {
       method: "POST",
       body: JSON.stringify({ market, title })
     });
-    const approval = data.operatorApproval ?? {};
+    let approval = data.operatorApproval ?? {};
+    if (approval.taskId) {
+      approval = await waitForOperatorApprovalTask(approval.taskId, key);
+    }
     const approved = Boolean(approval.approved || approval.operatorApproved || approval.alreadyApproved);
     const pending = approval.status === "broadcast" && !approved;
     const statusText = approval.statusText || (approved ? "已授权" : "已广播");
@@ -742,7 +958,7 @@ async function updateMarketExclusion(market, action) {
       body: JSON.stringify({ market, action })
     });
     state.configDirty = false;
-    renderConfig(data.config, state.data?.settings?.runtimeStatus);
+    renderConfig(data.config, state.data?.settings?.runtimeStatus, { force: true });
     setRestartStatus(isRestore ? "已恢复市场，重启 Watch 后生效" : "已去除市场，重启 Watch 后生效", "warn");
     showToast(isRestore ? "已从手动去除名单移除" : "已加入手动去除名单");
     await loadOverview({ force: true });
@@ -782,22 +998,36 @@ function formatOutcomeCount(item) {
 function marketInlineMeta(item) {
   return [
     item?.category || "Event Market",
-    item?.curve?.label || "",
     `outcome ${formatOutcomeCount(item)} 个`,
     `买 ${item?.choices ?? "--"} 档`
   ].filter(Boolean).join(" · ");
 }
 
 function marketScheduleText(item) {
-  return `开 ${formatDate(item.startsAt)} · 闭 ${formatDate(item.endsAt)} · 持续 ${marketDurationLabel(item)}`;
+  const premium = marketPremiumWindowLabel(item);
+  return `开 ${formatDate(item.startsAt)} · 闭 ${formatDate(item.endsAt)} · 持续 ${marketDurationLabel(item)}${premium ? ` · ${premium}` : ""} · UTC+8`;
 }
 
 function marketScheduleHtml(item) {
+  const premium = marketPremiumWindowLabel(item);
   return `
     <span>开 ${formatDate(item.startsAt)}</span>
     <span>闭 ${formatDate(item.endsAt)}</span>
-    <small>持续 ${escapeHtml(marketDurationLabel(item))}</small>
+    <small>持续 ${escapeHtml(marketDurationLabel(item))}${premium ? ` · ${escapeHtml(premium)}` : ""} · UTC+8</small>
   `;
+}
+
+function marketPremiumWindowLabel(item) {
+  const premium = item?.premiumWindow;
+  if (premium?.label) return `溢价窗 ${premium.label}`;
+  const value = Number(premium?.seconds);
+  if (!Number.isFinite(value) || value < 0) return "";
+  return `溢价窗 ${formatSeconds(value)}`;
+}
+
+function formatSeconds(value) {
+  const rounded = Math.round(Number(value) * 1000) / 1000;
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : String(rounded).replace(/0+$/u, "").replace(/\.$/u, "")}s`;
 }
 
 function renderPositions(data) {
@@ -835,7 +1065,12 @@ function renderHoldings(holdings) {
         </div>
         <div class="marketActions">
           <strong class="${group.positive ? "good" : "bad"}">${group.pnl} U</strong>
-          ${renderOperatorApprovalButton({ market: group.market, title: group.title })}
+          ${renderOperatorApprovalButton({
+            market: group.market,
+            title: group.title,
+            operatorApproval: group.operatorApproval,
+            showStatus: true
+          })}
           <button class="ghost iconButton marketSellBtn" data-sell='${escapeAttr(JSON.stringify(marketSellPayload(group)))}' ${group.sellable ? "" : "disabled"}>
             ${icon("badge-dollar-sign")}<span>卖本市场</span>
           </button>
@@ -980,6 +1215,11 @@ function renderStrategy(data) {
   renderConfig(data.settings?.config, data.settings?.runtimeStatus);
   renderApprovalDefaults(data);
   const checks = [
+    {
+      label: "当前钱包",
+      value: data.dashboardWallet?.address ? `${shortAddress(data.dashboardWallet.address)} / ${data.dashboardWallet.source ?? "--"}` : "--",
+      tone: data.dashboardWallet?.matchesPrivateKey === false ? "warn" : "good"
+    },
     { label: "运行状态", value: data.bot.label, tone: data.bot.tone },
     { label: "BUSDT / BNB", value: data.wallet ? `${data.wallet.busdt} U / ${data.wallet.bnb} BNB` : "--", tone: data.wallet?.ready ? "good" : "warn" },
     { label: "Router 授权", value: data.wallet ? `${data.wallet.allowance} / ${data.wallet.minimumRequired} U` : "--", tone: data.wallet?.allowanceReady ? "good" : "warn" },
@@ -995,11 +1235,18 @@ function renderStrategy(data) {
   `).join("");
 }
 
-function renderConfig(config, runtimeStatus = null) {
+function renderConfig(config, runtimeStatus = null, { force = false } = {}) {
   if (!els.configForm || !config) return;
+  if (state.configRendered && !force) {
+    updateRenderedWatchRuntime(runtimeStatus);
+    return;
+  }
   if (state.configDirty && els.configForm.contains(document.activeElement)) return;
   const values = config.values ?? {};
   const runtime = config.runtime ?? {};
+  const walletMatchText = runtime.privateKeyLoaded
+    ? (runtime.walletMatchesPrivateKey ? "私钥匹配" : "私钥不匹配")
+    : "私钥未加载";
   const selectedGroup = CONFIG_GROUPS.some((group) => group.id === state.configGroup)
     ? state.configGroup
     : CONFIG_GROUPS[0].id;
@@ -1007,9 +1254,10 @@ function renderConfig(config, runtimeStatus = null) {
   els.configFileText.textContent = `${config.file ?? ".env.local"} · ${runtime.dryRun ? "dry-run" : "execute"}`;
   els.configForm.innerHTML = `
     ${renderWatchRuntime(runtimeStatus)}
+    ${renderWalletProfileSelector(config.walletProfiles)}
     <div class="configRuntime">
       <span>钱包 ${runtime.walletAddress ? shortAddress(runtime.walletAddress) : "--"}</span>
-      <span>私钥 ${runtime.privateKeyLoaded ? "已加载" : "未加载"}</span>
+      <span>${walletMatchText}</span>
       <span>RPC ${runtime.rpcConfigured && runtime.wsConfigured ? "已配置" : "缺失"}</span>
     </div>
     ${renderConfigTabs(selectedGroup)}
@@ -1017,6 +1265,44 @@ function renderConfig(config, runtimeStatus = null) {
       ${CONFIG_GROUPS.map((group) => renderConfigGroup(group, values, selectedGroup)).join("")}
     </div>
   `;
+  if (config.walletProfiles?.available) {
+    const walletAddressInput = els.configForm.querySelector('[data-config-key="WALLET_ADDRESS"]');
+    if (walletAddressInput) {
+      walletAddressInput.disabled = true;
+      walletAddressInput.title = "请使用钱包切换器同时切换地址和私钥";
+    }
+  }
+  state.configRendered = true;
+}
+
+function renderWalletProfileSelector(walletProfiles) {
+  if (!walletProfiles?.available || !walletProfiles.profiles?.length) return "";
+  const activeId = walletProfiles.activeId ?? "";
+  return `
+    <section class="walletProfileBar">
+      <div class="walletProfileCopy">
+        <strong>${icon("key-round")} 钱包</strong>
+        <span>切换时同步私钥、地址和持仓数据</span>
+      </div>
+      <div class="walletProfileControls">
+        <select data-wallet-profile-select aria-label="选择钱包">
+          ${walletProfiles.profiles.map((profile) => `
+            <option value="${escapeAttr(profile.id)}" ${profile.id === activeId ? "selected" : ""}>
+              ${escapeHtml(profile.label)} · ${escapeHtml(shortAddress(profile.address))}
+            </option>
+          `).join("")}
+        </select>
+        <button class="ghost iconButton" type="button" data-wallet-profile-activate disabled>
+          ${icon("refresh-cw")}<span>切换并重启</span>
+        </button>
+      </div>
+    </section>
+  `;
+}
+
+function updateRenderedWatchRuntime(runtimeStatus) {
+  const current = els.configForm?.querySelector(".watchRuntime");
+  if (current) current.outerHTML = renderWatchRuntime(runtimeStatus);
 }
 
 function renderConfigTabs(selectedGroup) {
@@ -1144,6 +1430,7 @@ function renderWatchRuntime(runtime) {
   const dataSources = runtime.dataSources ?? {};
   const autoSell = runtime.autoSell ?? {};
   const restText = dataSources.restDiscoveryEnabled ? `${dataSources.restDiscoveryPollMs ?? "--"}ms` : "关";
+  const entryText = `${runtimeSeconds(strategy.eventOpenWindowSeconds)} / 延迟 ${runtimeSeconds(strategy.eventBuyDelaySeconds)}`;
   return `
     <div class="configRuntime watchRuntime ${runtime.tone ?? "neutral"}">
       <span>Watch ${runtime.stateText ?? "--"}</span>
@@ -1151,7 +1438,10 @@ function renderWatchRuntime(runtime) {
       <span>模式 ${runtime.mode ?? "--"}</span>
       <span>数据 ${dataSources.eventDiscovery ?? "--"} / ${dataSources.wsProvider ?? dataSources.primaryRpc ?? "--"}</span>
       <span>买入 ${strategy.eventOutcomeCount ?? "--"} 档 x ${strategy.stakePerOutcomeUsdt ?? "--"}U</span>
+      <span>入场 ${entryText}</span>
       <span>时长 ≥ ${strategy.minMarketDurationHours ?? "--"}h</span>
+      <span>范围 ${strategy.worldCupScoreMode ? "世界杯25项比分盘" : "常规"}</span>
+      <span>手选 ${strategy.manualOutcomeSelectionMarkets ?? 0} 场</span>
       <span>REST ${restText}</span>
       <span>买 ${runtime.execution?.gasPriceGwei ?? "--"} / 卖 ${runtime.execution?.sellGasPriceGwei ?? runtime.execution?.gasPriceGwei ?? "--"} / 授权 ${runtime.execution?.operatorApproveGasPriceGwei ?? runtime.execution?.gasPriceGwei ?? "--"} gwei</span>
       <span>广播 ${dataSources.broadcastRpcCount ?? 0} 节点</span>
@@ -1159,6 +1449,11 @@ function renderWatchRuntime(runtime) {
       <span>快照 ${runtime.file ?? "--"}</span>
     </div>
   `;
+}
+
+function runtimeSeconds(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? formatSeconds(number) : "--";
 }
 
 function autoSellSummary(autoSell) {
@@ -1171,6 +1466,7 @@ function autoSellSummary(autoSell) {
   if (autoSell.adaptiveTrailing?.enabled) parts.push("自适应");
   if (autoSell.weakExit?.enabled) parts.push("弱势");
   if (autoSell.breakeven?.enabled) parts.push("保本");
+  if (autoSell.timedExit?.enabled) parts.push(`定时极速${autoSell.timedExit.afterOpenSeconds}s`);
   return parts.length ? parts.join(" / ") : "监控开";
 }
 
@@ -1197,11 +1493,11 @@ function renderConfigField(field, value) {
       </label>
     `;
   }
-  if (field.type === "text") {
+  if (field.type === "text" || field.type === "address") {
     return `
       <label class="configField" for="${id}">
         <span>${escapeHtml(field.label)}</span>
-        <input id="${id}" data-config-key="${field.key}" data-config-type="${field.type}" type="text" value="${escapeAttr(value ?? "")}">
+        <input id="${id}" data-config-key="${field.key}" data-config-type="${field.type}" type="text" value="${escapeAttr(value ?? "")}" ${field.type === "address" ? "spellcheck=\"false\" inputmode=\"text\"" : ""}>
       </label>
     `;
   }
@@ -1216,6 +1512,12 @@ function renderConfigField(field, value) {
 function bindConfigControls() {
   if (els.configForm) {
     els.configForm.addEventListener("click", (event) => {
+      const walletSwitch = event.target.closest("[data-wallet-profile-activate]");
+      if (walletSwitch) {
+        event.preventDefault();
+        activateWalletProfile();
+        return;
+      }
       const modeButton = event.target.closest("[data-buy-entry-mode]");
       if (modeButton) {
         event.preventDefault();
@@ -1227,24 +1529,85 @@ function bindConfigControls() {
       event.preventDefault();
       setConfigGroup(button.dataset.configGroup);
     });
-    els.configForm.addEventListener("input", () => {
+    els.configForm.addEventListener("input", (event) => {
+      if (event.target.matches("[data-wallet-profile-select]")) {
+        updateWalletProfileSwitchButton();
+        return;
+      }
       state.configDirty = true;
       updateBuyEntryModeCards();
+    });
+    els.configForm.addEventListener("change", (event) => {
+      if (event.target.matches("[data-wallet-profile-select]")) updateWalletProfileSwitchButton();
     });
   }
   if (els.saveConfig) els.saveConfig.addEventListener("click", saveConfig);
   if (els.restartWatch) els.restartWatch.addEventListener("click", restartWatch);
 }
 
+function updateWalletProfileSwitchButton() {
+  const select = els.configForm?.querySelector("[data-wallet-profile-select]");
+  const button = els.configForm?.querySelector("[data-wallet-profile-activate]");
+  if (!select || !button) return;
+  const activeId = state.data?.settings?.config?.walletProfiles?.activeId ?? "";
+  button.disabled = state.walletSwitching || !select.value || select.value === activeId;
+}
+
+async function activateWalletProfile() {
+  if (state.configDirty) {
+    showToast("请先保存当前配置，再切换钱包");
+    return;
+  }
+  const select = els.configForm?.querySelector("[data-wallet-profile-select]");
+  const button = els.configForm?.querySelector("[data-wallet-profile-activate]");
+  if (!select || !button || !select.value) return;
+  const profile = state.data?.settings?.config?.walletProfiles?.profiles?.find((item) => item.id === select.value);
+  const name = profile ? `${profile.label}（${shortAddress(profile.address)}）` : select.value;
+  if (!window.confirm(`切换到 ${name}？Watch 会重启，持仓和交易记录将切换到该钱包。`)) return;
+
+  state.walletSwitching = true;
+  state.walletDataGeneration += 1;
+  state.operatorApprovals = {};
+  state.overviewPendingForce = state.overviewLoading;
+  state.positionsPendingForce = state.positionsLoading;
+  button.disabled = true;
+  setButtonLabel(button, "loader-circle", "切换中");
+  setRestartStatus("正在切换钱包并重启 Watch...", "warn");
+  try {
+    const data = await api("/api/wallet/activate", {
+      method: "POST",
+      body: JSON.stringify({ profileId: select.value, confirm: "SWITCH_WALLET" })
+    });
+    if (state.data?.settings) state.data.settings.config = data.config;
+    state.configRendered = false;
+    renderConfig(data.config, state.data?.settings?.runtimeStatus, { force: true });
+    setRestartStatus(data.message || "钱包已切换", data.bot?.running ? "good" : "warn");
+    showToast(data.message || "钱包已切换");
+    await loadOverview({ force: true });
+    await loadPositions({ force: true });
+  } catch (error) {
+    setRestartStatus(error.message || "钱包切换失败", "bad");
+    showToast(error.message || "钱包切换失败");
+    await loadOverview({ force: true });
+  } finally {
+    state.walletSwitching = false;
+    const currentButton = els.configForm?.querySelector("[data-wallet-profile-activate]");
+    if (currentButton) setButtonLabel(currentButton, "refresh-cw", "切换并重启");
+    updateWalletProfileSwitchButton();
+  }
+}
+
 function applyBuyEntryMode(modeId) {
   const mode = BUY_ENTRY_MODES.find((item) => item.id === modeId);
   if (!mode) return;
+  const preservedKeys = modeId === "anti" ? new Set(["EVENT_BUY_DELAY_SECONDS"]) : new Set();
   for (const [key, value] of Object.entries(mode.values)) {
+    if (preservedKeys.has(key)) continue;
     setConfigInputValue(key, value);
   }
   state.configDirty = true;
   updateBuyEntryModeCards();
-  showToast(`已套用${mode.label}参数，保存并重启 Watch 后生效`);
+  showToast(`已套用${mode.label}参数${preservedKeys.size ? "，延迟秒数保持不变" : ""}；保存并重启 Watch 后生效`);
 }
 
 function setConfigInputValue(key, value) {
@@ -1305,11 +1668,12 @@ async function saveConfig() {
       body: JSON.stringify({ values })
     });
     state.configDirty = false;
-    renderConfig(data.config, state.data?.settings?.runtimeStatus);
+    renderConfig(data.config, state.data?.settings?.runtimeStatus, { force: true });
     setRestartStatus("配置已保存，重启 Watch 后生效", "warn");
     showToast("配置已保存，运行中的 watch 需重启生效");
     await loadOverview({ force: true });
   } catch (error) {
+    setRestartStatus(error.message || "保存失败", "bad");
     showToast(error.message || "保存失败");
   } finally {
     els.saveConfig.disabled = false;
@@ -1384,7 +1748,10 @@ async function approveRouter() {
       method: "POST",
       body: JSON.stringify({ amountUsdt: amount })
     });
-    const approval = data.approval ?? {};
+    let approval = data.approval ?? {};
+    if (approval.taskId) {
+      approval = await waitForRouterApprovalTask(approval.taskId);
+    }
     const hashText = approval.approveHash ? ` · ${shortAddress(approval.approveHash)}` : "";
     const message = approval.alreadyReady
       ? `Router 授权额度已经是 ${approval.allowance} U`
@@ -1405,6 +1772,23 @@ async function approveRouter() {
     els.approveRouter.disabled = false;
     setButtonLabel(els.approveRouter, "shield-check", "授权 BUSDT");
   }
+}
+
+async function waitForRouterApprovalTask(taskId) {
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const data = await api(`/api/wallet-actions/${encodeURIComponent(taskId)}`);
+    if (els.approveStatus) {
+      els.approveStatus.textContent = data.task.progress?.message || "授权任务排队中...";
+      els.approveStatus.className = "approvalStatus warn";
+    }
+    if (data.task.terminal) {
+      if (data.task.status === "failed") throw new Error(data.task.error || "BUSDT 授权失败");
+      return data.approval ?? {};
+    }
+    await delay(500);
+  }
+  throw new Error("BUSDT 授权仍在后台执行");
 }
 
 function openSell(item) {
@@ -1497,13 +1881,17 @@ async function executeSell() {
       method: "POST",
       body: JSON.stringify(sellRequestPayload())
     });
-    const txText = data.sell.txHash ? ` · ${shortAddress(data.sell.txHash)}` : "";
-    const received = data.sell.receivedText && data.sell.receivedText !== "未报价"
-      ? `${data.sell.receivedText} U`
-      : (data.sell.receivedText || "");
-    showToast(`${data.sell.status}：${received}${txText}`);
-    submitted = data.sell.rawStatus !== "reverted";
-    if (data.sell.rawStatus !== "reverted" && data.sell.rawStatus !== "partial_failed") closeSell();
+    let sell = data.sell;
+    if (sell.taskId) {
+      sell = await waitForSellTask(sell.taskId);
+    }
+    const txText = sell.txHash ? ` · ${shortAddress(sell.txHash)}` : "";
+    const received = sell.receivedText && sell.receivedText !== "未报价"
+      ? `${sell.receivedText} U`
+      : (sell.receivedText || "");
+    showToast(`${sell.status}：${received}${txText}`);
+    submitted = !["reverted", "failed"].includes(sell.rawStatus);
+    if (!["reverted", "failed", "partial_failed"].includes(sell.rawStatus)) closeSell();
   } catch (error) {
     showToast(error.message || "卖出失败");
   } finally {
@@ -1523,6 +1911,8 @@ async function executeSell() {
 function sellRequestPayload() {
   const payload = {
     market: state.selected.market,
+    title: state.selected.title,
+    outcome: state.selected.outcome,
     percent: state.sellPercent
   };
   if (state.selected.all) {
@@ -1535,6 +1925,78 @@ function sellRequestPayload() {
     payload.minOutUsdt = String(els.quickSellMinOut.value || state.quickSellMinOutUsdt || "0");
   }
   return payload;
+}
+
+async function waitForSellTask(taskId) {
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const data = await api(`/api/wallet-actions/${encodeURIComponent(taskId)}`);
+    renderSellTaskProgress(data.task);
+    if (data.task.terminal) {
+      if (!data.sell) throw new Error(data.task.error || "卖出任务没有返回结果");
+      return data.sell;
+    }
+    await delay(500);
+  }
+  throw new Error("卖出任务仍在后台执行，请查看持仓或执行记录");
+}
+
+async function waitForOperatorApprovalTask(taskId, key) {
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const data = await api(`/api/wallet-actions/${encodeURIComponent(taskId)}`);
+    state.operatorApprovals[key] = {
+      loading: !data.task.terminal,
+      pending: !data.task.terminal,
+      approved: Boolean(data.operatorApproval?.approved || data.operatorApproval?.operatorApproved),
+      error: data.task.error || ""
+    };
+    rerenderMarketViews();
+    if (data.task.terminal) {
+      if (data.task.status === "failed") throw new Error(data.task.error || "卖出授权失败");
+      return data.operatorApproval ?? {};
+    }
+    await delay(500);
+  }
+  throw new Error("卖出授权仍在后台执行");
+}
+
+function renderSellTaskProgress(task) {
+  const progress = task?.progress ?? {};
+  const total = Number(progress.total ?? 0);
+  const done = Number(progress.confirmed ?? 0) + Number(progress.broadcast ?? 0) + Number(progress.skipped ?? 0);
+  const failed = Number(progress.failed ?? 0);
+  const phaseText = task?.status === "queued"
+    ? "等待 Watch 执行"
+    : task?.status === "processing"
+      ? "Watch 正在逐项卖出"
+      : "卖出任务已结束";
+  els.quoteBox.innerHTML = `
+    <div class="quoteIntro">
+      <strong>${escapeHtml(phaseText)}</strong>
+      <span>${total ? `${done}/${total} 已处理${failed ? ` · ${failed} 失败` : ""}` : "正在读取剩余仓位"}</span>
+    </div>
+    ${(progress.items ?? []).map((item) => `
+      <div class="quoteLine">
+        <span>${escapeHtml(item.outcome || item.tokenId || "outcome")}</span>
+        <strong>${escapeHtml(walletTaskStatusText(item.status))}${item.txHash ? ` · ${escapeHtml(shortAddress(item.txHash))}` : ""}</strong>
+      </div>
+    `).join("")}
+  `;
+  setButtonLabel(els.confirmSell, "loader-circle", total ? `卖出中 ${done}/${total}` : "卖出排队中");
+}
+
+function walletTaskStatusText(status) {
+  if (status === "confirmed") return "已确认";
+  if (status === "broadcast") return "已广播";
+  if (status === "preparing") return "准备中";
+  if (status === "skipped") return "已跳过";
+  if (status === "failed" || status === "reverted") return "失败";
+  return "排队中";
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function setSellPercent(value, { quote = true } = {}) {
@@ -1653,12 +2115,41 @@ function routeFromHash() {
 }
 
 function marketMatchesFilter(item, filter) {
+  if (filter === "today") return isMarketToday(item);
   if (item.bucket) return filter === "all" || item.bucket === filter;
   if (filter === "all") return true;
   if (filter === "bought") return item.state === "已买";
   if (filter === "skipped") return item.state === "已跳过" || item.state === "已错过";
   if (filter === "pending") return !["已买", "已跳过", "已错过"].includes(item.state);
   return true;
+}
+
+function compareMarketsByOpenTime(a, b) {
+  const at = marketOpenTimeMs(a);
+  const bt = marketOpenTimeMs(b);
+  if (at !== bt) return bt - at;
+  return String(a?.title ?? "").localeCompare(String(b?.title ?? ""), "zh-CN");
+}
+
+function marketOpenTimeMs(item) {
+  const time = new Date(item?.startsAt ?? "").getTime();
+  return Number.isFinite(time) ? time : Number.NEGATIVE_INFINITY;
+}
+
+function isMarketToday(item) {
+  const date = shanghaiDateKey(item?.startsAt);
+  return Boolean(date) && date === shanghaiDateKey(new Date());
+}
+
+function shanghaiDateKey(value) {
+  const date = value instanceof Date ? value : new Date(value ?? "");
+  if (!Number.isFinite(date.getTime())) return "";
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
 }
 
 function marketStateTone(tone) {
@@ -1732,6 +2223,7 @@ function countdown(value) {
 function formatDate(value) {
   if (!value) return "--";
   return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -1805,6 +2297,10 @@ function shortAddress(value) {
 
 function marketKey(value) {
   return String(value ?? "").trim().toLowerCase();
+}
+
+function sameWalletAddress(left, right) {
+  return String(left ?? "").trim().toLowerCase() === String(right ?? "").trim().toLowerCase();
 }
 
 function escapeHtml(value) {

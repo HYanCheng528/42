@@ -34,6 +34,7 @@ export function readConfig() {
   loadDotEnv(".env.local");
   loadDotEnv();
   loadProviderEnv();
+  loadServiceEnvFallback();
   loadBotConfigEnv();
 
   const cfg = {
@@ -46,7 +47,7 @@ export function readConfig() {
       ["BSC_WS_URL", "CHAINSTACK_BSC_WS_URL", "ANKR_BSC_WS_URL", "ANKR_BSC_WS_RPC_URL"],
       "wss://bsc-rpc.publicnode.com"
     ),
-    privateKey: envString("PRIVATE_KEY", "") || readKeychainPrivateKey() || readWindowsDpapiPrivateKey(),
+    privateKey: envString("PRIVATE_KEY", "") || readPrivateKeyFile() || readKeychainPrivateKey() || readWindowsDpapiPrivateKey(),
     walletAddress: envString("WALLET_ADDRESS", ""),
     dryRun: envBool("DRY_RUN", true),
     execute: envBool("EXECUTE", false),
@@ -84,19 +85,24 @@ export function readConfig() {
     receiptWatchPollingMs: envInteger("RECEIPT_WATCH_POLLING_MS", 1000),
     executionRetryMs: envInteger("EXECUTION_RETRY_MS", 500),
     eventOpenWindowSeconds: envInteger("EVENT_OPEN_WINDOW_SECONDS", 25),
-    eventBuyDelaySeconds: envInteger("EVENT_BUY_DELAY_SECONDS", 0),
+    eventBuyDelaySeconds: envNumber("EVENT_BUY_DELAY_SECONDS", 0),
     requireRestBeforeBuy: envBool("REQUIRE_REST_BEFORE_BUY", false),
     requireRestStatus: envList("REQUIRE_REST_STATUS", ""),
     requireQuoteBeforeBuy: envBool("REQUIRE_QUOTE_BEFORE_BUY", false),
     requireChainMintBeforeBuy: envBool("REQUIRE_CHAIN_MINT_BEFORE_BUY", false),
     fanoutBroadcast: envBool("FANOUT_BROADCAST", true),
     broadcastRpcUrls: [],
+    archiveRpcUrls: [],
     broadcastTimeoutMs: envInteger("BROADCAST_TIMEOUT_MS", 1200),
     rpcWarmupTimeoutMs: envInteger("RPC_WARMUP_TIMEOUT_MS", 2500),
     doctorCheckWs: envBool("DOCTOR_CHECK_WS", false),
     gasPriceGwei: envString("GAS_PRICE_GWEI", "0.12"),
     sellGasPriceGwei: envString("SELL_GAS_PRICE_GWEI", envString("GAS_PRICE_GWEI", "0.12")),
     operatorApproveGasPriceGwei: envString("OPERATOR_APPROVE_GAS_PRICE_GWEI", envString("GAS_PRICE_GWEI", "0.12")),
+    autoApproveMarketAfterBuy: envBool("AUTO_APPROVE_MARKET_AFTER_BUY", true),
+    operatorApprovalStateFile: envString("OPERATOR_APPROVAL_STATE_FILE", "data/operator-approval-state.json"),
+    walletActionQueueDir: envString("WALLET_ACTION_QUEUE_DIR", "data/wallet-actions"),
+    walletActionPollMs: envInteger("WALLET_ACTION_POLL_MS", 100),
     fastGasLimit: envInteger("FAST_GAS_LIMIT", 5000000),
     fastSellGasLimit: envInteger("FAST_SELL_GAS_LIMIT", 1000000),
     bundleFastGasLimit: envInteger("BUNDLE_FAST_GAS_LIMIT", 12000000),
@@ -112,6 +118,9 @@ export function readConfig() {
     allowOnchainOnlyMarkets: envBool("ALLOW_ONCHAIN_ONLY_MARKETS", false),
     minMarketCreatedAt: envString("MIN_MARKET_CREATED_AT", ""),
     minMarketDurationHours: envNumber("MIN_MARKET_DURATION_HOURS", 48),
+    worldCupScoreMode: envBool("WORLD_CUP_SCORE_MODE", false),
+    manualOutcomeSelectionsFile: envString("MANUAL_OUTCOME_SELECTIONS_FILE", "data/manual-outcome-selections.json"),
+    manualOutcomeSelections: {},
     watchBuyExisting: envBool("WATCH_BUY_EXISTING", false),
     slippageBps: envInteger("SLIPPAGE_BPS", 800),
     pollMs: envInteger("POLL_MS", 500),
@@ -164,6 +173,9 @@ export function readConfig() {
     autoSellBreakevenArmProfitPct: envNumber("AUTO_SELL_BREAKEVEN_ARM_PROFIT_PCT", 30),
     autoSellBreakevenExitProfitPct: envNumber("AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT", 3),
     autoSellBreakevenPercent: envNumber("AUTO_SELL_BREAKEVEN_PERCENT", 100),
+    autoSellTimedExitEnabled: envBool("AUTO_SELL_TIMED_EXIT_ENABLED", false),
+    autoSellTimedExitAfterOpenSeconds: envInteger("AUTO_SELL_TIMED_EXIT_AFTER_OPEN_SECONDS", 60),
+    autoSellTimedExitPercent: envNumber("AUTO_SELL_TIMED_EXIT_PERCENT", 100),
     autoSellPositionLimit: envInteger("AUTO_SELL_POSITION_LIMIT", 500),
     autoSellStateFile: envString("AUTO_SELL_STATE_FILE", "data/auto-sell-seen.json"),
     autoSellPositionStateFile: envString("AUTO_SELL_POSITION_STATE_FILE", "data/auto-sell-position-state.json"),
@@ -179,9 +191,12 @@ export function readConfig() {
     lookaheadSeconds: envInteger("LOOKAHEAD_SECONDS", 900),
     allowLateBuy: envBool("ALLOW_LATE_BUY", false),
     stateFile: envString("STATE_FILE", "data/seen-markets.json"),
-    fillsFile: envString("FILLS_FILE", "data/fills.jsonl")
+    fillsFile: envString("FILLS_FILE", "data/fills.jsonl"),
+    buyLatencyFile: envString("BUY_LATENCY_FILE", "data/buy-latency.jsonl")
   };
   cfg.broadcastRpcUrls = resolveBroadcastRpcUrls(cfg.rpcUrl);
+  cfg.archiveRpcUrls = resolveArchiveRpcUrls(cfg.rpcUrl);
+  cfg.manualOutcomeSelections = loadManualOutcomeSelections(cfg.manualOutcomeSelectionsFile);
 
   if (cfg.stakeUsdt <= 0) throw new Error("STAKE_USDT must be positive");
   if (cfg.stakePerOutcomeUsdt <= 0) throw new Error("STAKE_PER_OUTCOME_USDT must be positive");
@@ -198,8 +213,8 @@ export function readConfig() {
   if (cfg.slippageBps < 0 || cfg.slippageBps > 5000) {
     throw new Error("SLIPPAGE_BPS must be between 0 and 5000");
   }
-  if (!["all", "lowest_odds"].includes(cfg.eventOutcomeSelection)) {
-    throw new Error("EVENT_OUTCOME_SELECTION must be all or lowest_odds");
+  if (!["all", "lowest_odds", "last_outcomes"].includes(cfg.eventOutcomeSelection)) {
+    throw new Error("EVENT_OUTCOME_SELECTION must be all, lowest_odds, or last_outcomes");
   }
   if (!["token_order", "error"].includes(cfg.eventOutcomeSelectionFallback)) {
     throw new Error("EVENT_OUTCOME_SELECTION_FALLBACK must be token_order or error");
@@ -246,6 +261,9 @@ export function readConfig() {
   if (cfg.autoSellPollMs <= 0) {
     throw new Error("AUTO_SELL_POLL_MS must be positive");
   }
+  if (cfg.walletActionPollMs <= 0) {
+    throw new Error("WALLET_ACTION_POLL_MS must be positive");
+  }
   if (!["quote", "manual"].includes(cfg.autoSellMinOutMode)) {
     throw new Error("AUTO_SELL_MIN_OUT_MODE must be quote or manual");
   }
@@ -282,6 +300,8 @@ export function readConfig() {
   validatePct("AUTO_SELL_BREAKEVEN_ARM_PROFIT_PCT", cfg.autoSellBreakevenArmProfitPct, { min: 0 });
   validatePct("AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT", cfg.autoSellBreakevenExitProfitPct, { min: -100 });
   validatePct("AUTO_SELL_BREAKEVEN_PERCENT", cfg.autoSellBreakevenPercent, { minExclusive: 0, max: 100 });
+  validateNonNegativeInteger("AUTO_SELL_TIMED_EXIT_AFTER_OPEN_SECONDS", cfg.autoSellTimedExitAfterOpenSeconds);
+  validatePct("AUTO_SELL_TIMED_EXIT_PERCENT", cfg.autoSellTimedExitPercent, { minExclusive: 0, max: 100 });
   if (cfg.autoSellPositionLimit <= 0) {
     throw new Error("AUTO_SELL_POSITION_LIMIT must be positive");
   }
@@ -354,8 +374,10 @@ export function readConfig() {
 
   ensureParentDir(cfg.stateFile);
   ensureParentDir(cfg.fillsFile);
+  ensureParentDir(cfg.buyLatencyFile);
   ensureParentDir(cfg.notificationStateFile);
   ensureParentDir(cfg.runtimeStatusFile);
+  ensureParentDir(cfg.manualOutcomeSelectionsFile);
   ensureParentDir(cfg.autoSellStateFile);
   ensureParentDir(cfg.autoSellPositionStateFile);
   return cfg;
@@ -387,8 +409,34 @@ function loadProviderEnv() {
   loadDotEnv(file);
 }
 
+function loadServiceEnvFallback() {
+  if (process.env.BOT_CONFIG_FILE || process.env.BSC_RPC_URL || process.env.BSC_WS_URL) return;
+  try {
+    loadDotEnvFile("/etc/42space/event-bot.env", { override: false });
+  } catch {
+    // Manual CLI runs outside systemd may not have permission to read the service env.
+  }
+}
+
 function loadBotConfigEnv() {
   loadDotEnvFile(process.env.BOT_CONFIG_FILE ?? "", { override: true });
+}
+
+function readPrivateKeyFile() {
+  const file = envString("PRIVATE_KEY_FILE", "");
+  if (!file) return "";
+  const resolved = path.resolve(file);
+  if (!fs.existsSync(resolved)) return "";
+  const stat = fs.statSync(resolved);
+  if (!stat.isFile()) return "";
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+    throw new Error(`PRIVATE_KEY_FILE must only be readable by its owner: ${resolved}`);
+  }
+  const value = fs.readFileSync(resolved, "utf8").trim();
+  if (!/^0x[0-9a-fA-F]{64}$/.test(value)) {
+    throw new Error(`PRIVATE_KEY_FILE does not contain a valid private key: ${resolved}`);
+  }
+  return value;
 }
 
 function readKeychainPrivateKey() {
@@ -485,6 +533,64 @@ export function saveSeen(file, seen) {
   fs.chmodSync(file, 0o600);
 }
 
+export function loadManualOutcomeSelections(file) {
+  if (!file || !fs.existsSync(file)) return {};
+  try {
+    return normalizeManualOutcomeSelections(JSON.parse(fs.readFileSync(file, "utf8")));
+  } catch (error) {
+    const backup = `${file}.bak`;
+    if (fs.existsSync(backup)) {
+      return normalizeManualOutcomeSelections(JSON.parse(fs.readFileSync(backup, "utf8")));
+    }
+    throw new Error(`Failed to load manual outcome selections ${file}: ${error.message}`);
+  }
+}
+
+export function saveManualOutcomeSelections(file, selections) {
+  ensureParentDir(file);
+  const normalized = normalizeManualOutcomeSelections(selections);
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  const tmp = path.join(dir, `.${base}.${process.pid}.${Date.now()}.tmp`);
+  const backup = `${file}.bak`;
+  fs.writeFileSync(tmp, `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
+  if (fs.existsSync(file)) {
+    fs.copyFileSync(file, backup);
+    fs.chmodSync(backup, 0o600);
+  }
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
+  return normalized;
+}
+
+function normalizeManualOutcomeSelections(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const result = {};
+  for (const [rawAddress, rawTokenIds] of Object.entries(raw)) {
+    const address = normalizeConfigAddress(rawAddress);
+    if (!address || !Array.isArray(rawTokenIds)) continue;
+    const tokenIds = [...new Set(rawTokenIds.map(normalizeTokenId).filter(Boolean))];
+    if (tokenIds.length > 0) result[address] = tokenIds;
+  }
+  return Object.fromEntries(Object.entries(result).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function normalizeConfigAddress(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return /^0x[0-9a-f]{40}$/.test(text) ? text : "";
+}
+
+function normalizeTokenId(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/.test(text)) return "";
+  try {
+    const parsed = BigInt(text);
+    return parsed >= 0n ? parsed.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
 export function appendJsonl(file, row) {
   ensureParentDir(file);
   fs.appendFileSync(file, `${JSON.stringify(row)}\n`);
@@ -563,6 +669,15 @@ function resolveBroadcastRpcUrls(primaryRpcUrl) {
         process.env.ANKR_BSC_RPC_URL
       ];
   return uniqueStrings(urls.filter(Boolean).filter((url) => /^https?:\/\//i.test(url)));
+}
+
+function resolveArchiveRpcUrls(primaryRpcUrl) {
+  const explicit = envList("ARCHIVE_RPC_URLS", "");
+  const urls = explicit.length > 0 ? explicit : [];
+  return uniqueStrings([
+    primaryRpcUrl,
+    ...urls
+  ].filter(Boolean).filter((url) => /^https?:\/\//i.test(url)));
 }
 
 function uniqueStrings(items) {

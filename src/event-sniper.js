@@ -7,7 +7,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import readline from "node:readline/promises";
 import { promisify } from "node:util";
-import { formatUnits, parseUnits } from "viem";
+import { formatUnits, getAddress, parseUnits } from "viem";
 import WebSocket from "ws";
 import { appendJsonl, loadSeen, parseArgs, readConfig, saveSeen } from "./config.js";
 import {
@@ -46,13 +46,23 @@ import {
 import {
   eventSeenKey,
   filterEventMarkets,
-  marketCurveBlockReason,
+  filterNotificationMarkets,
   selectEventMarket,
   summarizeEventMarket
 } from "./event-strategy.js";
 import { markdownLine, notifyPushPlusSafe, shortHash } from "./pushplus.js";
+import {
+  activeManualSellMarkets,
+  claimNextWalletActionTask,
+  recoverInterruptedWalletActionTasks,
+  updateWalletActionTask
+} from "./wallet-action-queue.js";
 
 const execFileAsync = promisify(execFile);
+const runtimeWalletActionQueues = new WeakMap();
+const fallbackWalletActionQueues = new Map();
+const pendingPostBuyApprovalKeys = new Set();
+let walletActionSequence = 0;
 const PUBLIC_TEST_PRIVATE_KEY = [
   "0x",
   "ac0974bec39a17e36",
@@ -65,8 +75,12 @@ const MARKET_MINT_TOPIC = "0xf2e90b10bd525a6b1fe02d09e8133d3e38c9a87376ed4850904
 const activeDiscoveryKeys = new Set();
 const persistentNotificationSets = new Map();
 const pendingPersistentNotifications = new Set();
+const persistentNotificationFailureBackoff = new Map();
 const PERSISTENT_NOTIFICATION_RETRY_MS = 5000;
 const PERSISTENT_NOTIFICATION_MAX_RETRIES = 2;
+const PERSISTENT_NOTIFICATION_FAILURE_BACKOFF_MS = 10 * 60 * 1000;
+const BUY_LATENCY_ENRICH_DELAY_MS = 60_000;
+const BUY_LATENCY_LOG_LOOKBACK_BLOCKS = 120n;
 const PROCESS_STARTED_AT = new Date().toISOString();
 
 async function main() {
@@ -353,7 +367,18 @@ async function sell(cfg, args) {
   const executions = [];
   if (!cfg.dryRun && cfg.execute) {
     for (const item of plans) {
-      executions.push(await sellOutcome(cfg, item.plan));
+      try {
+        executions.push(await sellOutcome(cfg, item.plan));
+      } catch (error) {
+        executions.push({
+          status: "failed",
+          txHash: null,
+          market: item.plan.market,
+          tokenId: String(item.plan.tokenId),
+          amountOt: formatUnits(item.plan.amount, 18),
+          error: errorMessage(error)
+        });
+      }
     }
   }
 
@@ -447,11 +472,17 @@ async function replay(cfg, args) {
 
 async function status(cfg, args) {
   const { publicClient } = makeClients(cfg);
-  const [liveMarkets, chain, restFutureMarkets] = await Promise.all([
+  const [liveMarkets, chainResult, restFutureMarkets] = await Promise.all([
     loadEventMarkets(cfg, { limit: cfg.watchScanLimit }),
-    loadChainEventMarkets(cfg, args),
+    loadChainEventMarkets(cfg, args)
+      .then((chain) => ({ chain, warning: null }))
+      .catch((error) => ({
+        chain: emptyChainEventReplay(),
+        warning: errorMessage(error)
+      })),
     loadUpcomingRestEventMarkets(cfg)
   ]);
+  const { chain, warning: chainWarning } = chainResult;
   const fundingMarkets = mergeMarketLists(chain.eventMarkets, restFutureMarkets);
   const funding = computeFundingRequirement(cfg, fundingMarkets);
   const [gasReserve, minimumGasReserve] = await Promise.all([
@@ -518,9 +549,12 @@ async function status(cfg, args) {
       restDiscoveryEnabled: cfg.restDiscoveryEnabled,
       restDiscoveryPollMs: cfg.restDiscoveryPollMs,
       stakePerOutcomeUsdt: cfg.stakePerOutcomeUsdt,
+      maxStakeUsdt: cfg.maxStakeUsdt,
       eventOutcomeSelection: cfg.eventOutcomeSelection,
       eventOutcomeCount: cfg.eventOutcomeCount,
       eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
+      worldCupScoreMode: cfg.worldCupScoreMode,
+      manualOutcomeSelectionMarkets: Object.keys(cfg.manualOutcomeSelections ?? {}).length,
       marketAddressBlocklist: cfg.marketAddressBlocklist,
       marketQuestionBlocklist: cfg.marketQuestionBlocklist,
       allowOnchainOnlyMarkets: cfg.allowOnchainOnlyMarkets,
@@ -558,6 +592,9 @@ async function status(cfg, args) {
       autoSellBreakevenArmProfitPct: cfg.autoSellBreakevenArmProfitPct,
       autoSellBreakevenExitProfitPct: cfg.autoSellBreakevenExitProfitPct,
       autoSellBreakevenPercent: cfg.autoSellBreakevenPercent,
+      autoSellTimedExitEnabled: cfg.autoSellTimedExitEnabled,
+      autoSellTimedExitAfterOpenSeconds: cfg.autoSellTimedExitAfterOpenSeconds,
+      autoSellTimedExitPercent: cfg.autoSellTimedExitPercent,
       autoSellPollMs: cfg.autoSellPollMs,
       autoSellMinOutMode: cfg.autoSellMinOutMode,
       autoSellManualMinOutUsdt: cfg.autoSellManualMinOutUsdt,
@@ -595,6 +632,7 @@ async function status(cfg, args) {
     chainReplay: {
       head: chain.head,
       fromBlock: chain.fromBlock,
+      warning: chainWarning,
       controllerLogs: chain.controllerLogs,
       createNewMarketLogs: chain.createNewMarketLogs,
       decodedMarkets: chain.decodedMarkets,
@@ -603,6 +641,19 @@ async function status(cfg, args) {
     },
     future
   }, null, 2));
+}
+
+function emptyChainEventReplay() {
+  return {
+    head: null,
+    fromBlock: null,
+    controllerLogs: 0,
+    createNewMarketLogs: 0,
+    decoded: [],
+    decodedMarkets: 0,
+    eventMarkets: [],
+    decodeErrors: []
+  };
 }
 
 async function rehearse(cfg, args) {
@@ -1100,6 +1151,7 @@ async function selfTest(cfg) {
     maxMarketStakeUsdt: 25,
     maxBatchStakeUsdt: 100,
     minMarketDurationHours: 48,
+    worldCupScoreMode: false,
     marketCategoryBlocklist: ["Price"],
     marketTagBlocklist: ["8 hour", "automated"],
     marketAddressBlocklist: [],
@@ -1133,6 +1185,61 @@ async function selfTest(cfg) {
     "markets with many outcomes should stay eligible while the configured selection count is respected"
   );
   passed.push("markets with more than 12 outcomes remain eligible");
+
+  const lastOutcomesPlan = buildDirectBuyAllOutcomesPlan(mockEventMarket({
+    address: "0x0000000000000000000000000000000000000061",
+    outcomes: tokenOrderOutcomes()
+  }), {
+    ...testCfg,
+    eventOutcomeSelection: "last_outcomes",
+    eventOutcomeCount: 3
+  });
+  assertArrayEqual(
+    lastOutcomesPlan.outcomes.map((outcome) => String(outcome.tokenId)),
+    ["8", "16", "32"],
+    "last-outcomes token selection"
+  );
+  passed.push("last-outcomes selection uses the highest token-order tail");
+
+  const manualSelectionMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000000064",
+    outcomes: tokenOrderOutcomes()
+  });
+  const manualSelectionPlan = buildDirectBuyAllOutcomesPlan(manualSelectionMarket, {
+    ...testCfg,
+    manualOutcomeSelections: {
+      [manualSelectionMarket.address.toLowerCase()]: ["16", "2"]
+    }
+  });
+  assertArrayEqual(
+    manualSelectionPlan.outcomes.map((outcome) => String(outcome.tokenId)),
+    ["16", "2"],
+    "manual outcome token selection"
+  );
+  assertSelfTest(
+    manualSelectionPlan.selection?.strategy === "manual_outcomes" &&
+      manualSelectionPlan.totalStakeUsdt === 10,
+    "manual outcome selection should override the default strategy and update stake"
+  );
+  assertSelfTest(
+    estimateSelectedOutcomeCount(manualSelectionMarket, {
+      ...testCfg,
+      manualOutcomeSelections: {
+        [manualSelectionMarket.address.toLowerCase()]: ["16", "999"]
+      }
+    }) === 1,
+    "manual outcome funding estimates should count only tokenIds that exist in the market"
+  );
+  assertSelfTest(
+    throwsSelfTest(() => buildDirectBuyAllOutcomesPlan(manualSelectionMarket, {
+      ...testCfg,
+      manualOutcomeSelections: {
+        [manualSelectionMarket.address.toLowerCase()]: ["999"]
+      }
+    })),
+    "manual outcome selection should reject unknown tokenIds before execution"
+  );
+  passed.push("manual outcome selection overrides the default strategy only for selected markets");
 
   const noOddsPlan = buildDirectBuyAllOutcomesPlan(mockEventMarket({
     address: "0x0000000000000000000000000000000000000043",
@@ -1179,21 +1286,21 @@ async function selfTest(cfg) {
     startDate: new Date(baseStart).toISOString(),
     endDate: new Date(baseStart + 48 * 3600000).toISOString()
   })], testCfg);
-  assertSelfTest(testingCurveMarkets.length === 0, "testingCurve markets should be hard-excluded even without Testing in the title");
+  assertSelfTest(testingCurveMarkets.length === 1, "curve type alone should not exclude an otherwise matching market");
   const powerLdaMarkets = filterEventMarkets([mockEventMarket({
     address: "0x0000000000000000000000000000000000000056",
     curve: "0xa59096C20022a9ec5d7691E0DcDc7D46776b1b3d",
     startDate: new Date(baseStart).toISOString(),
     endDate: new Date(baseStart + 48 * 3600000).toISOString()
   })], testCfg);
-  assertSelfTest(powerLdaMarkets.length === 0, "powerLdaCurve markets should be hard-excluded");
+  assertSelfTest(powerLdaMarkets.length === 1, "powerLdaCurve should not be hard-excluded");
   const unknownCurveMarkets = filterEventMarkets([mockEventMarket({
     address: "0x0000000000000000000000000000000000000057",
     curve: "0x1111111111111111111111111111111111111111",
     startDate: new Date(baseStart).toISOString(),
     endDate: new Date(baseStart + 48 * 3600000).toISOString()
   })], testCfg);
-  assertSelfTest(unknownCurveMarkets.length === 0, "unknown curve markets should be hard-excluded");
+  assertSelfTest(unknownCurveMarkets.length === 1, "unknown curve should not be hard-excluded");
   const normalManualMarket = mockEventMarket({
     address: "0x0000000000000000000000000000000000000054",
     question: "$GENIUS FDV by end of May 31st?",
@@ -1236,7 +1343,7 @@ async function selfTest(cfg) {
     }), ["live"]),
     "delayed REST safety should defer onchain-only markets instead of marking them seen"
   );
-  passed.push("testing, powerLda and unknown-curve markets are hard-excluded; manual blocklists are opt-in");
+  passed.push("Testing titles and manual blocklists are excluded; curve type alone does not block markets");
 
   const shortDurationMarkets = filterEventMarkets([mockEventMarket({
     address: "0x0000000000000000000000000000000000000045",
@@ -1252,18 +1359,69 @@ async function selfTest(cfg) {
   assertSelfTest(exactDurationMarkets.length === 1, "48h markets should be allowed");
   passed.push("market duration filter allows >=48h only");
 
+  const worldCupScoreMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000000062",
+    question: "Argentina vs France",
+    categories: ["Sports"],
+    startDate: new Date(baseStart).toISOString(),
+    endDate: new Date(baseStart + 120 * 3600000).toISOString(),
+    outcomes: worldCupScoreOutcomes()
+  });
+  const genericTwentyFiveOutcomeMarket = mockEventMarket({
+    address: "0x0000000000000000000000000000000000000063",
+    question: "Generic twenty-five option market",
+    categories: ["Culture"],
+    startDate: new Date(baseStart).toISOString(),
+    endDate: new Date(baseStart + 120 * 3600000).toISOString(),
+    outcomes: Array.from({ length: 25 }, (_, index) => ({
+      tokenId: (1n << BigInt(index)).toString(),
+      name: `Option ${index + 1}`,
+      payout: index + 1,
+      price: 1 / (index + 1)
+    }))
+  });
+  const worldCupModeMarkets = filterEventMarkets([
+    normalManualMarket,
+    worldCupScoreMarket,
+    genericTwentyFiveOutcomeMarket
+  ], {
+    ...testCfg,
+    worldCupScoreMode: true
+  });
+  assertSelfTest(
+    worldCupModeMarkets.length === 1 && worldCupModeMarkets[0].address === worldCupScoreMarket.address,
+    "World Cup score mode should keep only 25-outcome score markets"
+  );
+  assertSelfTest(
+    filterEventMarkets([normalManualMarket], { ...testCfg, worldCupScoreMode: false }).length === 1,
+    "World Cup score mode off should preserve the normal market filter"
+  );
+  const notificationModeMarkets = filterNotificationMarkets([
+    normalManualMarket,
+    worldCupScoreMarket,
+    genericTwentyFiveOutcomeMarket
+  ], {
+    ...testCfg,
+    worldCupScoreMode: true
+  });
+  assertSelfTest(
+    notificationModeMarkets.length === 3,
+    "Market discovery notifications should use base filters, not World Cup buy narrowing"
+  );
+  passed.push("World Cup score mode only narrows eligible markets when enabled");
+
   const delayedStart = new Date(Date.now() + 1000).toISOString();
   const delayedWaitMs = msUntilAction(mockEventMarket({
     address: "0x0000000000000000000000000000000000000050",
     startDate: delayedStart
   }), {
     ...testCfg,
-    eventBuyDelaySeconds: 20,
+    eventBuyDelaySeconds: 19.3,
     prebroadcastMs: 0
   });
   assertSelfTest(
-    delayedWaitMs > 19000 && delayedWaitMs <= 22000,
-    `delayed buy should wait until open+delay, got ${delayedWaitMs}ms`
+    delayedWaitMs > 19500 && delayedWaitMs <= 21000,
+    `decimal delayed buy should wait until open+delay, got ${delayedWaitMs}ms`
   );
   assertSelfTest(
     normalizeQuestionForComparison("Stripe Valuation, June 2026?") ===
@@ -1407,7 +1565,9 @@ async function selfTest(cfg) {
       pushPlusEnabled: true,
       pushPlusToken: "self-test-token"
     };
-    const notifyImmediately = (_cfg, _message, { onSuccess = null } = {}) => {
+    let discoveryNotificationMessage = null;
+    const notifyImmediately = (_cfg, message, { onSuccess = null } = {}) => {
+      discoveryNotificationMessage = message;
       onSuccess?.({ ok: true });
       return true;
     };
@@ -1418,6 +1578,26 @@ async function selfTest(cfg) {
       notifyMarketDiscovered(notificationCfg, notificationMarket, null, "self-test", notifyImmediately) &&
         !notifyMarketDiscovered(notificationCfg, notificationMarket, null, "self-test", notifyImmediately),
       "market discovery notifications should persistently dedupe by market"
+    );
+    assertSelfTest(
+      discoveryNotificationMessage?.content?.includes("- 市场 outcome 总数: 6") &&
+        discoveryNotificationMessage?.content?.includes("- 计划买入数量: 5") &&
+        discoveryNotificationMessage?.content?.includes("- 计划金额: 25 U"),
+      "market discovery notifications should separate total and planned outcome counts"
+    );
+    const allOutcomeNotificationMarket = mockEventMarket({
+      address: "0x0000000000000000000000000000000000000060"
+    });
+    notifyMarketDiscovered({
+      ...notificationCfg,
+      eventOutcomeSelection: "all",
+      eventOutcomeCount: 2
+    }, allOutcomeNotificationMarket, null, "self-test", notifyImmediately);
+    assertSelfTest(
+      discoveryNotificationMessage?.content?.includes("- 市场 outcome 总数: 6") &&
+        discoveryNotificationMessage?.content?.includes("- 计划买入数量: 6") &&
+        discoveryNotificationMessage?.content?.includes("- 计划金额: 30 U"),
+      "market discovery notifications should respect all-outcome selection"
     );
     assertSelfTest(
       loadSeen(notificationCfg.notificationStateFile).has(marketNotificationKey("discovered", notificationMarket)),
@@ -1537,7 +1717,265 @@ async function selfTest(cfg) {
     weakTriggers.some((trigger) => trigger.strategy === "weak_exit"),
     "weak exit should trigger when required peak profit is not reached by deadline"
   );
-  passed.push("auto-sell exits trigger per outcome and choose the strongest action");
+  const timedTriggers = autoSellTriggers({
+    ...sellCfg,
+    autoSellFixedTrailingEnabled: false,
+    autoSellBreakevenEnabled: false,
+    autoSellTimedExitEnabled: true,
+    autoSellTimedExitAfterOpenSeconds: 90,
+    autoSellTimedExitPercent: 100
+  }, sellPosition, {
+    ...sellRecord,
+    firstSeenAt: sellNowMs - 10000,
+    marketStartAt: sellNowMs - 120000,
+    marketStartResolved: true
+  }, {
+    walletAddress: testCfg.walletAddress,
+    nowMs: sellNowMs,
+    costBasisUsdt: 5,
+    fullExitValueUsdt: 5.25,
+    profitMultiple: 1.05
+  });
+  assertSelfTest(
+    timedTriggers.some((trigger) =>
+      trigger.strategy === "timed_exit" &&
+      trigger.openedSeconds === 120
+    ),
+    "timed exit should count from the resolved market open time"
+  );
+  const timedTrigger = timedTriggers.find((trigger) => trigger.strategy === "timed_exit");
+  assertSelfTest(
+    hasAutoSellStrategyEnabled({
+      autoSellOriginalEnabled: false,
+      autoSellFixedTrailingEnabled: false,
+      autoSellAdaptiveTrailingEnabled: false,
+      autoSellWeakExitEnabled: false,
+      autoSellBreakevenEnabled: false,
+      autoSellTimedExitEnabled: true
+    }) &&
+      autoSellTriggerKey(testCfg.walletAddress, sellPosition, timedTrigger, {
+        autoSellTimedExitAfterOpenSeconds: 90
+      }).includes("timed_exit:sell100:after90"),
+    "timed exit should independently enable monitoring and use a parameter-specific idempotency key"
+  );
+  let timedFastReadCount = 0;
+  const timedFastPlan = await buildAutoSellExecutionPlan({
+    ...sellCfg,
+    autoSellTimedExitEnabled: true
+  }, {
+    readContract: async ({ functionName }) => {
+      timedFastReadCount += 1;
+      if (functionName === "balanceOf") return parseUnits("10", 18);
+      if (functionName === "isOperator") return true;
+      throw new Error(`Unexpected timed exit read ${functionName}`);
+    },
+    simulateContract: async () => {
+      throw new Error("Timed exit must not simulate or quote");
+    }
+  }, {
+    position: {
+      ...sellPosition,
+      marketAddress: "0x0000000000000000000000000000000000000047"
+    },
+    walletAddress: testCfg.walletAddress,
+    trigger: timedTrigger,
+    fullQuote: null
+  });
+  assertSelfTest(
+    timedFastReadCount === 2 &&
+      timedFastPlan.quoteSkipped &&
+      timedFastPlan.skipSimulation &&
+      timedFastPlan.minCollateralOut === 0n,
+    "timed exit should only read balance/authorization and use minOut zero without quote simulation"
+  );
+  const unresolvedTimedTriggers = autoSellTriggers({
+    ...sellCfg,
+    autoSellFixedTrailingEnabled: false,
+    autoSellBreakevenEnabled: false,
+    autoSellTimedExitEnabled: true,
+    autoSellTimedExitAfterOpenSeconds: 5,
+    autoSellTimedExitPercent: 100
+  }, sellPosition, {
+    ...sellRecord,
+    firstSeenAt: sellNowMs - 120000,
+    marketStartAt: sellNowMs - 120000,
+    marketStartResolved: false
+  }, {
+    walletAddress: testCfg.walletAddress,
+    nowMs: sellNowMs,
+    costBasisUsdt: 5,
+    fullExitValueUsdt: 5.25,
+    profitMultiple: 1.05
+  });
+  assertSelfTest(
+    !unresolvedTimedTriggers.some((trigger) => trigger.strategy === "timed_exit"),
+    "timed exit should not use the first position scan as a fake market open time"
+  );
+  const futureTimedTriggers = autoSellTriggers({
+    ...sellCfg,
+    autoSellFixedTrailingEnabled: false,
+    autoSellBreakevenEnabled: false,
+    autoSellTimedExitEnabled: true,
+    autoSellTimedExitAfterOpenSeconds: 0,
+    autoSellTimedExitPercent: 100
+  }, sellPosition, {
+    ...sellRecord,
+    marketStartAt: sellNowMs + 10000,
+    marketStartResolved: true
+  }, {
+    walletAddress: testCfg.walletAddress,
+    nowMs: sellNowMs,
+    costBasisUsdt: 5,
+    fullExitValueUsdt: 5.25,
+    profitMultiple: 1.05
+  });
+  assertSelfTest(
+    !futureTimedTriggers.some((trigger) => trigger.strategy === "timed_exit"),
+    "zero-second timed exit should still wait until the market has actually opened"
+  );
+  passed.push("auto-sell exits trigger per outcome; timed exit uses the resolved market open time");
+
+  const schedulerRuntime = {};
+  const schedulerOrder = [];
+  let releaseSchedulerBlock;
+  const schedulerBlock = new Promise((resolve) => {
+    releaseSchedulerBlock = resolve;
+  });
+  const firstAction = enqueueRuntimeWalletAction(schedulerRuntime, async () => {
+    schedulerOrder.push("running");
+    await schedulerBlock;
+  }, testCfg.walletAddress, 50);
+  await Promise.resolve();
+  const lowPriority = enqueueRuntimeWalletAction(schedulerRuntime, async () => {
+    schedulerOrder.push("authorization");
+  }, testCfg.walletAddress, 40);
+  const highPriority = enqueueRuntimeWalletAction(schedulerRuntime, async () => {
+    schedulerOrder.push("manual-sell");
+  }, testCfg.walletAddress, 10);
+  releaseSchedulerBlock();
+  await Promise.all([firstAction, lowPriority, highPriority]);
+  assertArrayEqual(
+    schedulerOrder,
+    ["running", "manual-sell", "authorization"],
+    "wallet action priority"
+  );
+  passed.push("wallet actions serialize and pending manual sells outrank authorization");
+
+  const receiptStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "42space-manual-receipts-"));
+  try {
+    const receiptTaskId = "self-test-manual-receipts";
+    fs.writeFileSync(path.join(receiptStateDir, `${receiptTaskId}.json`), JSON.stringify({
+      id: receiptTaskId,
+      status: "processing",
+      progress: {
+        items: [
+          { tokenId: "1", status: "broadcast", txHash: "0x01", error: "" },
+          { tokenId: "2", status: "broadcast", txHash: "0x02", error: "" }
+        ]
+      }
+    }));
+    const receiptExecutions = [
+      { txHash: "0x01", status: "broadcast" },
+      { txHash: "0x02", status: "broadcast" }
+    ];
+    await confirmManualSellReceipts({
+      walletActionQueueDir: receiptStateDir,
+      receiptWatchTimeoutMs: 1000,
+      receiptWatchPollingMs: 1
+    }, {
+      waitForTransactionReceipt: async ({ hash }) => ({
+        status: hash === "0x01" ? "success" : "reverted",
+        blockNumber: hash === "0x01" ? 101n : 102n
+      })
+    }, {
+      id: receiptTaskId,
+      wallet: testCfg.walletAddress,
+      market: sellPosition.marketAddress,
+      title: "Self test sell"
+    }, receiptExecutions.map((execution, index) => ({ execution, index })));
+    const receiptTask = JSON.parse(fs.readFileSync(path.join(receiptStateDir, `${receiptTaskId}.json`), "utf8"));
+    assertSelfTest(
+      receiptExecutions[0].status === "success" &&
+        receiptExecutions[1].status === "reverted" &&
+        receiptTask.progress.confirmed === 1 &&
+        receiptTask.progress.failed === 1,
+      "manual sell receipt checks should confirm outcomes concurrently after broadcast"
+    );
+  } finally {
+    fs.rmSync(receiptStateDir, { recursive: true, force: true });
+  }
+  passed.push("manual multi-outcome sells broadcast first and confirm receipts concurrently");
+
+  const latencyStart = "2026-06-24T06:00:00.000Z";
+  const latencyTrace = createBuyLatencyTrace({
+    ...testCfg,
+    eventBuyDelaySeconds: 19.3,
+    prebroadcastMs: 0
+  }, {
+    type: "single",
+    wallet: testCfg.walletAddress,
+    markets: [{
+      address: "0x0000000000000000000000000000000000000042",
+      question: "Latency self test",
+      startDate: latencyStart
+    }]
+  });
+  latencyTrace.broadcastStartedAtEpochMs = Date.parse(latencyStart) + 19_312;
+  latencyTrace.broadcastStartedAt = new Date(latencyTrace.broadcastStartedAtEpochMs).toISOString();
+  latencyTrace.timerDriftMs = 12;
+  latencyTrace.firstAcceptedAtEpochMs = Date.parse(latencyStart) + 19_388;
+  latencyTrace.firstAcceptedAt = new Date(latencyTrace.firstAcceptedAtEpochMs).toISOString();
+  latencyTrace.firstAcceptedMs = 76;
+  latencyTrace.firstProvider = "rpc.example";
+  latencyTrace.broadcastAttempts.push({
+    sequence: 1,
+    providerResults: [
+      { provider: "slow.example", latencyMs: 120, ok: true },
+      { provider: "fast.example", latencyMs: 70, ok: true }
+    ]
+  });
+  const latencySnapshot = snapshotBuyLatencyTrace(latencyTrace);
+  assertSelfTest(
+    latencyTrace.plannedBroadcastAtEpochMs === Date.parse(latencyStart) + 19_300 &&
+      latencySnapshot.firstAcceptedDriftMs === 88 &&
+      latencySnapshot.broadcastAttempts[0].providerResults[0].provider === "fast.example" &&
+      !Object.prototype.hasOwnProperty.call(latencySnapshot, "_settlementPromises"),
+    "buy latency trace must preserve decimal timing without exposing async internals"
+  );
+
+  const latencyTxA = `0x${"11".repeat(32)}`;
+  const latencyTxB = `0x${"22".repeat(32)}`;
+  const latencyGroups = groupBuyLatencyMintLogs([
+    {
+      topics: [MARKET_MINT_TOPIC],
+      transactionHash: latencyTxB,
+      blockNumber: 102n,
+      transactionIndex: 1,
+      logIndex: 2
+    },
+    {
+      topics: [MARKET_MINT_TOPIC],
+      transactionHash: latencyTxA,
+      blockNumber: 101n,
+      transactionIndex: 5,
+      logIndex: 1
+    },
+    {
+      topics: [MARKET_MINT_TOPIC],
+      transactionHash: latencyTxA,
+      blockNumber: 101n,
+      transactionIndex: 5,
+      logIndex: 3
+    }
+  ]);
+  assertSelfTest(
+    latencyGroups.length === 2 &&
+      latencyGroups[0].txHash === latencyTxA &&
+      latencyGroups[0].outcomeEvents === 2 &&
+      latencyGroups[1].txHash === latencyTxB,
+    "buy latency market ranking must group outcomes by transaction and sort by chain order"
+  );
+  passed.push("buy latency telemetry remains side-channel and ranks mint transactions by chain order");
 
   console.log(JSON.stringify({
     level: "event-self-test",
@@ -1585,8 +2023,34 @@ function tokenOrderOutcomes() {
   ];
 }
 
+function worldCupScoreOutcomes() {
+  const outcomes = [];
+  let index = 0;
+  for (let home = 0; home < 5; home += 1) {
+    for (let away = 0; away < 5; away += 1) {
+      outcomes.push({
+        tokenId: (1n << BigInt(index)).toString(),
+        name: `ARG ${home}-${away} FRA`,
+        payout: index + 1,
+        price: 1 / (index + 1)
+      });
+      index += 1;
+    }
+  }
+  return outcomes;
+}
+
 function assertSelfTest(condition, message) {
   if (!condition) throw new Error(`Self-test failed: ${message}`);
+}
+
+function throwsSelfTest(fn) {
+  try {
+    fn();
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 function assertArrayEqual(actual, expected, label) {
@@ -1691,21 +2155,17 @@ async function minimal(cfg, args) {
 
 async function arm(cfg, args) {
   cfg.stakePerOutcomeUsdt = Number(args.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt);
-  cfg.eventBuyMode = "fast";
-  cfg.dryRun = false;
-  cfg.execute = true;
-  cfg.riskAck = "YES";
-  cfg.eligibilityAck = "YES";
-  cfg.fastSkipPreflight = true;
+  const realExecution = !cfg.dryRun && cfg.execute;
 
-  if (!cfg.privateKey) {
+  if (realExecution && !cfg.privateKey) {
     cfg.privateKey = await promptHidden("PRIVATE_KEY for long-running event:watch (hidden): ");
   }
-  if (!cfg.privateKey) throw new Error("PRIVATE_KEY is required for event:arm");
+  if (realExecution && !cfg.privateKey) throw new Error("PRIVATE_KEY is required for real event:arm");
+  if (realExecution) assertConfiguredWalletMatchesPrivateKey(cfg, "event:arm");
 
   console.log(JSON.stringify({
     level: "event-arm",
-    mode: "execute",
+    mode: realExecution ? "execute" : "dry-run",
     eventDiscovery: cfg.eventDiscovery,
     wsProvider: wsProviderLabel(cfg.wsUrl),
     eventBuyMode: cfg.eventBuyMode,
@@ -1754,9 +2214,12 @@ async function arm(cfg, args) {
   let fundingWaitAutoSellMonitor = null;
   let fundingWaitDiscoveryMonitor = null;
   let fundingWaitWsDiscoveryMonitor = null;
-  if (cfg.armWaitForFunding) {
+  const sharedRuntime = await createRuntime(cfg);
+  let sharedWalletActionMonitor = null;
+  if (cfg.armWaitForFunding && realExecution) {
     const waitingSince = Date.now();
-    fundingWaitAutoSellMonitor = startAutoSellMonitor(cfg, null);
+    fundingWaitAutoSellMonitor = startAutoSellMonitor(cfg, sharedRuntime);
+    sharedWalletActionMonitor = startWalletActionMonitor(cfg, sharedRuntime);
     fundingWaitDiscoveryMonitor = startFundingWaitDiscoveryMonitor(cfg);
     fundingWaitWsDiscoveryMonitor = startFundingWaitWsDiscoveryMonitor(cfg);
     const fundingStatus = await waitForWatchFunding(cfg, {
@@ -1783,7 +2246,11 @@ async function arm(cfg, args) {
     };
   }
 
-  await watch(cfg, { fundingRecovery });
+  await watch(cfg, {
+    fundingRecovery,
+    runtime: sharedRuntime,
+    walletActionMonitor: sharedWalletActionMonitor
+  });
 }
 
 async function preflight(cfg) {
@@ -2049,6 +2516,7 @@ async function createRuntime(cfg) {
   if (cfg.dryRun || !cfg.execute || cfg.eventBuyMode !== "fast") return null;
   const { publicClient, account } = makeClients(cfg);
   if (!account) return null;
+  assertConfiguredWalletMatchesPrivateKey(cfg, "event:watch");
   const runtime = {
     receiverAddress: cfg.walletAddress || account.address
   };
@@ -2065,8 +2533,11 @@ async function watch(cfg, options = {}) {
   const seen = loadSeen(cfg.stateFile);
   const watchPreflight = await validateWatchFunding(cfg);
   const broadcastWarmup = await maybeWarmBroadcastRpcs(cfg);
-  const runtime = await createRuntime(cfg);
+  const runtime = options.runtime ?? await createRuntime(cfg);
   const autoSellMonitor = startAutoSellMonitor(cfg, runtime);
+  const walletActionMonitor = options.walletActionMonitor
+    ?? startWalletActionMonitor(cfg, runtime);
+  const discoveryNotificationMonitor = startMarketNotificationMonitor(cfg, "watch-rest-readonly");
   const initialPending = new Map();
   const startupWarnings = [];
   const wsStartupSeedDeferred = cfg.eventDiscovery === "ws" && !cfg.watchBuyExisting;
@@ -2082,7 +2553,9 @@ async function watch(cfg, options = {}) {
     startupWarnings,
     wsStartupSeedDeferred,
     fundingRecovery: options.fundingRecovery,
-    autoSellMonitor
+    autoSellMonitor,
+    walletActionMonitor,
+    fundingWaitWsDiscoveryMonitor: discoveryNotificationMonitor
   });
   writeRuntimeStatusFile(cfg, runtimeStatus);
   console.log(JSON.stringify(runtimeStatus, null, 2));
@@ -2110,6 +2583,7 @@ function buildWatchRuntimeStatus(cfg, {
   wsStartupSeedDeferred = false,
   fundingRecovery = null,
   autoSellMonitor = null,
+  walletActionMonitor = null,
   fundingWaitWsDiscoveryMonitor = null,
   phase = "watching"
 } = {}) {
@@ -2141,9 +2615,12 @@ function buildWatchRuntimeStatus(cfg, {
       eventOutcomeCount: cfg.eventOutcomeCount,
       eventOutcomeSelectionFallback: cfg.eventOutcomeSelectionFallback,
       stakePerOutcomeUsdt: cfg.stakePerOutcomeUsdt,
+      maxStakeUsdt: cfg.maxStakeUsdt,
       maxMarketStakeUsdt: cfg.maxMarketStakeUsdt,
       maxBatchStakeUsdt: cfg.maxBatchStakeUsdt,
       minMarketDurationHours: cfg.minMarketDurationHours,
+      worldCupScoreMode: cfg.worldCupScoreMode,
+      manualOutcomeSelectionMarkets: Object.keys(cfg.manualOutcomeSelections ?? {}).length,
       marketAddressBlocklist: cfg.marketAddressBlocklist,
       marketQuestionBlocklist: cfg.marketQuestionBlocklist,
       allowOnchainOnlyMarkets: cfg.allowOnchainOnlyMarkets,
@@ -2185,6 +2662,11 @@ function buildWatchRuntimeStatus(cfg, {
       wsReceiptFallbackMs: cfg.wsReceiptFallbackMs,
       wsReceiptFallbackRetries: cfg.wsReceiptFallbackRetries,
       receiverReady: Boolean(runtime?.receiverAddress || cfg.walletAddress)
+    },
+    walletActions: {
+      monitorActive: Boolean(walletActionMonitor),
+      queueDir: cfg.walletActionQueueDir,
+      pollMs: cfg.walletActionPollMs
     },
     autoSell: autoSellRuntimeEnabled
       ? {
@@ -2230,6 +2712,13 @@ function buildWatchRuntimeStatus(cfg, {
             armProfitPct: cfg.autoSellBreakevenArmProfitPct,
             exitProfitPct: cfg.autoSellBreakevenExitProfitPct,
             percent: cfg.autoSellBreakevenPercent
+          },
+          timedExit: {
+            enabled: cfg.autoSellTimedExitEnabled,
+            afterOpenSeconds: cfg.autoSellTimedExitAfterOpenSeconds,
+            percent: cfg.autoSellTimedExitPercent,
+            mode: "fast_no_quote",
+            minOutUsdt: 0
           },
           pollMs: cfg.autoSellPollMs,
           minOutMode: cfg.autoSellMinOutMode,
@@ -2335,7 +2824,468 @@ function startAutoSellMonitor(cfg, runtime = null) {
   return timer;
 }
 
+function startWalletActionMonitor(cfg, runtime = null) {
+  if (cfg.dryRun || !cfg.execute) return null;
+  const wallet = currentExecutionWallet(cfg, runtime);
+  if (!wallet) return null;
+  recoverInterruptedWalletActionTasks(cfg, wallet);
+
+  const tick = () => {
+    const task = claimNextWalletActionTask(cfg, wallet);
+    if (!task) return;
+    void enqueueRuntimeWalletAction(
+      runtime,
+      () => executeWalletActionTask(cfg, task, runtime),
+      wallet,
+      task.priority
+    ).catch((error) => {
+        if (task.type === "operator_approve") {
+          updateOperatorApprovalState(cfg, {
+            wallet: task.wallet,
+            market: task.market,
+            question: task.title,
+            status: "failed",
+            txHash: "",
+            error: errorMessage(error),
+            at: new Date().toISOString()
+          });
+        }
+        updateWalletActionTask(cfg, task.id, {
+          status: "failed",
+          error: errorMessage(error)
+        });
+        console.error(JSON.stringify({
+          level: "wallet-action-error",
+          taskId: task.id,
+          type: task.type,
+          market: task.market,
+          message: errorMessage(error),
+          at: new Date().toISOString()
+        }));
+      });
+  };
+
+  const timer = setInterval(tick, cfg.walletActionPollMs);
+  tick();
+  return timer;
+}
+
+async function executeWalletActionTask(cfg, task, runtime) {
+  if (task.type === "router_approve") {
+    updateWalletActionTask(cfg, task.id, {
+      progress: { phase: "authorizing", message: "正在提交 BUSDT Router 授权" }
+    });
+    const approval = await approveRouterAmount(cfg, {
+      amountUsdt: task.payload?.amount,
+      runtime
+    });
+    await syncRuntimeNonceFromChain(cfg, runtime);
+    appendJsonl(path.resolve("data/dashboard-actions.jsonl"), {
+      type: "approve",
+      at: new Date().toISOString(),
+      wallet: task.wallet,
+      question: "BUSDT 授权",
+      amount: approval.allowance,
+      status: approval.approved ? "submitted" : "unchanged",
+      txHash: approval.approveHash ?? null,
+      resetHash: approval.resetHash ?? null,
+      taskId: task.id
+    });
+    notifyPushPlusSafe(cfg, {
+      title: approval.approved ? "42space 已提交授权" : "42space 授权已满足",
+      content: [
+        markdownLine("额度", approval.allowance ? `${approval.allowance} U` : ""),
+        markdownLine("交易", shortHash(approval.approveHash)),
+        markdownLine("重置交易", shortHash(approval.resetHash))
+      ].filter(Boolean).join("\n")
+    });
+    return updateWalletActionTask(cfg, task.id, {
+      status: "completed",
+      result: { approval },
+      error: "",
+      progress: {
+        phase: "completed",
+        message: approval.alreadyReady ? "BUSDT 授权额度已经满足" : "BUSDT 授权已提交"
+      }
+    });
+  }
+  if (task.type === "manual_sell") {
+    return executeManualSellTask(cfg, task, runtime);
+  }
+  if (task.type === "operator_approve") {
+    updateWalletActionTask(cfg, task.id, {
+      progress: { phase: "authorizing", message: "正在提交市场卖出授权" }
+    });
+    updateOperatorApprovalState(cfg, {
+      wallet: task.wallet,
+      market: task.market,
+      question: task.title,
+      status: "authorizing",
+      txHash: "",
+      error: "",
+      at: new Date().toISOString()
+    });
+    const approval = await approveMarketOperator(cfg, {
+      market: task.market,
+      owner: task.wallet,
+      runtime
+    });
+    const approved = Boolean(approval.operatorApproved || approval.approved || approval.alreadyApproved);
+    updateOperatorApprovalState(cfg, {
+      wallet: task.wallet,
+      market: task.market,
+      question: task.title,
+      status: approved ? "approved" : approval.status === "broadcast" ? "pending" : "failed",
+      txHash: approval.txHash ?? "",
+      error: approval.receiptError ?? "",
+      at: new Date().toISOString()
+    });
+    appendJsonl(path.resolve("data/dashboard-actions.jsonl"), {
+      type: "operator_approve",
+      at: new Date().toISOString(),
+      wallet: task.wallet,
+      question: task.title,
+      market: task.market,
+      amount: approved ? "已授权" : approval.status,
+      status: approval.status,
+      txHash: approval.txHash ?? null,
+      broadcastMode: approval.broadcastMode ?? null,
+      broadcastRpcCount: approval.broadcastRpcCount ?? null,
+      firstBroadcastProvider: approval.firstBroadcastProvider ?? null,
+      receiptError: approval.receiptError ?? null,
+      taskId: task.id
+    });
+    notifyPushPlusSafe(cfg, {
+      title: approved ? "42space 卖出授权已确认" : "42space 卖出授权已广播",
+      content: [
+        markdownLine("市场", task.title),
+        markdownLine("交易", shortHash(approval.txHash)),
+        markdownLine("状态", approved ? "已确认" : approval.status)
+      ].filter(Boolean).join("\n")
+    });
+    return updateWalletActionTask(cfg, task.id, {
+      status: approved || approval.status === "broadcast" ? "completed" : "failed",
+      result: { approval },
+      error: approved || approval.status === "broadcast" ? "" : approval.receiptError || "卖出授权失败",
+      progress: {
+        phase: approved ? "confirmed" : approval.status,
+        message: approved ? "卖出授权已确认" : "卖出授权已广播"
+      }
+    });
+  }
+  throw new Error(`Unsupported wallet action type ${task.type}`);
+}
+
+async function executeManualSellTask(cfg, task, runtime) {
+  const payload = task.payload ?? {};
+  const percent = Number(payload.percent ?? 100);
+  const fastSell = Boolean(payload.quickSell || payload.fastSell);
+  const minOutUsdt = payload.minOutUsdt ?? "0.000001";
+  const { publicClient } = makeClients(cfg);
+  const openPositions = await fetchOpenPositions(cfg, {
+    user: task.wallet,
+    market: task.market,
+    limit: Number(payload.limit ?? 500)
+  });
+  const selected = openPositions.filter((position) => {
+    if (String(position.marketAddress).toLowerCase() !== String(task.market).toLowerCase()) return false;
+    if (payload.all) return true;
+    return String(position.tokenId) === String(payload.tokenId);
+  });
+  const progressItems = selected.map((position) => ({
+    tokenId: String(position.tokenId),
+    outcome: position.outcome?.name ?? String(position.tokenId),
+    status: "queued",
+    txHash: "",
+    error: ""
+  }));
+
+  updateWalletActionTask(cfg, task.id, {
+    progress: {
+      phase: "selling",
+      total: progressItems.length,
+      confirmed: 0,
+      broadcast: 0,
+      failed: 0,
+      skipped: 0,
+      items: progressItems
+    }
+  });
+
+  if (!selected.length) {
+    return updateWalletActionTask(cfg, task.id, {
+      status: "completed",
+      result: {
+        level: "event-sell",
+        mode: "execute",
+        sellMode: fastSell ? "fast" : "quoted",
+        wallet: task.wallet,
+        selectedCount: 0,
+        totals: null,
+        positions: [],
+        executions: []
+      },
+      progress: {
+        phase: "completed",
+        total: 0,
+        confirmed: 0,
+        broadcast: 0,
+        failed: 0,
+        skipped: 0,
+        message: "没有剩余可卖仓位",
+        items: []
+      }
+    });
+  }
+
+  const plans = [];
+  const executions = [];
+  const pendingReceiptChecks = [];
+  for (let index = 0; index < selected.length; index += 1) {
+    const position = selected[index];
+    updateWalletTaskItem(cfg, task.id, index, { status: "preparing" });
+    let plan;
+    try {
+      plan = fastSell
+        ? await buildFastSellOutcomePlan(publicClient, {
+            market: position.marketAddress,
+            tokenId: position.tokenId,
+            owner: task.wallet,
+            percent,
+            minOutUsdt
+          })
+        : await quoteSellOutcome(publicClient, {
+            market: position.marketAddress,
+            tokenId: position.tokenId,
+            owner: task.wallet,
+            percent,
+            slippageBps: cfg.slippageBps
+          });
+      plans.push({ position, plan });
+      const execution = await sellOutcome(cfg, plan, runtime, {
+        onBroadcast: (broadcast) => {
+          updateWalletTaskItem(cfg, task.id, index, {
+            status: "broadcast",
+            txHash: broadcast.txHash
+          });
+        },
+        // Broadcast every selected outcome first; confirmations are awaited together below.
+        waitForReceipt: false
+      });
+      executions.push(execution);
+      if (execution.status === "broadcast" && execution.txHash) {
+        pendingReceiptChecks.push({ execution, index });
+      }
+      updateWalletTaskItem(cfg, task.id, index, {
+        status: execution.status === "success" ? "confirmed" : execution.status,
+        txHash: execution.txHash ?? "",
+        error: execution.receiptError ?? ""
+      });
+    } catch (error) {
+      const message = errorMessage(error);
+      const skipped = /sell amount is zero|no matching open positions|outcome balance 0/i.test(message);
+      executions.push({
+        status: skipped ? "skipped" : "failed",
+        txHash: null,
+        market: position.marketAddress,
+        tokenId: String(position.tokenId),
+        error: message
+      });
+      updateWalletTaskItem(cfg, task.id, index, {
+        status: skipped ? "skipped" : "failed",
+        error: message
+      });
+    }
+  }
+
+  await confirmManualSellReceipts(cfg, publicClient, task, pendingReceiptChecks);
+
+  const failedCount = executions.filter((item) => item.status === "failed" || item.status === "reverted").length;
+  const confirmedCount = executions.filter((item) => item.status === "success").length;
+  const broadcastCount = executions.filter((item) => item.status === "broadcast").length;
+  const skippedCount = executions.filter((item) => item.status === "skipped").length;
+  const status = failedCount > 0 && confirmedCount + broadcastCount + skippedCount > 0
+    ? "partial_failed"
+    : failedCount > 0
+      ? "failed"
+      : "completed";
+  const result = {
+    level: "event-sell",
+    mode: "execute",
+    sellMode: fastSell ? "fast" : "quoted",
+    wallet: task.wallet,
+    selectedCount: selected.length,
+    totals: plans.length ? summarizeSellPlans(plans.map((item) => item.plan)) : null,
+    positions: plans.map(({ position, plan }) => ({
+      question: position.question?.title ?? task.title,
+      outcome: position.outcome?.name ?? null,
+      marketAddress: position.marketAddress,
+      tokenId: position.tokenId,
+      costBasisUsdt: roundUsd(Number(position.costBasis ?? 0)),
+      cashPnlUsdt: roundUsd(Number(position.cashPnl ?? 0)),
+      quote: describeSellPlan(plan, { dryRun: false })
+    })),
+    executions
+  };
+  const finished = updateWalletActionTask(cfg, task.id, {
+    status,
+    result,
+    error: failedCount ? `${failedCount} 个仓位卖出失败` : "",
+    progress: {
+      phase: status,
+      total: selected.length,
+      confirmed: confirmedCount,
+      broadcast: broadcastCount,
+      failed: failedCount,
+      skipped: skippedCount,
+      items: readWalletTaskProgressItems(cfg, task.id)
+    }
+  });
+  appendJsonl(cfg.fillsFile, {
+    level: "event-manual-sell-task",
+    taskId: task.id,
+    wallet: task.wallet,
+    market: task.market,
+    title: task.title,
+    result,
+    at: new Date().toISOString()
+  });
+  const firstPosition = result.positions[0];
+  const txHashes = executions.map((item) => item.txHash).filter(Boolean);
+  appendJsonl(path.resolve("data/dashboard-actions.jsonl"), {
+    type: "sell",
+    at: new Date().toISOString(),
+    wallet: task.wallet,
+    question: firstPosition?.question ?? task.title,
+    outcome: selected.length > 1 ? `全部 ${selected.length} 个仓位` : firstPosition?.outcome ?? "",
+    amount: fastSell ? "未报价" : result.totals?.expectedCollateralToUserUsdt ?? "",
+    status: failedCount > 0
+      ? `部分失败 ${failedCount}/${selected.length}`
+      : broadcastCount > 0
+        ? `已广播 ${broadcastCount}/${selected.length}，等待确认`
+        : `已确认 ${confirmedCount + skippedCount}/${selected.length}`,
+    rawStatus: failedCount > 0 ? status : broadcastCount > 0 ? "broadcast" : "success",
+    txHash: txHashes[0] ?? "",
+    txHashes,
+    receiptError: executions.find((item) => item.receiptError || item.error)?.receiptError
+      ?? executions.find((item) => item.error)?.error
+      ?? "",
+    taskId: task.id
+  });
+  notifyPushPlusSafe(cfg, {
+    title: failedCount > 0
+      ? "42space 手动卖出部分失败"
+      : broadcastCount > 0
+        ? "42space 手动卖出已广播，等待确认"
+        : "42space 手动卖出已确认",
+    content: [
+      markdownLine("市场", firstPosition?.question ?? task.title),
+      markdownLine("仓位", `${selected.length} 个`),
+      markdownLine("确认", confirmedCount),
+      markdownLine("广播", broadcastCount),
+      markdownLine("跳过", skippedCount),
+      markdownLine("失败", failedCount),
+      markdownLine("交易", txHashes.map(shortHash).join(", "))
+    ].filter(Boolean).join("\n")
+  });
+  return finished;
+}
+
+async function confirmManualSellReceipts(cfg, publicClient, task, pendingReceiptChecks) {
+  await Promise.all(pendingReceiptChecks.map(async ({ execution, index }) => {
+    try {
+      const receipt = await publicClient.waitForTransactionReceipt({
+        hash: execution.txHash,
+        timeout: cfg.receiptWatchTimeoutMs,
+        pollingInterval: cfg.receiptWatchPollingMs
+      });
+      execution.status = receipt.status;
+      execution.blockNumber = receipt.blockNumber?.toString() ?? null;
+      execution.waitedForReceipt = true;
+      execution.receiptError = null;
+      updateWalletTaskItem(cfg, task.id, index, {
+        status: receipt.status === "success" ? "confirmed" : "reverted",
+        txHash: execution.txHash,
+        error: ""
+      });
+    } catch (error) {
+      // The transaction was broadcast. Preserve that fact instead of falsely reporting a failed sale.
+      execution.receiptError = errorMessage(error);
+      updateWalletTaskItem(cfg, task.id, index, {
+        status: "broadcast",
+        txHash: execution.txHash,
+        error: execution.receiptError
+      });
+      maybeTrackReceipt(cfg, {
+        txHash: execution.txHash,
+        waitedForReceipt: false,
+        blockNumber: null
+      }, {
+        type: "manual-sell",
+        wallet: task.wallet,
+        market: task.market,
+        question: task.title,
+        tokenId: execution.tokenId
+      });
+    }
+  }));
+}
+
+function updateWalletTaskItem(cfg, taskId, index, patch) {
+  const task = readWalletActionTaskLocal(cfg, taskId);
+  if (!task) return;
+  const items = [...(task.progress?.items ?? [])];
+  items[index] = { ...(items[index] ?? {}), ...patch };
+  const counts = walletTaskItemCounts(items);
+  updateWalletActionTask(cfg, taskId, {
+    progress: {
+      ...(task.progress ?? {}),
+      ...counts,
+      items
+    }
+  });
+}
+
+function readWalletTaskProgressItems(cfg, taskId) {
+  return readWalletActionTaskLocal(cfg, taskId)?.progress?.items ?? [];
+}
+
+function readWalletActionTaskLocal(cfg, taskId) {
+  const file = path.resolve(cfg.walletActionQueueDir || "data/wallet-actions", `${taskId}.json`);
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function walletTaskItemCounts(items) {
+  return {
+    total: items.length,
+    confirmed: items.filter((item) => item.status === "confirmed").length,
+    broadcast: items.filter((item) => item.status === "broadcast").length,
+    failed: items.filter((item) => item.status === "failed" || item.status === "reverted").length,
+    skipped: items.filter((item) => item.status === "skipped").length
+  };
+}
+
+async function syncRuntimeNonceFromChain(cfg, runtime) {
+  if (!runtime || runtime.nextNonce === undefined) return;
+  const { publicClient, account } = makeClients(cfg);
+  if (!account) return;
+  const pendingNonce = Number(await publicClient.getTransactionCount({
+    address: account.address,
+    blockTag: "pending"
+  }));
+  runtime.nextNonce = Math.max(runtime.nextNonce, pendingNonce);
+  runtime.lastNonceSyncAt = Date.now();
+}
+
 function startFundingWaitDiscoveryMonitor(cfg) {
+  return startMarketNotificationMonitor(cfg, "funding-wait-rest-readonly");
+}
+
+function startMarketNotificationMonitor(cfg, source = "market-rest-readonly") {
   if (!cfg.pushPlusEnabled || !cfg.pushPlusToken) return null;
   let running = false;
   let initialized = false;
@@ -2344,7 +3294,7 @@ function startFundingWaitDiscoveryMonitor(cfg) {
     if (running) return;
     running = true;
     try {
-      const markets = await loadRestDiscoveryEventMarkets(cfg);
+      const markets = await loadRestNotificationMarkets(cfg);
       let alerted = 0;
       let seededLive = 0;
       for (const market of markets) {
@@ -2355,11 +3305,12 @@ function startFundingWaitDiscoveryMonitor(cfg) {
           seededLive += 1;
           continue;
         }
-        if (notifyMarketDiscovered(cfg, market, null, "funding-wait-rest-readonly")) alerted += 1;
+        if (notifyMarketDiscovered(cfg, market, null, source)) alerted += 1;
       }
       if (alerted > 0 || seededLive > 0) {
         console.log(JSON.stringify({
-          level: "event-funding-wait-discovery",
+          level: "event-market-notification-discovery",
+          source,
           alerted,
           seededLive,
           tracked: persistentMarketNotifications(cfg).size,
@@ -2370,7 +3321,7 @@ function startFundingWaitDiscoveryMonitor(cfg) {
     } catch (error) {
       console.error(JSON.stringify({
         level: "warn",
-        source: "funding-wait-rest-discovery",
+        source,
         message: errorMessage(error),
         at: new Date().toISOString()
       }));
@@ -2478,6 +3429,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
   const walletAddress = cfg.walletAddress || account?.address;
   if (!walletAddress) throw new Error("AUTO_SELL requires WALLET_ADDRESS or PRIVATE_KEY-derived account");
   if (!cfg.dryRun && cfg.execute && !account) throw new Error("PRIVATE_KEY is required for real AUTO_SELL");
+  if (!cfg.dryRun && cfg.execute) assertConfiguredWalletMatchesPrivateKey(cfg, "AUTO_SELL");
   const result = {
     source,
     wallet: walletAddress,
@@ -2493,6 +3445,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
 
   const positionState = loadAutoSellPositionState(cfg.autoSellPositionStateFile);
   const marketCache = new Map();
+  const manualExitMarkets = activeManualSellMarkets(cfg, walletAddress);
   const openPositions = await fetchOpenPositions(cfg, {
     user: walletAddress,
     limit: cfg.autoSellPositionLimit
@@ -2500,6 +3453,10 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
   let stateChanged = false;
 
   for (const position of openPositions) {
+    if (manualExitMarkets.has(String(position.marketAddress).toLowerCase())) {
+      result.skipped += 1;
+      continue;
+    }
     if (!isAutoSellablePosition(position)) {
       result.skipped += 1;
       continue;
@@ -2508,26 +3465,77 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
     result.checked += 1;
     try {
       const nowMs = Date.now();
-      const fullQuote = await quoteSellOutcome(publicClient, {
-        market: position.marketAddress,
-        tokenId: position.tokenId,
-        owner: walletAddress,
-        percent: 100,
-        slippageBps: cfg.slippageBps
-      });
       const costBasisUsdt = Number(position.costBasis ?? 0);
-      const fullExitValueUsdt = rawUsdt(fullQuote.expectedCollateralToUser);
-      const profitMultiple = costBasisUsdt > 0 ? fullExitValueUsdt / costBasisUsdt : 0;
       const stateKey = autoSellPositionKey(walletAddress, position);
-      const marketStartMs = await resolvePositionMarketStartMs(cfg, position, marketCache, positionState.positions[stateKey]);
-      const record = updateAutoSellPositionRecord(positionState, stateKey, {
+      const marketStartMs = await resolvePositionMarketStartMs(
+        cfg,
+        position,
+        marketCache,
+        positionState.positions[stateKey]
+      );
+      const timingRecord = updateAutoSellTimingRecord(positionState, stateKey, {
         nowMs,
-        marketStartMs,
-        costBasisUsdt,
-        fullExitValueUsdt,
-        profitMultiple
+        marketStartMs
       });
       stateChanged = true;
+      const timedTrigger = buildTimedExitTrigger(cfg, timingRecord, nowMs);
+      const timedTriggerWithKey = timedTrigger
+        ? {
+            ...timedTrigger,
+            key: autoSellTriggerKey(walletAddress, position, timedTrigger, cfg)
+          }
+        : null;
+      const useTimedFastExit = Boolean(
+        timedTriggerWithKey && !seen.has(timedTriggerWithKey.key)
+      );
+      const quoteStrategiesEnabled = hasQuoteBasedAutoSellStrategyEnabled(cfg);
+      if (!useTimedFastExit && !quoteStrategiesEnabled) {
+        if (timedTriggerWithKey && seen.has(timedTriggerWithKey.key)) {
+          result.alreadyHandled += 1;
+        }
+        continue;
+      }
+
+      let fullQuote = null;
+      let fullExitValueUsdt = null;
+      let profitMultiple = null;
+      let record = timingRecord;
+      let pendingTriggers = [];
+      if (useTimedFastExit) {
+        pendingTriggers = [timedTriggerWithKey];
+      } else {
+        fullQuote = await quoteSellOutcome(publicClient, {
+          market: position.marketAddress,
+          tokenId: position.tokenId,
+          owner: walletAddress,
+          percent: 100,
+          slippageBps: cfg.slippageBps
+        });
+        fullExitValueUsdt = rawUsdt(fullQuote.expectedCollateralToUser);
+        profitMultiple = costBasisUsdt > 0 ? fullExitValueUsdt / costBasisUsdt : 0;
+        record = updateAutoSellPositionRecord(positionState, stateKey, {
+          nowMs,
+          marketStartMs,
+          costBasisUsdt,
+          fullExitValueUsdt,
+          profitMultiple
+        });
+        const triggers = autoSellTriggers(cfg, position, record, {
+          walletAddress,
+          nowMs,
+          costBasisUsdt,
+          fullExitValueUsdt,
+          profitMultiple
+        }).map((trigger) => ({
+          ...trigger,
+          key: autoSellTriggerKey(walletAddress, position, trigger, cfg)
+        }));
+        pendingTriggers = triggers.filter((trigger) => !seen.has(trigger.key));
+        if (triggers.length > 0 && pendingTriggers.length === 0) {
+          result.alreadyHandled += 1;
+          continue;
+        }
+      }
 
       const summary = {
         marketAddress: position.marketAddress,
@@ -2535,28 +3543,13 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
         question: position.question?.title ?? null,
         outcome: position.outcome?.name ?? null,
         costBasisUsdt: roundUsd(costBasisUsdt),
-        fullExitValueUsdt: roundUsd(fullExitValueUsdt),
-        profitMultiple: roundUsd(profitMultiple),
-        profitPct: roundUsd((profitMultiple - 1) * 100),
-        peakProfitMultiple: roundUsd(record.peakProfitMultiple ?? profitMultiple),
-        peakProfitPct: roundUsd(((record.peakProfitMultiple ?? profitMultiple) - 1) * 100)
+        fullExitValueUsdt: fullExitValueUsdt === null ? null : roundUsd(fullExitValueUsdt),
+        profitMultiple: profitMultiple === null ? null : roundUsd(profitMultiple),
+        profitPct: profitMultiple === null ? null : roundUsd((profitMultiple - 1) * 100),
+        peakProfitMultiple: profitMultiple === null ? null : roundUsd(record.peakProfitMultiple ?? profitMultiple),
+        peakProfitPct: profitMultiple === null ? null : roundUsd(((record.peakProfitMultiple ?? profitMultiple) - 1) * 100)
       };
 
-      const triggers = autoSellTriggers(cfg, position, record, {
-        walletAddress,
-        nowMs,
-        costBasisUsdt,
-        fullExitValueUsdt,
-        profitMultiple
-      }).map((trigger) => ({
-        ...trigger,
-        key: autoSellTriggerKey(walletAddress, position, trigger, cfg)
-      }));
-      const pendingTriggers = triggers.filter((trigger) => !seen.has(trigger.key));
-      if (triggers.length > 0 && pendingTriggers.length === 0) {
-        result.alreadyHandled += 1;
-        continue;
-      }
       if (pendingTriggers.length === 0) continue;
       const trigger = chooseAutoSellTrigger(pendingTriggers);
 
@@ -2577,6 +3570,7 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
         minCollateralOutUsdt: roundUsd(rawUsdt(sellPlan.minCollateralOut)),
         minOutMode: sellPlan.minOutMode ?? "quote",
         quoteReused: Boolean(sellPlan.quoteReused),
+        quoteSkipped: Boolean(sellPlan.quoteSkipped),
         operatorApproved: sellPlan.operatorApproved,
         txHash: null,
         status: cfg.dryRun || !cfg.execute ? "dry-run" : "pending"
@@ -2584,10 +3578,39 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
 
       let execution = null;
       if (!cfg.dryRun && cfg.execute) {
-        execution = await sellOutcome(cfg, sellPlan);
+        execution = await enqueueRuntimeWalletAction(
+          runtime,
+          async () => {
+            if (activeManualSellMarkets(cfg, walletAddress).has(String(position.marketAddress).toLowerCase())) {
+              return {
+                status: "skipped_manual_exit",
+                txHash: null,
+                market: position.marketAddress,
+                tokenId: String(position.tokenId)
+              };
+            }
+            return sellOutcome(cfg, sellPlan, runtime, {
+              waitForReceipt: trigger.strategy !== "timed_exit"
+            });
+          },
+          walletAddress,
+          20
+        );
         action.txHash = execution.txHash;
         action.status = execution.status;
-        await syncRuntimeNonceAfterExternalTx(cfg, runtime, "auto-sell");
+        if (execution.status === "skipped_manual_exit") {
+          result.skipped += 1;
+          continue;
+        }
+        maybeTrackReceipt(cfg, execution, {
+          type: "auto-sell",
+          wallet: walletAddress,
+          market: position.marketAddress,
+          question: position.question?.title ?? null,
+          outcome: position.outcome?.name ?? null,
+          tokenId: String(position.tokenId),
+          strategy: trigger.strategy
+        });
         if (execution.status === "success" || execution.status === "broadcast") {
           for (const pendingTrigger of pendingTriggers) seen.add(pendingTrigger.key);
           saveSeen(cfg.autoSellStateFile, seen);
@@ -2631,6 +3654,15 @@ async function runAutoSellOnce(cfg, { seen = loadSeen(cfg.autoSellStateFile), ru
 
 async function buildAutoSellExecutionPlan(cfg, publicClient, { position, walletAddress, trigger, fullQuote }) {
   const triggerPercent = Number(trigger.percent);
+  if (trigger.strategy === "timed_exit") {
+    return buildFastSellOutcomePlan(publicClient, {
+      market: position.marketAddress,
+      tokenId: position.tokenId,
+      owner: walletAddress,
+      percent: triggerPercent,
+      minOutUsdt: 0
+    });
+  }
   const basePlan = triggerPercent === 100
     ? { ...fullQuote, quoteReused: true }
     : await quoteSellOutcome(publicClient, {
@@ -2654,6 +3686,13 @@ async function buildAutoSellExecutionPlan(cfg, publicClient, { position, walletA
 }
 
 function hasAutoSellStrategyEnabled(cfg) {
+  return Boolean(
+    hasQuoteBasedAutoSellStrategyEnabled(cfg) ||
+    cfg.autoSellTimedExitEnabled
+  );
+}
+
+function hasQuoteBasedAutoSellStrategyEnabled(cfg) {
   return Boolean(
     cfg.autoSellOriginalEnabled ||
     cfg.autoSellFixedTrailingEnabled ||
@@ -2721,6 +3760,8 @@ function autoSellTriggerKey(walletAddress, position, trigger, cfg) {
       `exit${cfg.autoSellBreakevenExitProfitPct}`,
       `delay${cfg.autoSellBreakevenStartDelaySeconds}`
     );
+  } else if (trigger.strategy === "timed_exit") {
+    parts.push(`after${cfg.autoSellTimedExitAfterOpenSeconds}`);
   }
   return parts.join(":");
 }
@@ -2827,7 +3868,29 @@ function autoSellTriggers(cfg, position, record, context) {
     });
   }
 
+  const timedTrigger = buildTimedExitTrigger(cfg, record, context.nowMs, {
+    currentProfitPct,
+    peakProfitPct
+  });
+  if (timedTrigger) triggers.push(timedTrigger);
+
   return triggers;
+}
+
+function buildTimedExitTrigger(cfg, record, nowMs, profit = {}) {
+  if (!cfg.autoSellTimedExitEnabled) return null;
+  const openedSeconds = autoSellOpenedSeconds(record, nowMs);
+  if (openedSeconds === null || openedSeconds < cfg.autoSellTimedExitAfterOpenSeconds) return null;
+  return {
+    strategy: "timed_exit",
+    reason: "time_after_market_open",
+    percent: cfg.autoSellTimedExitPercent,
+    priority: 60,
+    currentProfitPct: Number.isFinite(profit.currentProfitPct) ? roundUsd(profit.currentProfitPct) : null,
+    peakProfitPct: Number.isFinite(profit.peakProfitPct) ? roundUsd(profit.peakProfitPct) : null,
+    openedSeconds: roundUsd(openedSeconds),
+    deadlineSeconds: cfg.autoSellTimedExitAfterOpenSeconds
+  };
 }
 
 function chooseAutoSellTrigger(triggers) {
@@ -2842,6 +3905,14 @@ function autoSellElapsedSeconds(record, nowMs) {
   const start = Math.max(Number(record.marketStartAt ?? 0), Number(record.firstSeenAt ?? 0));
   if (!Number.isFinite(start) || start <= 0) return 0;
   return Math.max(0, (nowMs - start) / 1000);
+}
+
+function autoSellOpenedSeconds(record, nowMs) {
+  if (!record.marketStartResolved) return null;
+  const start = Number(record.marketStartAt);
+  if (!Number.isFinite(start) || start <= 0) return null;
+  if (nowMs < start) return null;
+  return (nowMs - start) / 1000;
 }
 
 function adaptiveDrawdownPct(cfg, record, nowMs) {
@@ -2945,11 +4016,10 @@ function saveAutoSellPositionState(file, state) {
 }
 
 function updateAutoSellPositionRecord(state, key, item) {
-  const record = state.positions[key] ?? {};
-  const firstSeenAt = Number(record.firstSeenAt ?? item.nowMs);
-  const marketStartAt = Number.isFinite(item.marketStartMs) && item.marketStartMs > 0
-    ? item.marketStartMs
-    : Number(record.marketStartAt ?? firstSeenAt);
+  const record = updateAutoSellTimingRecord(state, key, item);
+  const firstSeenAt = record.firstSeenAt;
+  const marketStartAt = record.marketStartAt;
+  const marketStartResolved = record.marketStartResolved;
   const peakProfitMultiple = Math.max(
     Number(record.peakProfitMultiple ?? 0),
     Number(item.profitMultiple ?? 0)
@@ -2967,12 +4037,32 @@ function updateAutoSellPositionRecord(state, key, item) {
     ...record,
     firstSeenAt,
     marketStartAt,
+    marketStartResolved,
     lastSeenAt: item.nowMs,
     costBasisUsdt: roundUsd(item.costBasisUsdt),
     fullExitValueUsdt: roundUsd(item.fullExitValueUsdt),
     profitMultiple: roundUsd(item.profitMultiple),
     peakProfitMultiple: roundUsd(peakProfitMultiple),
     observations: trimmedObservations
+  };
+  state.positions[key] = next;
+  return next;
+}
+
+function updateAutoSellTimingRecord(state, key, item) {
+  const record = state.positions[key] ?? {};
+  const firstSeenAt = Number(record.firstSeenAt ?? item.nowMs);
+  const resolvedMarketStart = Number.isFinite(item.marketStartMs) && item.marketStartMs > 0;
+  const next = {
+    ...record,
+    firstSeenAt,
+    marketStartAt: resolvedMarketStart
+      ? item.marketStartMs
+      : record.marketStartResolved
+        ? Number(record.marketStartAt)
+        : null,
+    marketStartResolved: resolvedMarketStart || Boolean(record.marketStartResolved),
+    lastSeenAt: item.nowMs
   };
   state.positions[key] = next;
   return next;
@@ -2988,7 +4078,11 @@ async function resolvePositionMarketStartMs(cfg, position, marketCache, record =
     position.start_date
   ]);
   if (direct !== null) return direct;
-  if (Number.isFinite(Number(record?.marketStartAt)) && Number(record.marketStartAt) > 0) {
+  if (
+    record?.marketStartResolved &&
+    Number.isFinite(Number(record.marketStartAt)) &&
+    Number(record.marketStartAt) > 0
+  ) {
     return Number(record.marketStartAt);
   }
   const key = String(position.marketAddress ?? "").toLowerCase();
@@ -3017,30 +4111,6 @@ function firstFiniteTimestamp(values) {
 function rawUsdt(value) {
   const raw = typeof value === "bigint" ? value : BigInt(value);
   return Number(formatUnits(raw, 18));
-}
-
-async function syncRuntimeNonceAfterExternalTx(cfg, runtime, reason) {
-  if (!runtime || runtime.nextNonce === undefined || cfg.dryRun || !cfg.execute) return;
-  const { publicClient, account } = makeClients(cfg);
-  if (!account) return;
-  const pendingNonce = Number(await publicClient.getTransactionCount({
-    address: account.address,
-    blockTag: "pending"
-  }));
-  const previousNonce = runtime.nextNonce;
-  runtime.nextNonce = Math.max(runtime.nextNonce, pendingNonce);
-  runtime.lastNonceSyncAt = Date.now();
-  if (runtime.nextNonce !== previousNonce) {
-    console.error(JSON.stringify({
-      level: "warn",
-      source: "nonce-sync-after-external-tx",
-      reason,
-      previousNonce,
-      nextNonce: runtime.nextNonce,
-      pendingNonce,
-      at: new Date().toISOString()
-    }));
-  }
 }
 
 async function waitForWatchFunding(cfg, options = {}) {
@@ -3702,27 +4772,7 @@ async function drainFundingWaitWsLogBuffers(publicClient, txBuffers, cfg) {
 
 function handleFundingWaitWsMarkets(cfg, markets, source, { notifySender = notifyPushPlusSafe } = {}) {
   for (const market of markets) {
-    const curveReason = marketCurveBlockReason(market);
-    if (curveReason) {
-      if (notifyBlockedCurveMarket(cfg, market, curveReason, source, notifySender)) {
-        const row = {
-          level: "event-skip-curve",
-          source,
-          market: market.address,
-          question: market.question,
-          startDate: market.startDate,
-          curve: market.curve ?? null,
-          curveReason,
-          reason: `blocked curve: ${curveReason}`,
-          at: new Date().toISOString()
-        };
-        appendJsonl(cfg.fillsFile, row);
-        console.log(JSON.stringify(row));
-      }
-      continue;
-    }
-
-    const chainCandidate = filterEventMarkets([market], {
+    const chainCandidate = filterNotificationMarkets([market], {
       ...cfg,
       allowOnchainOnlyMarkets: true
     });
@@ -3808,6 +4858,7 @@ async function executeDueBundle(cfg, seen, pending, runtime, records) {
     if (preSigned) bundle = { ...bundle, preSignedFastBundleTransaction: preSigned };
     const result = await executeOrPrintBundle(bundle, cfg, runtime);
     appendJsonl(cfg.fillsFile, {
+      wallet: currentExecutionWallet(cfg, runtime),
       bundle: describeFastBundlePlan(bundle),
       result,
       at: new Date().toISOString()
@@ -4000,10 +5051,6 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
       if (seen.has(key) || pending.has(key) || activeDiscoveryKeys.has(key)) continue;
       activeDiscoveryKeys.add(key);
       lockedKeys.add(key);
-      if (markSkippedIfBlockedCurve(cfg, seen, market, options.source ?? "discovery")) {
-        saveSeen(cfg.stateFile, seen);
-        continue;
-      }
       if (filterEventMarkets([market], cfg, { statuses: eventStatuses }).length === 0) {
         if (shouldDeferOnchainOnlyForRestSafety(cfg, market, eventStatuses)) {
           const record = await preparePendingRecord(cfg, market, runtime, {
@@ -4017,8 +5064,12 @@ async function handleDiscoveredMarkets(cfg, seen, pending, markets, runtime, opt
           }
           continue;
         }
-        seen.add(key);
-        saveSeen(cfg.stateFile, seen);
+        if (
+          options.notify !== false &&
+          filterNotificationMarkets([market], cfg, { statuses: eventStatuses }).length > 0
+        ) {
+          notifyMarketDiscovered(cfg, market, null, `${options.source ?? "discovery"}-notify-only`);
+        }
         continue;
       }
       if (markSkippedIfExpired(cfg, seen, market, "discovery-open-window")) {
@@ -4245,7 +5296,11 @@ function singleMarketUpperBoundRequiredBusdt(cfg) {
   if ((cfg.eventOutcomeSelection ?? "lowest_odds") === "all") {
     return roundUsd(cfg.maxMarketStakeUsdt);
   }
-  return roundUsd(cfg.stakePerOutcomeUsdt * Number(cfg.eventOutcomeCount ?? 5));
+  const configuredCount = Number(cfg.eventOutcomeCount ?? 5);
+  const manualCount = Math.max(0, ...Object.values(cfg.manualOutcomeSelections ?? {}).map((tokenIds) =>
+    Array.isArray(tokenIds) ? tokenIds.length : 0
+  ));
+  return roundUsd(cfg.stakePerOutcomeUsdt * Math.max(configuredCount, manualCount));
 }
 
 function computeFundingRequirement(cfg, eventMarkets = []) {
@@ -4926,28 +5981,6 @@ function markSkippedIfExpired(cfg, seen, market, source) {
   return true;
 }
 
-function markSkippedIfBlockedCurve(cfg, seen, market, source) {
-  const curveReason = marketCurveBlockReason(market);
-  if (!curveReason) return false;
-  const key = eventSeenKey(market, cfg);
-  seen.add(key);
-  const row = {
-    level: "event-skip-curve",
-    source,
-    market: market.address,
-    question: market.question,
-    startDate: market.startDate,
-    curve: market.curve ?? null,
-    curveReason,
-    reason: `blocked curve: ${curveReason}`,
-    at: new Date().toISOString()
-  };
-  appendJsonl(cfg.fillsFile, row);
-  console.log(JSON.stringify(row));
-  notifyBlockedCurveMarket(cfg, market, curveReason, source);
-  return true;
-}
-
 function markSkippedCatchUpDisabled(cfg, seen, market, source) {
   const key = eventSeenKey(market, cfg);
   if (seen.has(key)) return true;
@@ -5199,6 +6232,7 @@ async function maybeExecuteMarket(
     markExecutionRetry(retryRecord, cfg, error);
     const row = {
       level: "event-execution-error",
+      wallet: currentExecutionWallet(cfg, runtime, eventPlan),
       market: market.address,
       question: market.question,
       message: errorMessage(error),
@@ -5211,6 +6245,7 @@ async function maybeExecuteMarket(
     return false;
   }
   appendJsonl(cfg.fillsFile, {
+    wallet: currentExecutionWallet(cfg, runtime, eventPlan),
     plan: describeEventPlan(eventPlan),
     result,
     at: new Date().toISOString()
@@ -5245,10 +6280,6 @@ async function buildEventPlan(cfg, args = {}) {
 }
 
 async function buildEventPlanForMarket(cfg, market, args = {}) {
-  const curveReason = marketCurveBlockReason(market);
-  if (curveReason && !args.ignoreCurveBlock) {
-    throw new Error(`Blocked market curve: ${curveReason}`);
-  }
   const { publicClient } = makeClients(cfg);
   const hydrateOdds = args.hydrateOdds !== false;
   const planMarket = hydrateOdds
@@ -5278,29 +6309,7 @@ async function loadEventMarkets(
     ascending,
     limit
   });
-  notifyBlockedCurveMarkets(cfg, markets, `rest-${status}`);
   return filterEventMarkets(markets, cfg, { statuses: eventStatuses });
-}
-
-function notifyBlockedCurveMarkets(cfg, markets, source) {
-  for (const market of markets ?? []) {
-    const curveReason = marketCurveBlockReason(market);
-    if (!curveReason) continue;
-    if (!notifyBlockedCurveMarket(cfg, market, curveReason, source)) continue;
-    const row = {
-      level: "event-skip-curve",
-      source,
-      market: market.address,
-      question: market.question,
-      startDate: market.startDate,
-      curve: market.curve ?? null,
-      curveReason,
-      reason: `blocked curve: ${curveReason}`,
-      at: new Date().toISOString()
-    };
-    appendJsonl(cfg.fillsFile, row);
-    console.log(JSON.stringify(row));
-  }
 }
 
 async function loadUpcomingRestEventMarkets(cfg) {
@@ -5319,6 +6328,17 @@ async function loadRestDiscoveryEventMarkets(cfg) {
     limit: cfg.watchScanLimit,
     eventStatuses: REST_DISCOVERY_STATUSES
   });
+}
+
+async function loadRestNotificationMarkets(cfg) {
+  const markets = await fetchMarkets(cfg, {
+    status: "all",
+    topic: "",
+    order: "created_at",
+    ascending: false,
+    limit: cfg.watchScanLimit
+  });
+  return filterNotificationMarkets(markets, cfg, { statuses: REST_DISCOVERY_STATUSES });
 }
 
 async function loadStartupRestEventMarkets(cfg) {
@@ -5352,14 +6372,47 @@ async function executeOrPrint(eventPlan, cfg, runtime = null) {
     return { dryRun: true };
   }
 
-  const result = await buyOutcomesBatch(cfg, eventPlan, runtime);
+  assertConfiguredWalletMatchesPrivateKey(cfg, "event buy");
+  const buyLatencyTrace = createBuyLatencyTrace(cfg, {
+    type: "single",
+    wallet: currentExecutionWallet(cfg, runtime, eventPlan),
+    markets: [eventPlan.market]
+  });
+  const result = await buyOutcomesBatch(cfg, eventPlan, runtime, buyLatencyTrace);
   console.log(JSON.stringify({ level: "executed", plan: described, result }, null, 2));
   maybeTrackReceipt(cfg, result, {
     type: "single",
+    wallet: currentExecutionWallet(cfg, runtime, eventPlan),
     market: eventPlan.market.address,
     question: eventPlan.market.question
   });
+  schedulePostBuyOperatorApprovals(cfg, [eventPlan.market], runtime, result);
+  scheduleBuyLatencyRecording(cfg, buyLatencyTrace, result);
   return result;
+}
+
+function currentExecutionWallet(cfg, runtime = null, plan = null) {
+  if (runtime?.receiverAddress) return runtime.receiverAddress;
+  if (plan?.prebuiltFastExecution?.receiver) return plan.prebuiltFastExecution.receiver;
+  if (cfg.walletAddress) return cfg.walletAddress;
+  try {
+    const { account } = makeClients(cfg);
+    return account?.address ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function assertConfiguredWalletMatchesPrivateKey(cfg, context = "real execution") {
+  const configured = String(cfg.walletAddress ?? "").trim();
+  if (!configured) return;
+  const { account } = makeClients(cfg);
+  if (!account) throw new Error(`${context}: PRIVATE_KEY is required`);
+  if (configured.toLowerCase() !== account.address.toLowerCase()) {
+    throw new Error(
+      `${context}: WALLET_ADDRESS ${shortHash(configured)} does not match PRIVATE_KEY-derived wallet ${shortHash(account.address)}`
+    );
+  }
 }
 
 async function executeOrPrintBundle(bundle, cfg, runtime = null) {
@@ -5369,15 +6422,434 @@ async function executeOrPrintBundle(bundle, cfg, runtime = null) {
     return { dryRun: true, bundled: true };
   }
 
-  const result = await executeFastBuyBundle(cfg, bundle, runtime);
+  assertConfiguredWalletMatchesPrivateKey(cfg, "event bundle buy");
+  const buyLatencyTrace = createBuyLatencyTrace(cfg, {
+    type: "bundle",
+    wallet: currentExecutionWallet(cfg, runtime),
+    markets: bundle.markets
+  });
+  const result = await executeFastBuyBundle(cfg, bundle, runtime, buyLatencyTrace);
   console.log(JSON.stringify({ level: "bundle-executed", bundle: described, result }, null, 2));
   maybeTrackReceipt(cfg, result, {
     type: "bundle",
+    wallet: currentExecutionWallet(cfg, runtime),
     markets: bundle.markets.map((market) => market.address),
     marketCount: bundle.marketCount,
     outcomeCount: bundle.outcomeCount
   });
+  schedulePostBuyOperatorApprovals(cfg, bundle.markets, runtime, result);
+  scheduleBuyLatencyRecording(cfg, buyLatencyTrace, result);
   return result;
+}
+
+function createBuyLatencyTrace(cfg, { type, wallet, markets }) {
+  const executionEnteredAtEpochMs = Date.now();
+  const configuredDelayMs = Math.max(0, Number(cfg.eventBuyDelaySeconds ?? 0)) * 1000;
+  const prebroadcastMs = Math.max(0, Number(cfg.prebroadcastMs ?? 0));
+  const normalizedMarkets = (markets ?? []).map((market) => {
+    const startAtEpochMs = Date.parse(market?.startDate ?? "");
+    return {
+      address: market?.address ?? null,
+      question: market?.question ?? null,
+      startDate: Number.isFinite(startAtEpochMs) ? new Date(startAtEpochMs).toISOString() : null,
+      startAtEpochMs: Number.isFinite(startAtEpochMs) ? startAtEpochMs : null,
+      plannedBroadcastAtEpochMs: Number.isFinite(startAtEpochMs)
+        ? startAtEpochMs + configuredDelayMs - prebroadcastMs
+        : null
+    };
+  });
+  const plannedTimes = normalizedMarkets
+    .map((market) => market.plannedBroadcastAtEpochMs)
+    .filter(Number.isFinite);
+  const plannedBroadcastAtEpochMs = plannedTimes.length > 0 ? Math.min(...plannedTimes) : null;
+  return {
+    schemaVersion: 1,
+    type,
+    wallet: wallet ?? null,
+    configuredDelayMs,
+    prebroadcastMs,
+    executionEnteredAtEpochMs,
+    executionEnteredAt: new Date(executionEnteredAtEpochMs).toISOString(),
+    plannedBroadcastAtEpochMs,
+    plannedBroadcastAt: Number.isFinite(plannedBroadcastAtEpochMs)
+      ? new Date(plannedBroadcastAtEpochMs).toISOString()
+      : null,
+    markets: normalizedMarkets,
+    broadcastAttempts: [],
+    _settlementPromises: []
+  };
+}
+
+function scheduleBuyLatencyRecording(cfg, trace, result) {
+  if (!cfg.buyLatencyFile || !trace || !result?.txHash) return;
+
+  setImmediate(() => {
+    void persistBuyLatencyBroadcast(cfg, trace, result);
+  });
+
+  const timer = setTimeout(() => {
+    void persistBuyLatencyChainResult(cfg, trace, result);
+  }, BUY_LATENCY_ENRICH_DELAY_MS);
+  timer.unref?.();
+}
+
+async function persistBuyLatencyBroadcast(cfg, trace, result) {
+  try {
+    await Promise.allSettled(trace._settlementPromises ?? []);
+    const row = {
+      level: "buy-latency",
+      phase: "broadcast",
+      ...snapshotBuyLatencyTrace(trace),
+      result: {
+        txHash: result.txHash,
+        status: result.status ?? null,
+        blockNumber: result.blockNumber ?? null,
+        broadcastMode: result.broadcastMode ?? null,
+        broadcastRpcCount: result.broadcastRpcCount ?? null,
+        firstBroadcastProvider: result.firstBroadcastProvider ?? null,
+        usedPreSignedTransaction: Boolean(result.usedPreSignedTransaction),
+        preSignedAt: result.preSignedAt ?? null,
+        preSignedNonce: result.preSignedNonce ?? null
+      },
+      at: new Date().toISOString()
+    };
+    await appendBuyLatencyJsonl(cfg, row);
+  } catch (error) {
+    logBuyLatencyWarning("broadcast-record", error);
+  }
+}
+
+async function persistBuyLatencyChainResult(cfg, trace, result) {
+  try {
+    const { publicClient } = makeClients(cfg);
+    const receipt = await publicClient.getTransactionReceipt({ hash: result.txHash });
+    const block = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+    const txHash = String(result.txHash).toLowerCase();
+    const blockTimestampSec = Number(block.timestamp);
+    const marketResults = [];
+
+    for (const market of trace.markets ?? []) {
+      marketResults.push(await inspectBuyLatencyMarket(
+        publicClient,
+        market,
+        receipt,
+        txHash,
+        blockTimestampSec
+      ));
+    }
+
+    await appendBuyLatencyJsonl(cfg, {
+      level: "buy-latency",
+      phase: "chain",
+      schemaVersion: trace.schemaVersion,
+      type: trace.type,
+      wallet: trace.wallet,
+      txHash: result.txHash,
+      blockNumber: receipt.blockNumber.toString(),
+      blockTimestamp: new Date(blockTimestampSec * 1000).toISOString(),
+      txIndex: Number(receipt.transactionIndex),
+      gasUsed: receipt.gasUsed?.toString?.() ?? null,
+      effectiveGasPriceWei: receipt.effectiveGasPrice?.toString?.() ?? null,
+      receiptStatus: receipt.status ?? null,
+      markets: marketResults,
+      at: new Date().toISOString()
+    });
+  } catch (error) {
+    await appendBuyLatencyJsonl(cfg, {
+      level: "buy-latency",
+      phase: "chain-error",
+      schemaVersion: trace.schemaVersion,
+      type: trace.type,
+      wallet: trace.wallet,
+      txHash: result.txHash,
+      message: errorMessage(error),
+      at: new Date().toISOString()
+    }).catch(() => {});
+    logBuyLatencyWarning("chain-record", error);
+  }
+}
+
+async function inspectBuyLatencyMarket(publicClient, market, receipt, txHash, blockTimestampSec) {
+  if (!market?.address) {
+    return { address: null, question: market?.question ?? null, error: "missing market address" };
+  }
+  try {
+    const fromBlock = receipt.blockNumber > BUY_LATENCY_LOG_LOOKBACK_BLOCKS
+      ? receipt.blockNumber - BUY_LATENCY_LOG_LOOKBACK_BLOCKS
+      : 1n;
+    const logs = await publicClient.getLogs({
+      address: getAddress(market.address),
+      fromBlock,
+      toBlock: receipt.blockNumber
+    });
+    const groups = groupBuyLatencyMintLogs(logs);
+    const rankIndex = groups.findIndex((group) => group.txHash === txHash);
+    const first = groups[0] ?? null;
+    const startTimestampSec = Number.isFinite(Number(market.startAtEpochMs))
+      ? Math.floor(Number(market.startAtEpochMs) / 1000)
+      : null;
+    return {
+      address: market.address,
+      question: market.question,
+      startDate: market.startDate,
+      openDeltaSec: startTimestampSec === null ? null : blockTimestampSec - startTimestampSec,
+      rank: rankIndex >= 0 ? rankIndex + 1 : null,
+      transactionsBefore: rankIndex >= 0 ? rankIndex : null,
+      blocksBehindFirst: rankIndex >= 0 && first
+        ? Number(receipt.blockNumber - first.blockNumber)
+        : null,
+      firstTxHash: first?.txHash ?? null,
+      firstBlockNumber: first?.blockNumber?.toString?.() ?? null,
+      firstTxIndex: first?.transactionIndex ?? null,
+      observedTransactions: groups.length,
+      lookbackBlocks: BUY_LATENCY_LOG_LOOKBACK_BLOCKS.toString()
+    };
+  } catch (error) {
+    return {
+      address: market.address,
+      question: market.question,
+      startDate: market.startDate,
+      error: errorMessage(error)
+    };
+  }
+}
+
+function groupBuyLatencyMintLogs(logs) {
+  const groups = new Map();
+  for (const log of logs ?? []) {
+    if (String(log.topics?.[0] ?? "").toLowerCase() !== MARKET_MINT_TOPIC) continue;
+    const txHash = String(log.transactionHash ?? "").toLowerCase();
+    if (!txHash) continue;
+    const current = groups.get(txHash) ?? {
+      txHash,
+      blockNumber: BigInt(log.blockNumber),
+      transactionIndex: Number(log.transactionIndex),
+      logIndex: Number(log.logIndex),
+      outcomeEvents: 0
+    };
+    current.outcomeEvents += 1;
+    current.logIndex = Math.min(current.logIndex, Number(log.logIndex));
+    groups.set(txHash, current);
+  }
+  return [...groups.values()].sort((a, b) =>
+    Number(a.blockNumber - b.blockNumber) ||
+    a.transactionIndex - b.transactionIndex ||
+    a.logIndex - b.logIndex
+  );
+}
+
+function snapshotBuyLatencyTrace(trace) {
+  const broadcastAttempts = (trace.broadcastAttempts ?? []).map((attempt) => ({
+    ...attempt,
+    providerResults: [...(attempt.providerResults ?? [])]
+      .sort((a, b) => Number(a.latencyMs ?? Infinity) - Number(b.latencyMs ?? Infinity))
+  }));
+  return {
+    schemaVersion: trace.schemaVersion,
+    type: trace.type,
+    wallet: trace.wallet,
+    configuredDelayMs: trace.configuredDelayMs,
+    prebroadcastMs: trace.prebroadcastMs,
+    executionEnteredAtEpochMs: trace.executionEnteredAtEpochMs,
+    executionEnteredAt: trace.executionEnteredAt,
+    plannedBroadcastAtEpochMs: trace.plannedBroadcastAtEpochMs,
+    plannedBroadcastAt: trace.plannedBroadcastAt,
+    broadcastStartedAtEpochMs: trace.broadcastStartedAtEpochMs ?? null,
+    broadcastStartedAt: trace.broadcastStartedAt ?? null,
+    timerDriftMs: trace.timerDriftMs ?? null,
+    firstAcceptedAtEpochMs: trace.firstAcceptedAtEpochMs ?? null,
+    firstAcceptedAt: trace.firstAcceptedAt ?? null,
+    firstAcceptedMs: trace.firstAcceptedMs ?? null,
+    firstAcceptedDriftMs: Number.isFinite(Number(trace.firstAcceptedAtEpochMs)) &&
+      Number.isFinite(Number(trace.plannedBroadcastAtEpochMs))
+      ? Math.round((Number(trace.firstAcceptedAtEpochMs) - Number(trace.plannedBroadcastAtEpochMs)) * 1000) / 1000
+      : null,
+    firstProvider: trace.firstProvider ?? null,
+    markets: trace.markets,
+    broadcastAttempts
+  };
+}
+
+async function appendBuyLatencyJsonl(cfg, row) {
+  await fs.promises.appendFile(cfg.buyLatencyFile, `${JSON.stringify(row)}\n`, "utf8");
+}
+
+function logBuyLatencyWarning(source, error) {
+  console.error(JSON.stringify({
+    level: "warn",
+    source: `buy-latency-${source}`,
+    message: errorMessage(error),
+    at: new Date().toISOString()
+  }));
+}
+
+function enqueueRuntimeWalletAction(runtime, action, walletAddress = "", priority = 50) {
+  const fallbackKey = String(walletAddress).toLowerCase() || "default";
+  const queue = runtime ? runtimeWalletActionQueues : fallbackWalletActionQueues;
+  const queueKey = runtime || fallbackKey;
+  let scheduler = queue.get(queueKey);
+  if (!scheduler) {
+    scheduler = { running: false, pending: [] };
+    queue.set(queueKey, scheduler);
+  }
+  return new Promise((resolve, reject) => {
+    scheduler.pending.push({
+      action,
+      priority: Number(priority ?? 50),
+      sequence: walletActionSequence++,
+      resolve,
+      reject
+    });
+    void drainWalletActionScheduler(queue, queueKey, scheduler);
+  });
+}
+
+async function drainWalletActionScheduler(queue, queueKey, scheduler) {
+  if (scheduler.running) return;
+  scheduler.running = true;
+  try {
+    while (scheduler.pending.length > 0) {
+      scheduler.pending.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+      const item = scheduler.pending.shift();
+      try {
+        item.resolve(await item.action());
+      } catch (error) {
+        item.reject(error);
+      }
+    }
+  } finally {
+    scheduler.running = false;
+    if (scheduler.pending.length === 0 && queue.get(queueKey) === scheduler) queue.delete(queueKey);
+  }
+}
+
+function schedulePostBuyOperatorApprovals(cfg, markets, runtime, buyResult) {
+  if (
+    !cfg.autoApproveMarketAfterBuy ||
+    cfg.dryRun ||
+    !cfg.execute ||
+    !executionMarksSeen(buyResult)
+  ) return;
+
+  const wallet = currentExecutionWallet(cfg, runtime);
+  if (!wallet) return;
+  const uniqueMarkets = new Map();
+  for (const market of markets ?? []) {
+    const address = String(market?.address ?? market ?? "").trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(address)) continue;
+    uniqueMarkets.set(address.toLowerCase(), {
+      address,
+      question: market?.question ?? address
+    });
+  }
+
+  for (const market of uniqueMarkets.values()) {
+    const key = operatorApprovalStateKey(wallet, market.address);
+    if (pendingPostBuyApprovalKeys.has(key)) continue;
+    pendingPostBuyApprovalKeys.add(key);
+    updateOperatorApprovalState(cfg, {
+      wallet,
+      market: market.address,
+      question: market.question,
+      status: "queued",
+      txHash: "",
+      error: ""
+    });
+
+    void enqueueRuntimeWalletAction(runtime, async () => {
+      updateOperatorApprovalState(cfg, {
+        wallet,
+        market: market.address,
+        question: market.question,
+        status: "authorizing",
+        txHash: "",
+        error: ""
+      });
+      const approval = await approveMarketOperator(cfg, {
+        market: market.address,
+        owner: wallet,
+        runtime
+      });
+      const approved = Boolean(approval.operatorApproved || approval.approved || approval.alreadyApproved);
+      const status = approved
+        ? "approved"
+        : approval.status === "broadcast"
+          ? "pending"
+          : "failed";
+      const row = {
+        level: "event-post-buy-operator-approval",
+        wallet,
+        market: market.address,
+        question: market.question,
+        status,
+        txHash: approval.txHash ?? null,
+        alreadyApproved: Boolean(approval.alreadyApproved),
+        receiptError: approval.receiptError ?? null,
+        at: new Date().toISOString()
+      };
+      updateOperatorApprovalState(cfg, {
+        ...row,
+        error: approval.receiptError ?? ""
+      });
+      appendJsonl(cfg.fillsFile, row);
+      console.log(JSON.stringify(row));
+    }, wallet, 40).catch((error) => {
+      const row = {
+        level: "event-post-buy-operator-approval",
+        wallet,
+        market: market.address,
+        question: market.question,
+        status: "failed",
+        txHash: null,
+        error: errorMessage(error),
+        at: new Date().toISOString()
+      };
+      updateOperatorApprovalState(cfg, row);
+      appendJsonl(cfg.fillsFile, row);
+      console.error(JSON.stringify(row));
+    }).finally(() => {
+      pendingPostBuyApprovalKeys.delete(key);
+    });
+  }
+}
+
+function operatorApprovalStateKey(wallet, market) {
+  return `${String(wallet).toLowerCase()}:${String(market).toLowerCase()}`;
+}
+
+function updateOperatorApprovalState(cfg, entry) {
+  if (!cfg.operatorApprovalStateFile) return;
+  try {
+    const file = path.resolve(cfg.operatorApprovalStateFile);
+    let state = { version: 1, entries: {} };
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (parsed && typeof parsed === "object") {
+        state = {
+          version: 1,
+          entries: parsed.entries && typeof parsed.entries === "object" ? parsed.entries : {}
+        };
+      }
+    } catch {
+      // Start a new state file.
+    }
+    const key = operatorApprovalStateKey(entry.wallet, entry.market);
+    state.entries[key] = {
+      ...(state.entries[key] ?? {}),
+      ...entry,
+      updatedAt: entry.at ?? new Date().toISOString()
+    };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    console.error(JSON.stringify({
+      level: "operator-approval-state-write-error",
+      message: errorMessage(error),
+      at: new Date().toISOString()
+    }));
+  }
 }
 
 function maybeTrackReceipt(cfg, result, context = {}) {
@@ -5429,13 +6901,18 @@ async function trackReceipt(cfg, txHash, context) {
 
 function notifyMarketDiscovered(cfg, market, record, source, notifySender = notifyPushPlusSafe) {
   const plan = record?.preparedPlan;
+  const availableOutcomeCount = plan?.selection?.availableOutcomeCount ?? market.outcomes?.length ?? 0;
+  const plannedOutcomeCount = plan?.outcomes?.length ?? selectedOutcomeCount(market, cfg);
+  const plannedStakeUsdt = plan?.totalStakeUsdt ?? roundUsd(cfg.stakePerOutcomeUsdt * plannedOutcomeCount);
   const lines = [
     markdownLine("来源", source),
     markdownLine("市场", market.question),
-    markdownLine("开盘", market.startDate),
-    markdownLine("结束", market.endDate),
-    markdownLine("选项", plan?.outcomes?.length ?? market.outcomes?.length),
-    markdownLine("计划金额", plan?.totalStakeUsdt ? `${plan.totalStakeUsdt} U` : ""),
+    markdownLine("栏目", marketColumnText(market)),
+    markdownLine("开盘(UTC+8)", formatUtc8Time(market.startDate)),
+    markdownLine("结束(UTC+8)", formatUtc8Time(market.endDate)),
+    markdownLine("市场 outcome 总数", availableOutcomeCount),
+    markdownLine("计划买入数量", plannedOutcomeCount),
+    markdownLine("计划金额", plannedStakeUsdt > 0 ? `${plannedStakeUsdt} U` : ""),
     markdownLine("状态", market.status)
   ].filter(Boolean);
   return queuePersistentMarketNotification(cfg, marketNotificationKey("discovered", market), {
@@ -5444,19 +6921,34 @@ function notifyMarketDiscovered(cfg, market, record, source, notifySender = noti
   }, notifySender);
 }
 
-function notifyBlockedCurveMarket(cfg, market, curveReason, source, notifySender = notifyPushPlusSafe) {
-  const lines = [
-    markdownLine("来源", source),
-    markdownLine("市场", market.question),
-    markdownLine("开盘", market.startDate),
-    markdownLine("结束", market.endDate),
-    markdownLine("Curve", curveReason),
-    markdownLine("动作", "已跳过，不买")
-  ].filter(Boolean);
-  return queuePersistentMarketNotification(cfg, marketNotificationKey("blocked-curve", market, curveReason), {
-    title: "42space 跳过风险 Curve 市场",
-    content: lines.join("\n")
-  }, notifySender);
+function marketColumnText(market) {
+  const categories = (market?.categories ?? [])
+    .map((item) => String(item).trim())
+    .filter(Boolean);
+  if (categories.length > 0) return categories.join(" / ");
+
+  const tags = (market?.tags ?? [])
+    .map((item) => String(item).trim())
+    .filter(Boolean);
+  if (tags.length > 0) return tags.join(" / ");
+
+  return "链上未分类";
+}
+
+function formatUtc8Time(value) {
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) return value ?? "";
+  const date = new Date(time + 8 * 3600000);
+  const pad = (number) => String(number).padStart(2, "0");
+  return [
+    date.getUTCFullYear(),
+    pad(date.getUTCMonth() + 1),
+    pad(date.getUTCDate())
+  ].join("-") + " " + [
+    pad(date.getUTCHours()),
+    pad(date.getUTCMinutes()),
+    pad(date.getUTCSeconds())
+  ].join(":") + " UTC+8";
 }
 
 function marketNotificationKey(kind, market, detail = "") {
@@ -5492,18 +6984,26 @@ function rememberPersistentMarketNotification(cfg, key) {
 function queuePersistentMarketNotification(cfg, key, message, notifySender = notifyPushPlusSafe, retryCount = 0) {
   if (!cfg?.pushPlusEnabled || !cfg.pushPlusToken || !key) return false;
   if (hasPersistentMarketNotification(cfg, key) || pendingPersistentNotifications.has(key)) return false;
+  const failureBackoffUntil = persistentNotificationFailureBackoff.get(key) ?? 0;
+  if (failureBackoffUntil > Date.now()) return false;
+  if (failureBackoffUntil) persistentNotificationFailureBackoff.delete(key);
   pendingPersistentNotifications.add(key);
 
   const release = () => pendingPersistentNotifications.delete(key);
   const started = notifySender(cfg, message, {
     onSuccess: () => {
+      persistentNotificationFailureBackoff.delete(key);
       rememberPersistentMarketNotification(cfg, key);
       release();
     },
     onError: () => {
-      release();
-      if (retryCount >= PERSISTENT_NOTIFICATION_MAX_RETRIES) return;
+      if (retryCount >= PERSISTENT_NOTIFICATION_MAX_RETRIES) {
+        persistentNotificationFailureBackoff.set(key, Date.now() + PERSISTENT_NOTIFICATION_FAILURE_BACKOFF_MS);
+        release();
+        return;
+      }
       setTimeout(() => {
+        release();
         queuePersistentMarketNotification(cfg, key, message, notifySender, retryCount + 1);
       }, PERSISTENT_NOTIFICATION_RETRY_MS);
     }
@@ -5563,6 +7063,7 @@ function notifyBuyError(cfg, market, error) {
 }
 
 function notifyReceipt(cfg, row) {
+  const sellReceipt = row.context?.type === "manual-sell" || row.context?.type === "auto-sell";
   const lines = [
     markdownLine("状态", row.status),
     markdownLine("交易", shortHash(row.txHash)),
@@ -5572,7 +7073,9 @@ function notifyReceipt(cfg, row) {
     markdownLine("错误", row.message)
   ].filter(Boolean);
   notifyPushPlusSafe(cfg, {
-    title: row.status === "success" ? "42space 交易已确认" : "42space 交易确认异常",
+    title: row.status === "success"
+      ? sellReceipt ? "42space 卖出已确认" : "42space 买入已确认"
+      : sellReceipt ? "42space 卖出确认异常" : "42space 买入确认异常",
     content: lines.join("\n")
   });
 }
@@ -5581,6 +7084,7 @@ function notifyAutoSell(cfg, action, execution) {
   const status = execution?.status ?? action?.status;
   const lines = [
     markdownLine("状态", status),
+    markdownLine("策略", autoSellStrategyLabel(action?.strategy)),
     markdownLine("市场", action?.question),
     markdownLine("选项", action?.outcome),
     markdownLine("比例", action?.percent ? `${action.percent}%` : ""),
@@ -5588,9 +7092,21 @@ function notifyAutoSell(cfg, action, execution) {
     markdownLine("交易", shortHash(action?.txHash))
   ].filter(Boolean);
   notifyPushPlusSafe(cfg, {
-    title: "42space 自动止盈",
+    title: "42space 自动卖出",
     content: lines.join("\n")
   });
+}
+
+function autoSellStrategyLabel(strategy) {
+  const labels = {
+    original: "原倍数止盈",
+    fixed_trailing: "固定移动止盈",
+    adaptive_trailing: "自适应移动止盈",
+    weak_exit: "弱势超时退出",
+    breakeven: "保本回落卖出",
+    timed_exit: "开盘定时卖出"
+  };
+  return labels[strategy] ?? strategy ?? "";
 }
 
 function buyResultText(result) {

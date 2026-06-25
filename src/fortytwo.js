@@ -3,6 +3,7 @@ import {
   createWalletClient,
   encodeAbiParameters,
   encodeFunctionData,
+  fallback,
   formatUnits,
   getAddress,
   http,
@@ -16,6 +17,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { bsc } from "viem/chains";
+import { performance } from "node:perf_hooks";
 
 export const ADDRESSES = {
   busdt: "0x55d398326f99059fF775485246999027B3197955",
@@ -117,6 +119,7 @@ const controllerEventAbi = parseAbi([
 const createNewMarketEvent = controllerEventAbi.find((item) => item.type === "event" && item.name === "CreateNewMarket");
 const controllerEvents = controllerEventAbi.filter((item) => item.type === "event");
 const broadcastClients = new Map();
+const archiveGetLogsFallbacks = new WeakMap();
 const creationTxFallbackCache = new Map();
 const CREATION_TX_FALLBACK_CACHE_MAX = 256;
 
@@ -183,8 +186,9 @@ export async function fetchActivity(cfg, { user, market, limit = 100, type } = {
 export function makeClients(cfg) {
   const publicClient = createPublicClient({
     chain: bsc,
-    transport: http(cfg.rpcUrl)
+    transport: publicReadTransport(cfg)
   });
+  attachArchiveGetLogsFallbacks(publicClient, cfg);
 
   if (!cfg.privateKey) return { publicClient, walletClient: null, account: null };
 
@@ -202,6 +206,17 @@ export function makeWsClient(cfg) {
   return createPublicClient({
     chain: bsc,
     transport: webSocket(cfg.wsUrl)
+  });
+}
+
+function publicReadTransport(cfg) {
+  const urls = (cfg.archiveRpcUrls?.length ? cfg.archiveRpcUrls : [cfg.rpcUrl])
+    .map((url) => String(url ?? "").trim())
+    .filter((url) => /^https?:\/\//i.test(url));
+  const uniqueUrls = [...new Set(urls)];
+  if (uniqueUrls.length <= 1) return http(cfg.rpcUrl);
+  return fallback(uniqueUrls.map((url) => http(url)), {
+    retryCount: 0
   });
 }
 
@@ -310,9 +325,10 @@ function resolveBundleFastGasLimit(cfg, { marketCount, outcomeCount } = {}) {
   return dynamic > configured ? configured : dynamic;
 }
 
-export async function approveRouterMax(cfg, { requiredUsdt = cfg.maxMarketStakeUsdt } = {}) {
+export async function approveRouterMax(cfg, { requiredUsdt = cfg.maxMarketStakeUsdt, runtime = null } = {}) {
   if (!cfg.privateKey) throw new Error("PRIVATE_KEY is required for router approval");
   const { publicClient, walletClient, account } = makeClients(cfg);
+  assertConfiguredWalletAccount(cfg, account, "router approval");
   const requiredAmount = parseUnits(String(requiredUsdt), 18);
   const allowance = await publicClient.readContract({
     address: ADDRESSES.busdt,
@@ -339,16 +355,17 @@ export async function approveRouterMax(cfg, { requiredUsdt = cfg.maxMarketStakeU
     throw new Error("Refusing approval: set I_AM_NOT_IN_RESTRICTED_JURISDICTION=YES");
   }
 
-  const approval = await ensureBusdtAllowance(publicClient, walletClient, account.address, requiredAmount);
+  const approval = await ensureBusdtAllowance(cfg, publicClient, walletClient, account.address, requiredAmount, runtime);
   return { ...base, ...approval, approved: true };
 }
 
-export async function approveRouterAmount(cfg, { amountUsdt } = {}) {
+export async function approveRouterAmount(cfg, { amountUsdt, runtime = null } = {}) {
   if (!cfg.privateKey) throw new Error("PRIVATE_KEY is required for router approval");
   const amount = Number(amountUsdt);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error("Approval amount must be positive");
 
   const { publicClient, walletClient, account } = makeClients(cfg);
+  assertConfiguredWalletAccount(cfg, account, "router approval");
   const targetAmount = parseUnits(String(amountUsdt), 18);
   const allowance = await publicClient.readContract({
     address: ADDRESSES.busdt,
@@ -375,7 +392,7 @@ export async function approveRouterAmount(cfg, { amountUsdt } = {}) {
     throw new Error("Refusing approval: set I_AM_NOT_IN_RESTRICTED_JURISDICTION=YES");
   }
 
-  const approval = await setBusdtAllowance(publicClient, walletClient, account.address, targetAmount);
+  const approval = await setBusdtAllowance(cfg, publicClient, walletClient, account.address, targetAmount, null, runtime);
   return { ...base, ...approval, approved: true };
 }
 
@@ -581,17 +598,64 @@ function groupLogsByTransaction(logs) {
 }
 
 async function fetchLogsChunked(publicClient, params, chunkSize) {
+  return getLogsWithArchiveFallback(publicClient, params, chunkSize);
+}
+
+function attachArchiveGetLogsFallbacks(publicClient, cfg) {
+  const urls = (cfg.archiveRpcUrls ?? [])
+    .map((url) => String(url ?? "").trim())
+    .filter((url) => /^https?:\/\//i.test(url) && url !== cfg.rpcUrl);
+  archiveGetLogsFallbacks.set(publicClient, {
+    primary: getBroadcastClient(cfg.rpcUrl),
+    fallbacks: urls.map((url) => ({
+      url,
+      client: getBroadcastClient(url)
+    }))
+  });
+}
+
+async function getLogsWithArchiveFallback(publicClient, params, chunkSize = 0) {
+  const fallbackSet = archiveGetLogsFallbacks.get(publicClient);
+  const primaryClient = fallbackSet?.primary ?? publicClient;
+  try {
+    return await getLogsChunkedOnClient(primaryClient, params, chunkSize);
+  } catch (primaryError) {
+    const fallbacks = fallbackSet?.fallbacks ?? [];
+    if (fallbacks.length === 0) throw primaryError;
+
+    const failures = [`primary: ${errorMessage(primaryError)}`];
+    for (const fallback of fallbacks) {
+      try {
+        return await getLogsChunkedOnClient(fallback.client, params, 0);
+      } catch (fullRangeError) {
+        if (chunkSize > 0) {
+          try {
+            return await getLogsChunkedOnClient(fallback.client, params, chunkSize);
+          } catch (chunkedError) {
+            failures.push(`${providerLabel(fallback.url)}: ${errorMessage(fullRangeError)}; chunked: ${errorMessage(chunkedError)}`);
+            continue;
+          }
+        }
+        failures.push(`${providerLabel(fallback.url)}: ${errorMessage(fullRangeError)}`);
+      }
+    }
+
+    throw new Error(`eth_getLogs failed on primary and archive fallback RPCs: ${failures.join(" | ")}`);
+  }
+}
+
+async function getLogsChunkedOnClient(client, params, chunkSize) {
   const fromBlock = BigInt(params.fromBlock);
   const toBlock = BigInt(params.toBlock);
   const step = BigInt(chunkSize);
   if (step <= 0n || toBlock - fromBlock <= step) {
-    return publicClient.getLogs(params);
+    return client.getLogs(params);
   }
 
   const logs = [];
   for (let start = fromBlock; start <= toBlock; start += step) {
     const end = start + step - 1n < toBlock ? start + step - 1n : toBlock;
-    logs.push(...await publicClient.getLogs({ ...params, fromBlock: start, toBlock: end }));
+    logs.push(...await client.getLogs({ ...params, fromBlock: start, toBlock: end }));
   }
   return logs;
 }
@@ -625,7 +689,7 @@ export async function simulateMintAmount(publicClient, { market, tokenId, amount
   };
 }
 
-export function selectEventOutcomes(outcomes, cfg) {
+export function selectEventOutcomes(outcomes, cfg, market = null) {
   const sorted = sortOutcomes(outcomes ?? []);
   if (sorted.length === 0) {
     return {
@@ -641,6 +705,27 @@ export function selectEventOutcomes(outcomes, cfg) {
     };
   }
 
+  const manualTokenIds = manualOutcomeTokenIdsForMarket(market, cfg);
+  if (manualTokenIds.length > 0) {
+    const byTokenId = new Map(sorted.map((outcome) => [String(outcome.tokenId), outcome]));
+    const missing = manualTokenIds.filter((tokenId) => !byTokenId.has(tokenId));
+    if (missing.length > 0) {
+      throw new Error(`Manual outcome selection contains unknown tokenId(s): ${missing.join(",")}`);
+    }
+    return {
+      outcomes: manualTokenIds.map((tokenId) => byTokenId.get(tokenId)),
+      metadata: {
+        strategy: "manual_outcomes",
+        requestedCount: manualTokenIds.length,
+        selectedCount: manualTokenIds.length,
+        availableOutcomeCount: sorted.length,
+        rankSource: "manual",
+        fallbackReason: null,
+        manualTokenIds
+      }
+    };
+  }
+
   const strategy = cfg.eventOutcomeSelection ?? "lowest_odds";
   if (strategy === "all") {
     return {
@@ -651,6 +736,20 @@ export function selectEventOutcomes(outcomes, cfg) {
         selectedCount: sorted.length,
         availableOutcomeCount: sorted.length,
         rankSource: "token_order",
+        fallbackReason: null
+      }
+    };
+  }
+  if (strategy === "last_outcomes") {
+    const requestedCount = Math.min(Number(cfg.eventOutcomeCount ?? 5), sorted.length);
+    return {
+      outcomes: sorted.slice(-requestedCount),
+      metadata: {
+        strategy,
+        requestedCount: Number(cfg.eventOutcomeCount ?? 5),
+        selectedCount: requestedCount,
+        availableOutcomeCount: sorted.length,
+        rankSource: "token_order_desc_tail",
         fallbackReason: null
       }
     };
@@ -678,8 +777,25 @@ export function selectEventOutcomes(outcomes, cfg) {
 export function estimateSelectedOutcomeCount(market, cfg) {
   const availableCount = market.outcomes?.length ?? 0;
   if (availableCount <= 0) return 0;
+  const manualTokenIds = manualOutcomeTokenIdsForMarket(market, cfg);
+  if (manualTokenIds.length > 0) {
+    const availableTokenIds = new Set((market.outcomes ?? []).map((outcome) => String(outcome.tokenId)));
+    return manualTokenIds.filter((tokenId) => availableTokenIds.has(tokenId)).length;
+  }
   if ((cfg.eventOutcomeSelection ?? "lowest_odds") === "all") return availableCount;
   return Math.min(Number(cfg.eventOutcomeCount ?? 5), availableCount);
+}
+
+function manualOutcomeTokenIdsForMarket(market, cfg) {
+  const address = normalizeManualMarketAddress(market?.address);
+  if (!address) return [];
+  const tokenIds = cfg?.manualOutcomeSelections?.[address];
+  return Array.isArray(tokenIds) ? tokenIds.map((item) => String(item)).filter(Boolean) : [];
+}
+
+function normalizeManualMarketAddress(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return /^0x[0-9a-f]{40}$/.test(text) ? text : "";
 }
 
 export async function quoteBuyAllOutcomes(publicClient, market, cfg, overrides = {}) {
@@ -688,7 +804,7 @@ export async function quoteBuyAllOutcomes(publicClient, market, cfg, overrides =
   }
   const availableOutcomes = sortOutcomes(market.outcomes ?? []);
   if (availableOutcomes.length === 0) throw new Error("Market has no outcomes");
-  const selection = selectEventOutcomes(availableOutcomes, cfg);
+  const selection = selectEventOutcomes(availableOutcomes, cfg, market);
   const outcomes = selection.outcomes;
 
   const stakePerOutcomeUsdt = Number(overrides.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt);
@@ -737,7 +853,7 @@ export function buildDirectBuyAllOutcomesPlan(market, cfg, overrides = {}) {
   }
   const availableOutcomes = sortOutcomes(market.outcomes ?? []);
   if (availableOutcomes.length === 0) throw new Error("Market has no outcomes");
-  const selection = selectEventOutcomes(availableOutcomes, cfg);
+  const selection = selectEventOutcomes(availableOutcomes, cfg, market);
   const outcomes = selection.outcomes;
 
   const stakePerOutcomeUsdt = Number(overrides.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt);
@@ -938,7 +1054,7 @@ export async function preSignFastBundleTransaction(cfg, bundle, runtime = null) 
   };
 }
 
-export async function executeFastBuyBundle(cfg, bundle, runtime = null) {
+export async function executeFastBuyBundle(cfg, bundle, runtime = null, buyLatencyTrace = null) {
   assertExecutionAllowed(cfg, bundle, { checkMarketStake: false });
   if (bundle.totalStakeUsdt > cfg.maxBatchStakeUsdt) {
     throw new Error(`Bundle stake ${bundle.totalStakeUsdt} exceeds MAX_BATCH_STAKE_USDT ${cfg.maxBatchStakeUsdt}`);
@@ -948,7 +1064,11 @@ export async function executeFastBuyBundle(cfg, bundle, runtime = null) {
   let preSignedError = null;
   if (bundle.preSignedFastBundleTransaction) {
     try {
-      broadcast = await broadcastPreSignedFastTransaction(cfg, bundle.preSignedFastBundleTransaction);
+      broadcast = await broadcastPreSignedFastTransaction(
+        cfg,
+        bundle.preSignedFastBundleTransaction,
+        buyLatencyTrace
+      );
     } catch (error) {
       preSignedError = error?.message ?? String(error);
     }
@@ -984,11 +1104,18 @@ export async function executeFastBuyBundle(cfg, bundle, runtime = null) {
           request,
           bundle.calls,
           runtime,
-          bundle.multicallData
+          bundle.multicallData,
+          buyLatencyTrace
         );
         broadcast.mode = `bundle_${broadcast.mode}`;
       } else {
-        broadcast = { txHash: await walletClient.writeContract(request), mode: "bundle_single", rpcCount: 1 };
+        broadcast = await writeSingleBuyTransaction(
+          cfg,
+          walletClient,
+          request,
+          "bundle_single",
+          buyLatencyTrace
+        );
       }
     } catch (error) {
       restoreRuntimeNonce(runtime, reservedRuntimeNonce);
@@ -1028,7 +1155,7 @@ export async function executeFastBuyBundle(cfg, bundle, runtime = null) {
   };
 }
 
-export async function buyOutcomesBatch(cfg, plan, runtime = null) {
+export async function buyOutcomesBatch(cfg, plan, runtime = null, buyLatencyTrace = null) {
   assertExecutionAllowed(cfg, plan);
   if (Number(plan.market.contractVersion) !== 2) {
     throw new Error("Real execution currently supports only contractVersion=2 markets");
@@ -1058,7 +1185,11 @@ export async function buyOutcomesBatch(cfg, plan, runtime = null) {
   let preSignedError = null;
   if (isFastPlan && plan.preSignedFastTransaction) {
     try {
-      broadcast = await broadcastPreSignedFastTransaction(cfg, plan.preSignedFastTransaction);
+      broadcast = await broadcastPreSignedFastTransaction(
+        cfg,
+        plan.preSignedFastTransaction,
+        buyLatencyTrace
+      );
     } catch (error) {
       preSignedError = error?.message ?? String(error);
     }
@@ -1102,8 +1233,17 @@ export async function buyOutcomesBatch(cfg, plan, runtime = null) {
   if (!broadcast) {
     try {
       broadcast = isFastPlan && cfg.fanoutBroadcast && cfg.broadcastRpcUrls.length > 1
-        ? await writeFastMulticallFanout(cfg, publicClient, account, request, calls, runtime, prebuilt?.multicallData)
-        : { txHash: await walletClient.writeContract(request), mode: "single", rpcCount: 1 };
+        ? await writeFastMulticallFanout(
+            cfg,
+            publicClient,
+            account,
+            request,
+            calls,
+            runtime,
+            prebuilt?.multicallData,
+            buyLatencyTrace
+          )
+        : await writeSingleBuyTransaction(cfg, walletClient, request, "single", buyLatencyTrace);
     } catch (error) {
       restoreRuntimeNonce(runtime, reservedRuntimeNonce);
       throw error;
@@ -1182,7 +1322,65 @@ function getReusablePrebuiltFastExecution(plan, market, receiver) {
   return prepared;
 }
 
-async function writeFastMulticallFanout(cfg, publicClient, account, request, calls, runtime, prebuiltMulticallData = null) {
+async function writeSingleBuyTransaction(cfg, walletClient, request, mode, buyLatencyTrace) {
+  const traceAttempt = beginBuyBroadcastAttempt(buyLatencyTrace, {
+    mode,
+    rpcCount: 1,
+    gasPriceWei: request.gasPrice?.toString?.() ?? null,
+    gasLimit: request.gas?.toString?.() ?? null,
+    nonce: request.nonce
+  });
+  const provider = providerLabel(cfg.rpcUrl);
+  const startedAtEpochMs = Date.now();
+  const startedAtMonoMs = performance.now();
+  try {
+    const txHash = await walletClient.writeContract(request);
+    const acceptedAtEpochMs = Date.now();
+    const first = {
+      txHash,
+      provider,
+      acceptedAtEpochMs,
+      latencyMs: roundLatencyMs(performance.now() - startedAtMonoMs)
+    };
+    recordBuyProviderResult(traceAttempt, {
+      provider,
+      ok: true,
+      startedAtEpochMs,
+      acceptedAtEpochMs,
+      latencyMs: first.latencyMs
+    });
+    markBuyBroadcastAccepted(buyLatencyTrace, traceAttempt, first);
+    markSingleBuyBroadcastSettled(buyLatencyTrace, traceAttempt);
+    return {
+      txHash,
+      mode,
+      rpcCount: 1,
+      firstProvider: provider
+    };
+  } catch (error) {
+    recordBuyProviderResult(traceAttempt, {
+      provider,
+      ok: false,
+      startedAtEpochMs,
+      settledAtEpochMs: Date.now(),
+      latencyMs: roundLatencyMs(performance.now() - startedAtMonoMs),
+      error: errorMessage(error)
+    });
+    markSingleBuyBroadcastSettled(buyLatencyTrace, traceAttempt);
+    throw error;
+  }
+}
+
+async function writeFastMulticallFanout(
+  cfg,
+  publicClient,
+  account,
+  request,
+  calls,
+  runtime,
+  prebuiltMulticallData = null,
+  buyLatencyTrace = null
+) {
   const gas = request.gas ?? BigInt(cfg.fastGasLimit);
   if (!gas || gas <= 0n) throw new Error("FAST_GAS_LIMIT is required for fanout fast broadcast");
   const gasPrice = request.gasPrice ?? await publicClient.getGasPrice();
@@ -1211,12 +1409,28 @@ async function writeFastMulticallFanout(cfg, publicClient, account, request, cal
   });
 
   const txHash = keccak256(serializedTransaction);
+  const traceAttempt = beginBuyBroadcastAttempt(buyLatencyTrace, {
+    mode: "fanout_raw",
+    rpcCount: cfg.broadcastRpcUrls.length,
+    txHash,
+    gasPriceWei: gasPrice.toString(),
+    gasLimit: gas.toString(),
+    nonce
+  });
   const attempts = cfg.broadcastRpcUrls.map((url) =>
-    sendRawTransactionVia(url, serializedTransaction, txHash, cfg.broadcastTimeoutMs)
+    sendRawTransactionViaTraced(
+      url,
+      serializedTransaction,
+      txHash,
+      cfg.broadcastTimeoutMs,
+      traceAttempt
+    )
   );
+  trackBuyBroadcastSettlements(buyLatencyTrace, traceAttempt, attempts);
 
   try {
     const first = await Promise.any(attempts);
+    markBuyBroadcastAccepted(buyLatencyTrace, traceAttempt, first);
     return {
       txHash: first.txHash,
       mode: "fanout_raw",
@@ -1299,16 +1513,32 @@ async function writeContractFanout(cfg, publicClient, account, request, { gasLim
   }
 }
 
-async function broadcastPreSignedFastTransaction(cfg, signed) {
+async function broadcastPreSignedFastTransaction(cfg, signed, buyLatencyTrace = null) {
   if (!signed?.serializedTransaction || !signed?.txHash) {
     throw new Error("Missing pre-signed fast transaction");
   }
   if (cfg.fanoutBroadcast && cfg.broadcastRpcUrls.length > 1) {
+    const traceAttempt = beginBuyBroadcastAttempt(buyLatencyTrace, {
+      mode: "presigned_fanout_raw",
+      rpcCount: cfg.broadcastRpcUrls.length,
+      txHash: signed.txHash,
+      gasPriceWei: signed.gasPrice ?? null,
+      gasLimit: signed.gas ?? null,
+      nonce: signed.nonce
+    });
     const attempts = cfg.broadcastRpcUrls.map((url) =>
-      sendRawTransactionVia(url, signed.serializedTransaction, signed.txHash, cfg.broadcastTimeoutMs)
+      sendRawTransactionViaTraced(
+        url,
+        signed.serializedTransaction,
+        signed.txHash,
+        cfg.broadcastTimeoutMs,
+        traceAttempt
+      )
     );
+    trackBuyBroadcastSettlements(buyLatencyTrace, traceAttempt, attempts);
     try {
       const first = await Promise.any(attempts);
+      markBuyBroadcastAccepted(buyLatencyTrace, traceAttempt, first);
       return {
         txHash: first.txHash,
         mode: "presigned_fanout_raw",
@@ -1324,18 +1554,165 @@ async function broadcastPreSignedFastTransaction(cfg, signed) {
     }
   }
 
-  const first = await sendRawTransactionVia(
+  const traceAttempt = beginBuyBroadcastAttempt(buyLatencyTrace, {
+    mode: "presigned_single_raw",
+    rpcCount: 1,
+    txHash: signed.txHash,
+    gasPriceWei: signed.gasPrice ?? null,
+    gasLimit: signed.gas ?? null,
+    nonce: signed.nonce
+  });
+  const singleAttempt = sendRawTransactionViaTraced(
     cfg.rpcUrl,
     signed.serializedTransaction,
     signed.txHash,
-    cfg.broadcastTimeoutMs
+    cfg.broadcastTimeoutMs,
+    traceAttempt
   );
+  trackBuyBroadcastSettlements(buyLatencyTrace, traceAttempt, [singleAttempt]);
+  const first = await singleAttempt;
+  markBuyBroadcastAccepted(buyLatencyTrace, traceAttempt, first);
   return {
     txHash: first.txHash,
     mode: "presigned_single_raw",
     rpcCount: 1,
     firstProvider: first.provider
   };
+}
+
+async function sendRawTransactionViaTraced(
+  url,
+  serializedTransaction,
+  txHash,
+  timeoutMs,
+  traceAttempt
+) {
+  const provider = providerLabel(url);
+  const startedAtEpochMs = Date.now();
+  const startedAtMonoMs = performance.now();
+  try {
+    const result = await sendRawTransactionVia(url, serializedTransaction, txHash, timeoutMs);
+    const acceptedAtEpochMs = Date.now();
+    const traced = {
+      ...result,
+      acceptedAtEpochMs,
+      latencyMs: roundLatencyMs(performance.now() - startedAtMonoMs)
+    };
+    recordBuyProviderResult(traceAttempt, {
+      provider,
+      ok: true,
+      alreadyKnown: Boolean(result.alreadyKnown),
+      startedAtEpochMs,
+      acceptedAtEpochMs,
+      latencyMs: traced.latencyMs
+    });
+    return traced;
+  } catch (error) {
+    recordBuyProviderResult(traceAttempt, {
+      provider,
+      ok: false,
+      startedAtEpochMs,
+      settledAtEpochMs: Date.now(),
+      latencyMs: roundLatencyMs(performance.now() - startedAtMonoMs),
+      error: errorMessage(error)
+    });
+    throw error;
+  }
+}
+
+function beginBuyBroadcastAttempt(trace, details) {
+  if (!trace) return null;
+  try {
+    const startedAtEpochMs = Date.now();
+    const attempt = {
+      sequence: (trace.broadcastAttempts?.length ?? 0) + 1,
+      mode: details.mode,
+      rpcCount: details.rpcCount,
+      txHash: details.txHash ?? null,
+      gasPriceWei: details.gasPriceWei ?? null,
+      gasLimit: details.gasLimit ?? null,
+      nonce: details.nonce === undefined || details.nonce === null ? null : Number(details.nonce),
+      startedAtEpochMs,
+      startedAt: new Date(startedAtEpochMs).toISOString(),
+      timerDriftMs: Number.isFinite(Number(trace.plannedBroadcastAtEpochMs))
+        ? roundLatencyMs(startedAtEpochMs - Number(trace.plannedBroadcastAtEpochMs))
+        : null,
+      firstAcceptedAtEpochMs: null,
+      firstAcceptedAt: null,
+      firstAcceptedMs: null,
+      firstProvider: null,
+      providerResults: [],
+      settledAtEpochMs: null,
+      settledAt: null
+    };
+    if (!Array.isArray(trace.broadcastAttempts)) trace.broadcastAttempts = [];
+    trace.broadcastAttempts.push(attempt);
+    if (!trace.broadcastStartedAtEpochMs) {
+      trace.broadcastStartedAtEpochMs = startedAtEpochMs;
+      trace.broadcastStartedAt = attempt.startedAt;
+      trace.timerDriftMs = attempt.timerDriftMs;
+    }
+    return attempt;
+  } catch {
+    return null;
+  }
+}
+
+function recordBuyProviderResult(traceAttempt, result) {
+  if (!traceAttempt) return;
+  try {
+    traceAttempt.providerResults.push(result);
+  } catch {
+    // Buy telemetry must never affect transaction execution.
+  }
+}
+
+function markBuyBroadcastAccepted(trace, traceAttempt, first) {
+  if (!trace || !traceAttempt || !first) return;
+  try {
+    traceAttempt.txHash = first.txHash ?? traceAttempt.txHash;
+    traceAttempt.firstAcceptedAtEpochMs = first.acceptedAtEpochMs ?? Date.now();
+    traceAttempt.firstAcceptedAt = new Date(traceAttempt.firstAcceptedAtEpochMs).toISOString();
+    traceAttempt.firstAcceptedMs = first.latencyMs ?? null;
+    traceAttempt.firstProvider = first.provider ?? null;
+    if (!trace.firstAcceptedAtEpochMs) {
+      trace.firstAcceptedAtEpochMs = traceAttempt.firstAcceptedAtEpochMs;
+      trace.firstAcceptedAt = traceAttempt.firstAcceptedAt;
+      trace.firstAcceptedMs = traceAttempt.firstAcceptedMs;
+      trace.firstProvider = traceAttempt.firstProvider;
+      trace.txHash = traceAttempt.txHash;
+    }
+  } catch {
+    // Buy telemetry must never affect transaction execution.
+  }
+}
+
+function trackBuyBroadcastSettlements(trace, traceAttempt, attempts) {
+  if (!trace || !traceAttempt) return;
+  try {
+    const settlement = Promise.allSettled(attempts).then(() => {
+      traceAttempt.settledAtEpochMs = Date.now();
+      traceAttempt.settledAt = new Date(traceAttempt.settledAtEpochMs).toISOString();
+    });
+    if (!Array.isArray(trace._settlementPromises)) trace._settlementPromises = [];
+    trace._settlementPromises.push(settlement);
+  } catch {
+    // Buy telemetry must never affect transaction execution.
+  }
+}
+
+function markSingleBuyBroadcastSettled(trace, traceAttempt) {
+  if (!trace || !traceAttempt) return;
+  try {
+    traceAttempt.settledAtEpochMs = Date.now();
+    traceAttempt.settledAt = new Date(traceAttempt.settledAtEpochMs).toISOString();
+  } catch {
+    // Buy telemetry must never affect transaction execution.
+  }
+}
+
+function roundLatencyMs(value) {
+  return Math.round(Number(value) * 1000) / 1000;
 }
 
 function shouldReusePreSignedNonce(preSignedError) {
@@ -1557,16 +1934,26 @@ export async function buildFastSellOutcomePlan(publicClient, { market, tokenId, 
   };
 }
 
-export async function approveMarketOperator(cfg, { market, owner } = {}) {
+export async function isMarketOperatorApproved(cfg, { market, owner } = {}) {
+  const { publicClient, account } = makeClients(cfg);
+  const marketAddress = getAddress(market);
+  const ownerAddress = getAddress(owner ?? account?.address);
+  return Boolean(await publicClient.readContract({
+    address: marketAddress,
+    abi: marketV2Abi,
+    functionName: "isOperator",
+    args: [ownerAddress, ADDRESSES.routerProxy]
+  }));
+}
+
+export async function approveMarketOperator(cfg, { market, owner, runtime = null } = {}) {
   const { publicClient, walletClient, account } = makeClients(cfg);
   const marketAddress = getAddress(market);
   const ownerAddress = getAddress(owner ?? account?.address);
   const router = ADDRESSES.routerProxy;
-  const currentApproval = await publicClient.readContract({
-    address: marketAddress,
-    abi: marketV2Abi,
-    functionName: "isOperator",
-    args: [ownerAddress, router]
+  const currentApproval = await isMarketOperatorApproved(cfg, {
+    market: marketAddress,
+    owner: ownerAddress
   });
   const base = {
     market: marketAddress,
@@ -1601,14 +1988,25 @@ export async function approveMarketOperator(cfg, { market, owner } = {}) {
     gas: 150000n,
     ...operatorApproveGasPriceOption(cfg)
   };
-  const broadcast = await writeContractWithOptionalFanout(
-    cfg,
-    publicClient,
-    walletClient,
-    account,
-    request,
-    { gasLimit: 150000n, mode: "operator_approval_fanout_raw" }
-  );
+  let reservedRuntimeNonce = null;
+  if (runtime?.nextNonce !== undefined) {
+    reservedRuntimeNonce = reserveRuntimeNonce(runtime);
+    request.nonce = reservedRuntimeNonce;
+  }
+  let broadcast;
+  try {
+    broadcast = await writeContractWithOptionalFanout(
+      cfg,
+      publicClient,
+      walletClient,
+      account,
+      request,
+      { gasLimit: 150000n, mode: "operator_approval_fanout_raw" }
+    );
+  } catch (error) {
+    restoreRuntimeNonce(runtime, reservedRuntimeNonce);
+    throw error;
+  }
   let receipt = null;
   let receiptError = null;
   try {
@@ -1633,7 +2031,10 @@ export async function approveMarketOperator(cfg, { market, owner } = {}) {
   };
 }
 
-export async function sellOutcome(cfg, sellPlan) {
+export async function sellOutcome(cfg, sellPlan, runtime = null, {
+  onBroadcast,
+  waitForReceipt = true
+} = {}) {
   assertSellExecutionAllowed(cfg, sellPlan);
   const { publicClient, walletClient, account } = makeClients(cfg);
   const receiver = getAddress(cfg.walletAddress || account.address);
@@ -1673,14 +2074,24 @@ export async function sellOutcome(cfg, sellPlan) {
       gas: 150000n,
       ...operatorApproveGasPriceOption(cfg)
     };
-    operatorApprovalBroadcast = await writeContractWithOptionalFanout(
-      cfg,
-      publicClient,
-      walletClient,
-      account,
-      approvalRequest,
-      { gasLimit: 150000n, mode: "sell_operator_fanout_raw" }
-    );
+    let reservedApprovalNonce = null;
+    if (runtime?.nextNonce !== undefined) {
+      reservedApprovalNonce = reserveRuntimeNonce(runtime);
+      approvalRequest.nonce = reservedApprovalNonce;
+    }
+    try {
+      operatorApprovalBroadcast = await writeContractWithOptionalFanout(
+        cfg,
+        publicClient,
+        walletClient,
+        account,
+        approvalRequest,
+        { gasLimit: 150000n, mode: "sell_operator_fanout_raw" }
+      );
+    } catch (error) {
+      restoreRuntimeNonce(runtime, reservedApprovalNonce);
+      throw error;
+    }
     operatorApprovalHash = operatorApprovalBroadcast.txHash;
     const approvalReceipt = await waitForReceiptWithConfig(cfg, operatorApprovalHash);
     if (approvalReceipt.status !== "success") throw new Error(`Operator approval reverted: ${operatorApprovalHash}`);
@@ -1718,24 +2129,45 @@ export async function sellOutcome(cfg, sellPlan) {
         account,
         ...sellGasPriceOption(cfg)
       };
-  const sellBroadcast = await writeContractWithOptionalFanout(
-    cfg,
-    publicClient,
-    walletClient,
-    account,
-    request,
-    {
-      gasLimit: BigInt(cfg.fastSellGasLimit || cfg.fastGasLimit || 1000000),
-      mode: sellPlan.skipSimulation ? "sell_fast_fanout_raw" : "sell_fanout_raw"
-    }
-  );
+  let reservedSellNonce = null;
+  if (runtime?.nextNonce !== undefined && request.nonce === undefined) {
+    reservedSellNonce = reserveRuntimeNonce(runtime);
+    request.nonce = reservedSellNonce;
+  }
+  let sellBroadcast;
+  try {
+    sellBroadcast = await writeContractWithOptionalFanout(
+      cfg,
+      publicClient,
+      walletClient,
+      account,
+      request,
+      {
+        gasLimit: BigInt(cfg.fastSellGasLimit || cfg.fastGasLimit || 1000000),
+        mode: sellPlan.skipSimulation ? "sell_fast_fanout_raw" : "sell_fanout_raw"
+      }
+    );
+  } catch (error) {
+    restoreRuntimeNonce(runtime, reservedSellNonce);
+    throw error;
+  }
   const txHash = sellBroadcast.txHash;
+  if (onBroadcast) {
+    await onBroadcast({
+      txHash,
+      mode: sellBroadcast.mode,
+      rpcCount: sellBroadcast.rpcCount,
+      firstProvider: sellBroadcast.firstProvider ?? null
+    });
+  }
   let receipt = null;
   let receiptError = null;
-  try {
-    receipt = await waitForReceiptWithConfig(cfg, txHash);
-  } catch (error) {
-    receiptError = error?.message ?? String(error);
+  if (waitForReceipt) {
+    try {
+      receipt = await waitForReceiptWithConfig(cfg, txHash);
+    } catch (error) {
+      receiptError = error?.message ?? String(error);
+    }
   }
 
   return {
@@ -1916,7 +2348,7 @@ function roundDownSellAmount(amount) {
   return (amount / minStep) * minStep;
 }
 
-async function ensureBusdtAllowance(publicClient, walletClient, owner, amount) {
+async function ensureBusdtAllowance(cfg, publicClient, walletClient, owner, amount, runtime = null) {
   const allowance = await publicClient.readContract({
     address: ADDRESSES.busdt,
     abi: erc20Abi,
@@ -1931,10 +2363,26 @@ async function ensureBusdtAllowance(publicClient, walletClient, owner, amount) {
     };
   }
 
-  return setBusdtAllowance(publicClient, walletClient, owner, MAX_UINT256, allowance);
+  return setBusdtAllowance(cfg, publicClient, walletClient, owner, MAX_UINT256, allowance, runtime);
 }
 
-async function setBusdtAllowance(publicClient, walletClient, owner, targetAmount, currentAllowance = null) {
+function assertConfiguredWalletAccount(cfg, account, context) {
+  const configured = String(cfg?.walletAddress ?? "").trim();
+  if (!configured || !account?.address) return;
+  if (configured.toLowerCase() !== account.address.toLowerCase()) {
+    throw new Error(`${context}: WALLET_ADDRESS must match PRIVATE_KEY-derived wallet`);
+  }
+}
+
+async function setBusdtAllowance(
+  cfg,
+  publicClient,
+  walletClient,
+  owner,
+  targetAmount,
+  currentAllowance = null,
+  runtime = null
+) {
   const allowance = currentAllowance ?? await publicClient.readContract({
     address: ADDRESSES.busdt,
     abi: erc20Abi,
@@ -1943,26 +2391,62 @@ async function setBusdtAllowance(publicClient, walletClient, owner, targetAmount
   });
   let resetHash = null;
   if (allowance > 0n) {
-    resetHash = await walletClient.writeContract({
+    resetHash = await writeBusdtApproval(
+      cfg,
+      publicClient,
+      walletClient,
+      {
+        address: ADDRESSES.busdt,
+        abi: erc20Abi,
+        functionName: "approve",
+        args: [ADDRESSES.routerProxy, 0n],
+        ...operatorApproveGasPriceOption(cfg)
+      },
+      runtime
+    );
+  }
+  const approveHash = await writeBusdtApproval(
+    cfg,
+    publicClient,
+    walletClient,
+    {
       address: ADDRESSES.busdt,
       abi: erc20Abi,
       functionName: "approve",
-      args: [ADDRESSES.routerProxy, 0n]
-    });
-    await publicClient.waitForTransactionReceipt({ hash: resetHash });
-  }
-  const approveHash = await walletClient.writeContract({
-    address: ADDRESSES.busdt,
-    abi: erc20Abi,
-    functionName: "approve",
-    args: [ADDRESSES.routerProxy, targetAmount]
-  });
-  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+      args: [ADDRESSES.routerProxy, targetAmount],
+      ...operatorApproveGasPriceOption(cfg)
+    },
+    runtime
+  );
   return {
     allowance: formatUnits(targetAmount, 18),
     approveHash,
     resetHash
   };
+}
+
+async function writeBusdtApproval(cfg, publicClient, walletClient, request, runtime = null) {
+  let reservedNonce = null;
+  if (runtime?.nextNonce !== undefined) {
+    reservedNonce = reserveRuntimeNonce(runtime);
+    request.nonce = reservedNonce;
+  }
+  let txHash;
+  try {
+    txHash = await walletClient.writeContract(request);
+  } catch (error) {
+    restoreRuntimeNonce(runtime, reservedNonce);
+    throw error;
+  }
+  const receipt = await publicClient.waitForTransactionReceipt({
+    hash: txHash,
+    timeout: cfg.receiptWatchTimeoutMs,
+    pollingInterval: cfg.receiptWatchPollingMs
+  });
+  if (receipt.status !== "success") {
+    throw new Error(`BUSDT approval reverted: ${txHash}`);
+  }
+  return txHash;
 }
 
 function encodeDataGuess(otDeltaGuessOffchain, maxIterations, eps) {
@@ -2002,6 +2486,15 @@ function providerLabel(url) {
   } catch {
     return "unknown";
   }
+}
+
+function errorMessage(error) {
+  const parts = [
+    error?.shortMessage,
+    error?.details,
+    error?.message
+  ].filter(Boolean);
+  return parts.length ? parts.join(": ") : String(error);
 }
 
 function sortOutcomes(outcomes) {

@@ -6,16 +6,30 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { readConfig } from "./config.js";
-import { curveInfo, fetchActivity, fetchMarket, fetchMarkets, fetchOpenPositions, makeClients, quoteBuyAllOutcomes } from "./fortytwo.js";
-import { isBlockedMarketAddress, isEventMarket, isPriceMarket, isTestingMarket, marketCurveBlockReason, marketDurationHours, passesMinimumDuration } from "./event-strategy.js";
+import { getAddress, parseAbi } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { readConfig, saveManualOutcomeSelections } from "./config.js";
+import {
+  fetchActivity,
+  fetchMarket,
+  fetchMarkets,
+  fetchOpenPositions,
+  isMarketOperatorApproved,
+  makeClients,
+  quoteBuyAllOutcomes
+} from "./fortytwo.js";
+import { isBlockedMarketAddress, isEventMarket, isPriceMarket, isTestingMarket, isWorldCupScoreMarket, marketDurationHours, passesMinimumDuration } from "./event-strategy.js";
 import { markdownLine, notifyPushPlusSafe, shortHash } from "./pushplus.js";
+import {
+  createWalletActionTask,
+  listWalletActionTasks,
+  readWalletActionTask,
+  walletActionTaskStatus
+} from "./wallet-action-queue.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(rootDir, "public");
-const dashboardConfig = readConfig();
-const botWallet = process.env.DASHBOARD_WALLET ?? dashboardConfig.walletAddress ?? "0x244FcE72db40B69C4DA4D41F0a76E25B24CA201b";
 const host = process.env.DASHBOARD_HOST ?? "127.0.0.1";
 const port = Number(process.env.DASHBOARD_PORT ?? 4242);
 const launchLabel = "com.myandong.42space-event-arm";
@@ -24,6 +38,10 @@ const fillsFile = path.join(rootDir, "data/fills.jsonl");
 const actionsFile = path.join(rootDir, "data/dashboard-actions.jsonl");
 const localEnvFile = resolveConfigEditorFile();
 const localEnvFileLabel = displayConfigEditorFile(localEnvFile);
+const walletProfilesDir = String(process.env.WALLET_PROFILES_DIR ?? "").trim();
+const walletProfilesMetadataFile = walletProfilesDir ? path.join(walletProfilesDir, "profiles.json") : "";
+const walletActiveProfileFile = walletProfilesDir ? path.join(walletProfilesDir, "active-profile") : "";
+const walletActiveKeyFile = walletProfilesDir ? path.join(walletProfilesDir, "active.key") : "";
 const runtimeStatusFile = resolveRuntimeStatusFile();
 const dashboardPassword = process.env.DASHBOARD_PASSWORD ?? "";
 const dashboardAuthSecret = process.env.DASHBOARD_AUTH_SECRET || dashboardPassword;
@@ -32,23 +50,30 @@ const dashboardAuthCookie = process.env.DASHBOARD_AUTH_COOKIE ?? "ft42_dashboard
 const dashboardAuthMaxAgeSeconds = Number(process.env.DASHBOARD_AUTH_MAX_AGE_SECONDS ?? 604800);
 const loginFailures = new Map();
 const marketMintTopic = "0xf2e90b10bd525a6b1fe02d09e8133d3e38c9a87376ed4850904ca21e6e27abec";
-let buySpeedCache = null;
-let buySpeedPromise = null;
+const curvePremiumWindowAbi = parseAbi(["function WINDOW_STATIC() view returns (uint256)"]);
+const curvePremiumWindowCache = new Map();
+const curvePremiumWindowCacheMs = Number(process.env.DASHBOARD_CURVE_WINDOW_CACHE_MS ?? 3600000);
+const curvePremiumWindowTimeoutMs = Number(process.env.DASHBOARD_CURVE_WINDOW_TIMEOUT_MS ?? 2500);
+const buySpeedCaches = new Map();
+const buySpeedPromises = new Map();
 let positionsCache = null;
-let positionsPromise = null;
+const positionsPromises = new Map();
 const marketDiagnosticsCache = new Map();
+const operatorApprovalStatusCache = new Map();
 
 const configFields = [
+  { key: "WALLET_ADDRESS", type: "address" },
   { key: "DRY_RUN", type: "boolean" },
   { key: "EXECUTE", type: "boolean" },
   { key: "I_UNDERSTAND_42_PRICE_MARKET_RISK", type: "ack" },
   { key: "I_AM_NOT_IN_RESTRICTED_JURISDICTION", type: "ack" },
   { key: "STAKE_PER_OUTCOME_USDT", type: "number", min: 0.01 },
   { key: "EVENT_OUTCOME_COUNT", type: "integer", min: 1 },
+  { key: "MAX_STAKE_USDT", type: "number", min: 0.01 },
   { key: "MAX_MARKET_STAKE_USDT", type: "number", min: 0.01 },
   { key: "MAX_BATCH_STAKE_USDT", type: "number", min: 0.01 },
   { key: "EVENT_OPEN_WINDOW_SECONDS", type: "integer", min: 1 },
-  { key: "EVENT_BUY_DELAY_SECONDS", type: "integer", min: 0 },
+  { key: "EVENT_BUY_DELAY_SECONDS", type: "number", min: 0 },
   { key: "ARM_CATCH_UP_AFTER_FUNDING", type: "boolean" },
   { key: "ARM_CATCH_UP_WINDOW_MS", type: "integer", min: 0 },
   { key: "REQUIRE_REST_BEFORE_BUY", type: "boolean" },
@@ -58,6 +83,7 @@ const configFields = [
   { key: "GAS_PRICE_GWEI", type: "number", min: 0.01 },
   { key: "SELL_GAS_PRICE_GWEI", type: "number", min: 0.01 },
   { key: "OPERATOR_APPROVE_GAS_PRICE_GWEI", type: "number", min: 0.01 },
+  { key: "AUTO_APPROVE_MARKET_AFTER_BUY", type: "boolean" },
   { key: "SLIPPAGE_BPS", type: "integer", min: 0, max: 5000 },
   { key: "FAST_SELL_GAS_LIMIT", type: "integer", min: 0 },
   { key: "EVENT_DISCOVERY", type: "enum", values: ["ws", "chain", "rest"] },
@@ -65,11 +91,12 @@ const configFields = [
   { key: "REST_DISCOVERY_POLL_MS", type: "integer", min: 1 },
   { key: "WATCH_SCAN_LIMIT", type: "integer", min: 1 },
   { key: "MIN_MARKET_DURATION_HOURS", type: "number", min: 0 },
+  { key: "WORLD_CUP_SCORE_MODE", type: "boolean" },
   { key: "MARKET_ADDRESS_BLOCKLIST", type: "text" },
   { key: "MARKET_QUESTION_BLOCKLIST", type: "text" },
   { key: "ALLOW_ONCHAIN_ONLY_MARKETS", type: "boolean" },
   { key: "EVENT_BUY_MODE", type: "enum", values: ["fast", "quoted"] },
-  { key: "EVENT_OUTCOME_SELECTION", type: "enum", values: ["lowest_odds", "all"] },
+  { key: "EVENT_OUTCOME_SELECTION", type: "enum", values: ["lowest_odds", "last_outcomes", "all"] },
   { key: "EVENT_OUTCOME_SELECTION_FALLBACK", type: "enum", values: ["token_order", "error"] },
   { key: "WATCH_BUY_EXISTING", type: "boolean" },
   { key: "AUTO_SELL_ENABLED", type: "boolean" },
@@ -108,11 +135,17 @@ const configFields = [
   { key: "AUTO_SELL_BREAKEVEN_START_DELAY_SECONDS", type: "integer", min: 0 },
   { key: "AUTO_SELL_BREAKEVEN_ARM_PROFIT_PCT", type: "number", min: 0 },
   { key: "AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT", type: "number", min: -100 },
-  { key: "AUTO_SELL_BREAKEVEN_PERCENT", type: "number", min: 1, max: 100 }
+  { key: "AUTO_SELL_BREAKEVEN_PERCENT", type: "number", min: 1, max: 100 },
+  { key: "AUTO_SELL_TIMED_EXIT_ENABLED", type: "boolean" },
+  { key: "AUTO_SELL_TIMED_EXIT_AFTER_OPEN_SECONDS", type: "integer", min: 0 },
+  { key: "AUTO_SELL_TIMED_EXIT_PERCENT", type: "number", min: 1, max: 100 }
 ];
 
 let overviewCache = null;
 let overviewPromise = null;
+let dashboardCacheGeneration = 0;
+let walletSwitchPromise = null;
+let activeWalletActions = 0;
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -159,23 +192,41 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/market/exclusion" && req.method === "POST") {
       return sendJson(res, updateMarketExclusion(await readJsonBody(req)));
     }
+    if (url.pathname === "/api/market/outcomes" && req.method === "POST") {
+      return sendJson(res, await updateMarketOutcomeSelection(await readJsonBody(req)));
+    }
     if (url.pathname === "/api/watch/restart" && req.method === "POST") {
+      assertWalletSwitchIdle();
       return sendJson(res, await restartWatchService());
     }
+    if (url.pathname === "/api/wallet/activate" && req.method === "POST") {
+      return sendJson(res, await activateWalletProfile(await readJsonBody(req)));
+    }
     if (url.pathname === "/api/approve" && req.method === "POST") {
-      return sendJson(res, await approveRouter(await readJsonBody(req)));
+      return sendJson(res, await enqueueRouterApproval(await readJsonBody(req)));
     }
     if (url.pathname === "/api/operator/approve" && req.method === "POST") {
-      return sendJson(res, await approveOperator(await readJsonBody(req)));
+      return sendJson(res, await enqueueOperatorApproval(await readJsonBody(req)));
     }
     if (url.pathname === "/api/sell/quote" && req.method === "POST") {
       return sendJson(res, await sellQuote(await readJsonBody(req)));
     }
     if (url.pathname === "/api/sell/execute" && req.method === "POST") {
-      return sendJson(res, await sellExecute(await readJsonBody(req)));
+      return sendJson(res, await enqueueManualSell(await readJsonBody(req)));
+    }
+    if (url.pathname.startsWith("/api/wallet-actions/") && req.method === "GET") {
+      const taskId = url.pathname.slice("/api/wallet-actions/".length);
+      return sendJson(res, walletActionTaskResponse(taskId));
     }
     sendJson(res, { ok: false, message: "Not found" }, 404);
   } catch (error) {
+    console.error(JSON.stringify({
+      level: "dashboard-error",
+      method: req.method,
+      path: req.url,
+      message: cleanError(error),
+      at: new Date().toISOString()
+    }));
     sendJson(res, { ok: false, message: cleanError(error) }, 500);
   }
 });
@@ -188,37 +239,52 @@ async function getOverview({ force = false } = {}) {
   const now = Date.now();
   if (!force && overviewCache && now - overviewCache.at < 4000) return overviewCache.data;
   if (overviewPromise) return overviewPromise;
-  overviewPromise = buildOverview()
+  const generation = dashboardCacheGeneration;
+  const promise = buildOverview()
     .then((data) => {
-      overviewCache = { at: Date.now(), data };
+      if (generation === dashboardCacheGeneration) {
+        overviewCache = { at: Date.now(), data };
+      }
       return data;
     })
     .finally(() => {
-      overviewPromise = null;
+      if (overviewPromise === promise) overviewPromise = null;
     });
-  return overviewPromise;
+  overviewPromise = promise;
+  return promise;
 }
 
 async function buildOverview() {
   const cfg = readConfig();
+  const dashboardWallet = dashboardWalletState(cfg);
+  const walletAddress = dashboardWallet.address;
   const [status, positions, walletActivity, newMarkets, bot, buySpeed] = await Promise.all([
-    runEvent(["status", "--wallet", botWallet], { timeoutMs: 30000 }),
-    runEvent(["positions", "--wallet", botWallet], { timeoutMs: 30000 }),
-    fetchUserActivity(),
+    runEvent(["status", "--wallet", walletAddress], { timeoutMs: 30000 }),
+    runEvent(["positions", "--wallet", walletAddress], { timeoutMs: 30000 }),
+    fetchUserActivity(walletAddress),
     fetchNewMarketsFeed(),
     getBotState(),
-    getBuySpeedStats(cfg)
+    getBuySpeedStats(cfg, walletAddress)
   ]);
   const marketFeed = await mergeBoughtMarketsIntoFeed(cfg, newMarkets, walletActivity);
-  const holdings = normalizeHoldings(positions);
-  const recentRows = readRecentActivity();
+  const curvePremiumWindows = await loadCurvePremiumWindows(cfg, [
+    ...marketFeed,
+    ...(status.future ?? [])
+  ]);
+  const holdings = await enrichHoldingsOperatorApprovals(
+    normalizeHoldings(positions),
+    cfg,
+    walletAddress
+  );
+  const recentRows = readRecentActivity(walletAddress);
   return {
     ok: true,
     updatedAt: new Date().toISOString(),
+    dashboardWallet,
     bot: normalizeBot(bot, status),
     wallet: normalizeWallet(status.wallet),
-    next: normalizeNext(status),
-    newMarkets: normalizeNewMarkets(marketFeed, status, walletActivity, recentRows),
+    next: normalizeNext(status, curvePremiumWindows),
+    newMarkets: normalizeNewMarkets(marketFeed, status, walletActivity, recentRows, curvePremiumWindows, walletAddress),
     holdings,
     analytics: buildAnalytics(positions, walletActivity),
     activity: normalizeActivity(recentRows, walletActivity),
@@ -236,24 +302,30 @@ async function buildOverview() {
 async function getPositionsSnapshot({ force = false } = {}) {
   const now = Date.now();
   const cacheMs = Number(process.env.DASHBOARD_POSITIONS_CACHE_MS ?? 1000);
-  if (!force && positionsCache && now - positionsCache.at < cacheMs) return positionsCache.data;
-  if (positionsPromise) return positionsPromise;
-  positionsPromise = buildPositionsSnapshot()
+  const walletAddress = currentDashboardWallet();
+  const walletKey = normAddress(walletAddress);
+  if (!force && positionsCache && positionsCache.wallet === walletKey && now - positionsCache.at < cacheMs) return positionsCache.data;
+  if (positionsPromises.has(walletKey)) return positionsPromises.get(walletKey);
+  const generation = dashboardCacheGeneration;
+  const promise = buildPositionsSnapshot(walletAddress)
     .then((data) => {
-      positionsCache = { at: Date.now(), data };
+      if (generation === dashboardCacheGeneration) {
+        positionsCache = { at: Date.now(), wallet: walletKey, data };
+      }
       return data;
     })
     .finally(() => {
-      positionsPromise = null;
+      if (positionsPromises.get(walletKey) === promise) positionsPromises.delete(walletKey);
     });
-  return positionsPromise;
+  positionsPromises.set(walletKey, promise);
+  return promise;
 }
 
-async function buildPositionsSnapshot() {
+async function buildPositionsSnapshot(walletAddress = currentDashboardWallet()) {
   const startedAt = Date.now();
   const cfg = readConfig();
   const rawRows = await fetchOpenPositions(cfg, {
-    user: botWallet,
+    user: walletAddress,
     limit: Number(process.env.DASHBOARD_POSITIONS_LIMIT ?? 100)
   });
   const positions = rawRows.map(summarizeDashboardPosition);
@@ -268,7 +340,7 @@ async function buildPositionsSnapshot() {
   );
   const raw = {
     level: "dashboard-positions",
-    wallet: botWallet,
+    wallet: walletAddress,
     count: positions.length,
     totals: {
       costBasisUsdt: roundFixed(totals.costBasisUsdt),
@@ -277,12 +349,16 @@ async function buildPositionsSnapshot() {
     },
     positions
   };
-  const holdings = normalizeHoldings(raw);
+  const holdings = await enrichHoldingsOperatorApprovals(
+    normalizeHoldings(raw),
+    cfg,
+    walletAddress
+  );
   return {
     ok: true,
     updatedAt: new Date().toISOString(),
     elapsedMs: Date.now() - startedAt,
-    wallet: botWallet,
+    wallet: walletAddress,
     holdings,
     cards: positionSummaryCards(raw)
   };
@@ -328,7 +404,20 @@ function getConfigEditorState() {
   };
 }
 
+function clearDashboardCaches() {
+  dashboardCacheGeneration += 1;
+  overviewCache = null;
+  overviewPromise = null;
+  positionsCache = null;
+  positionsPromises.clear();
+  buySpeedCaches.clear();
+  buySpeedPromises.clear();
+  marketDiagnosticsCache.clear();
+  operatorApprovalStatusCache.clear();
+}
+
 function saveConfigEditorState(body) {
+  assertWalletSwitchIdle();
   const values = body?.values;
   if (!values || typeof values !== "object" || Array.isArray(values)) {
     throw new Error("Missing config values");
@@ -346,11 +435,19 @@ function saveConfigEditorState(body) {
 
   validateConfigEditorPatch(parsed, readConfig());
 
+  if (Object.hasOwn(parsed, "WALLET_ADDRESS")) {
+    const profiles = walletProfilesState();
+    const active = profiles.profiles.find((profile) => profile.active);
+    if (profiles.available && active && normAddress(parsed.WALLET_ADDRESS) !== normAddress(active.address)) {
+      throw new Error("钱包档案已启用，请使用钱包切换器同时切换地址和私钥");
+    }
+  }
+
   writeEnvValues(localEnvFile, parsed);
   for (const [key, value] of Object.entries(parsed)) {
     process.env[key] = value;
   }
-  overviewCache = null;
+  clearDashboardCaches();
 
   return {
     ok: true,
@@ -373,6 +470,31 @@ function validateConfigEditorPatch(parsed, cfg) {
   ) {
     throw new Error("开盘后延迟买入秒必须小于开盘容错截止秒，否则 Watch 会启动失败");
   }
+
+  const stakePerOutcomeUsdt = Number(
+    parsed.STAKE_PER_OUTCOME_USDT ?? cfg.stakePerOutcomeUsdt
+  );
+  const maxStakeUsdt = Number(parsed.MAX_STAKE_USDT ?? cfg.maxStakeUsdt);
+  if (
+    Number.isFinite(stakePerOutcomeUsdt) &&
+    Number.isFinite(maxStakeUsdt) &&
+    stakePerOutcomeUsdt > maxStakeUsdt
+  ) {
+    throw new Error(`每档金额 ${stakePerOutcomeUsdt}U 不能超过单档上限 ${maxStakeUsdt}U`);
+  }
+
+  const eventOutcomeCount = Number(parsed.EVENT_OUTCOME_COUNT ?? cfg.eventOutcomeCount);
+  const maxMarketStakeUsdt = Number(parsed.MAX_MARKET_STAKE_USDT ?? cfg.maxMarketStakeUsdt);
+  if (
+    Number.isFinite(stakePerOutcomeUsdt) &&
+    Number.isFinite(eventOutcomeCount) &&
+    Number.isFinite(maxMarketStakeUsdt) &&
+    stakePerOutcomeUsdt * eventOutcomeCount > maxMarketStakeUsdt
+  ) {
+    throw new Error(
+      `计划单场金额 ${stakePerOutcomeUsdt * eventOutcomeCount}U 不能超过单场上限 ${maxMarketStakeUsdt}U`
+    );
+  }
 }
 
 async function diagnoseMarket(body) {
@@ -385,7 +507,7 @@ async function diagnoseMarket(body) {
   if (cached && Date.now() - cached.at < cacheMs) return cached.data;
 
   const cfg = readConfig();
-  const evidence = localMarketExecutionEvidence(readJsonl(fillsFile, 2000), []).get(key) ?? null;
+  const evidence = localMarketExecutionEvidence(readJsonl(fillsFile, 2000), [], currentDashboardWallet(cfg)).get(key) ?? null;
   let market = null;
   let restError = null;
   try {
@@ -446,7 +568,7 @@ function updateMarketExclusion(body) {
   const value = next.join(",");
   writeEnvValues(localEnvFile, { MARKET_ADDRESS_BLOCKLIST: value });
   process.env.MARKET_ADDRESS_BLOCKLIST = value;
-  overviewCache = null;
+  clearDashboardCaches();
 
   return {
     ok: true,
@@ -456,6 +578,53 @@ function updateMarketExclusion(body) {
     blocklist: next,
     config: configEditorPayload(readConfig())
   };
+}
+
+async function updateMarketOutcomeSelection(body) {
+  const marketAddress = String(body?.market ?? "").trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(marketAddress)) throw new Error("Missing market");
+  if (!Array.isArray(body?.tokenIds)) throw new Error("Missing tokenIds");
+
+  const tokenIds = [...new Set(body.tokenIds.map(normalizeDashboardTokenId).filter(Boolean))];
+  if (tokenIds.length > 50) throw new Error("Too many manually selected outcomes");
+
+  const cfg = readConfig();
+  const key = normAddress(marketAddress);
+  if (tokenIds.length > 0) {
+    const market = await fetchMarket(cfg, marketAddress);
+    const availableTokenIds = new Set((market?.outcomes ?? []).map((outcome) => String(outcome.tokenId ?? "")));
+    const missing = tokenIds.filter((tokenId) => !availableTokenIds.has(tokenId));
+    if (missing.length > 0) {
+      throw new Error(`Manual outcome selection does not belong to this market: ${missing.join(",")}`);
+    }
+  }
+  const selections = {
+    ...(cfg.manualOutcomeSelections ?? {})
+  };
+  if (tokenIds.length > 0) {
+    selections[key] = tokenIds;
+  } else {
+    delete selections[key];
+  }
+  const saved = saveManualOutcomeSelections(cfg.manualOutcomeSelectionsFile, selections);
+  clearDashboardCaches();
+
+  return {
+    ok: true,
+    market: marketAddress,
+    tokenIds: saved[key] ?? [],
+    manualOutcomeSelectionMarkets: Object.keys(saved).length
+  };
+}
+
+function normalizeDashboardTokenId(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/.test(text)) return "";
+  try {
+    return BigInt(text).toString();
+  } catch {
+    return "";
+  }
 }
 
 async function diagnoseMarketQuote(cfg, market) {
@@ -552,7 +721,7 @@ async function restartWatchService() {
   }
 
   const controller = await restartSystemdService(systemdService);
-  overviewCache = null;
+  clearDashboardCaches();
   const bot = await getSystemdBotState();
   return {
     ok: true,
@@ -584,13 +753,19 @@ function configEditorPayload(cfg) {
   for (const field of configFields) {
     values[field.key] = raw[field.key] ?? configValueFromRuntime(field.key, cfg);
   }
+  const wallet = dashboardWalletState(cfg);
   return {
     file: localEnvFileLabel,
     values,
+    walletProfiles: walletProfilesState(),
     runtime: {
       dryRun: cfg.dryRun,
       execute: cfg.execute,
-      walletAddress: cfg.walletAddress || null,
+      walletAddress: wallet.address,
+      configuredWalletAddress: cfg.walletAddress || null,
+      privateKeyAddress: wallet.privateKeyAddress,
+      walletMatchesPrivateKey: wallet.matchesPrivateKey,
+      walletSource: wallet.source,
       privateKeyLoaded: Boolean(cfg.privateKey),
       rpcConfigured: Boolean(cfg.rpcUrl),
       wsConfigured: Boolean(cfg.wsUrl)
@@ -600,12 +775,14 @@ function configEditorPayload(cfg) {
 
 function configValueFromRuntime(key, cfg) {
   const mapping = {
+    WALLET_ADDRESS: cfg.walletAddress,
     DRY_RUN: cfg.dryRun ? "1" : "0",
     EXECUTE: cfg.execute ? "1" : "0",
     I_UNDERSTAND_42_PRICE_MARKET_RISK: cfg.riskAck === "YES" ? "YES" : "NO",
     I_AM_NOT_IN_RESTRICTED_JURISDICTION: cfg.eligibilityAck === "YES" ? "YES" : "NO",
     STAKE_PER_OUTCOME_USDT: cfg.stakePerOutcomeUsdt,
     EVENT_OUTCOME_COUNT: cfg.eventOutcomeCount,
+    MAX_STAKE_USDT: cfg.maxStakeUsdt,
     MAX_MARKET_STAKE_USDT: cfg.maxMarketStakeUsdt,
     MAX_BATCH_STAKE_USDT: cfg.maxBatchStakeUsdt,
     EVENT_OPEN_WINDOW_SECONDS: cfg.eventOpenWindowSeconds,
@@ -619,6 +796,7 @@ function configValueFromRuntime(key, cfg) {
     GAS_PRICE_GWEI: cfg.gasPriceGwei,
     SELL_GAS_PRICE_GWEI: cfg.sellGasPriceGwei,
     OPERATOR_APPROVE_GAS_PRICE_GWEI: cfg.operatorApproveGasPriceGwei,
+    AUTO_APPROVE_MARKET_AFTER_BUY: cfg.autoApproveMarketAfterBuy ? "1" : "0",
     SLIPPAGE_BPS: cfg.slippageBps,
     FAST_SELL_GAS_LIMIT: cfg.fastSellGasLimit,
     EVENT_DISCOVERY: cfg.eventDiscovery,
@@ -626,6 +804,7 @@ function configValueFromRuntime(key, cfg) {
     REST_DISCOVERY_POLL_MS: cfg.restDiscoveryPollMs,
     WATCH_SCAN_LIMIT: cfg.watchScanLimit,
     MIN_MARKET_DURATION_HOURS: cfg.minMarketDurationHours,
+    WORLD_CUP_SCORE_MODE: cfg.worldCupScoreMode ? "1" : "0",
     MARKET_ADDRESS_BLOCKLIST: cfg.marketAddressBlocklist.join(","),
     MARKET_QUESTION_BLOCKLIST: cfg.marketQuestionBlocklist.join(","),
     ALLOW_ONCHAIN_ONLY_MARKETS: cfg.allowOnchainOnlyMarkets ? "1" : "0",
@@ -669,7 +848,10 @@ function configValueFromRuntime(key, cfg) {
     AUTO_SELL_BREAKEVEN_START_DELAY_SECONDS: cfg.autoSellBreakevenStartDelaySeconds,
     AUTO_SELL_BREAKEVEN_ARM_PROFIT_PCT: cfg.autoSellBreakevenArmProfitPct,
     AUTO_SELL_BREAKEVEN_EXIT_PROFIT_PCT: cfg.autoSellBreakevenExitProfitPct,
-    AUTO_SELL_BREAKEVEN_PERCENT: cfg.autoSellBreakevenPercent
+    AUTO_SELL_BREAKEVEN_PERCENT: cfg.autoSellBreakevenPercent,
+    AUTO_SELL_TIMED_EXIT_ENABLED: cfg.autoSellTimedExitEnabled ? "1" : "0",
+    AUTO_SELL_TIMED_EXIT_AFTER_OPEN_SECONDS: cfg.autoSellTimedExitAfterOpenSeconds,
+    AUTO_SELL_TIMED_EXIT_PERCENT: cfg.autoSellTimedExitPercent
   };
   return String(mapping[key] ?? "");
 }
@@ -683,6 +865,15 @@ function parseConfigField(field, value) {
       throw new Error(`${field.key} must be one of ${field.values.join(", ")}`);
     }
     return normalized;
+  }
+  if (field.type === "address") {
+    const normalized = String(value ?? "").trim();
+    if (!normalized) return "";
+    try {
+      return getAddress(normalized);
+    } catch {
+      throw new Error(`${field.key} must be a valid 0x wallet address`);
+    }
   }
   if (field.type === "integer" || field.type === "number") {
     const number = Number(value);
@@ -732,7 +923,15 @@ function writeEnvValues(file, values) {
     if (updated.length > 0 && updated.at(-1) !== "") updated.push("");
     updated.push(`${key}=${formatEnvValue(values[key])}`);
   }
-  fs.writeFileSync(file, `${updated.join("\n").replace(/\s+$/u, "")}\n`);
+  const mode = fs.existsSync(file) ? fs.statSync(file).mode & 0o777 : 0o600;
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, `${updated.join("\n").replace(/\s+$/u, "")}\n`, { mode });
+    fs.renameSync(temporary, file);
+    fs.chmodSync(file, mode);
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
 }
 
 function resolveConfigEditorFile() {
@@ -743,6 +942,247 @@ function displayConfigEditorFile(file) {
   const relative = path.relative(rootDir, file);
   if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) return relative;
   return file;
+}
+
+function currentDashboardWallet(cfg = readConfig()) {
+  return dashboardWalletState(cfg).address;
+}
+
+function walletProfilesState() {
+  if (!walletProfilesDir) {
+    return { available: false, activeId: null, profiles: [] };
+  }
+  try {
+    const profiles = loadWalletProfilesInternal();
+    const activeId = readActiveWalletProfileId(profiles);
+    return {
+      available: profiles.length > 0,
+      activeId,
+      profiles: profiles.map((profile) => ({
+        id: profile.id,
+        label: profile.label,
+        address: profile.address,
+        active: profile.id === activeId
+      }))
+    };
+  } catch (error) {
+    return {
+      available: false,
+      activeId: null,
+      profiles: [],
+      error: cleanError(error)
+    };
+  }
+}
+
+function loadWalletProfilesInternal() {
+  if (!walletProfilesDir || !fs.existsSync(walletProfilesDir)) return [];
+  const labels = readWalletProfileLabels();
+  const files = fs.readdirSync(walletProfilesDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".key") && entry.name !== "active.key")
+    .map((entry) => entry.name)
+    .sort();
+  return files.map((name) => {
+    const id = name.slice(0, -4);
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`Invalid wallet profile id: ${id}`);
+    const keyFile = path.join(walletProfilesDir, name);
+    const privateKey = readWalletProfilePrivateKey(keyFile);
+    return {
+      id,
+      label: labels[id] || id,
+      address: getAddress(privateKeyToAccount(privateKey).address),
+      keyFile
+    };
+  });
+}
+
+function readWalletProfileLabels() {
+  if (!walletProfilesMetadataFile || !fs.existsSync(walletProfilesMetadataFile)) return {};
+  const parsed = JSON.parse(fs.readFileSync(walletProfilesMetadataFile, "utf8"));
+  return parsed?.labels && typeof parsed.labels === "object" && !Array.isArray(parsed.labels)
+    ? parsed.labels
+    : {};
+}
+
+function readWalletProfilePrivateKey(file) {
+  const stat = fs.statSync(file);
+  if (!stat.isFile()) throw new Error(`Wallet profile is not a file: ${file}`);
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+    throw new Error(`Wallet profile must only be readable by its owner: ${file}`);
+  }
+  const value = fs.readFileSync(file, "utf8").trim();
+  if (!/^0x[0-9a-fA-F]{64}$/.test(value)) throw new Error(`Invalid wallet profile: ${path.basename(file)}`);
+  return value;
+}
+
+function readActiveWalletProfileId(profiles) {
+  const configured = walletActiveProfileFile && fs.existsSync(walletActiveProfileFile)
+    ? fs.readFileSync(walletActiveProfileFile, "utf8").trim()
+    : "";
+  if (profiles.some((profile) => profile.id === configured)) return configured;
+  if (walletActiveKeyFile && fs.existsSync(walletActiveKeyFile)) {
+    const activeRealPath = fs.realpathSync(walletActiveKeyFile);
+    const matched = profiles.find((profile) => fs.realpathSync(profile.keyFile) === activeRealPath);
+    if (matched) return matched.id;
+  }
+  return null;
+}
+
+async function activateWalletProfile(body) {
+  if (walletSwitchPromise) throw new Error("钱包正在切换，请等待当前操作完成");
+  if (activeWalletActions > 0) throw new Error("存在正在执行的授权或卖出，请完成后再切换钱包");
+  const promise = Promise.resolve().then(() => activateWalletProfileUnlocked(body));
+  walletSwitchPromise = promise;
+  try {
+    return await promise;
+  } finally {
+    if (walletSwitchPromise === promise) walletSwitchPromise = null;
+  }
+}
+
+async function activateWalletProfileUnlocked(body) {
+  if (process.platform !== "linux") throw new Error("钱包档案切换只允许在 Linux VPS 上执行");
+  if (body?.confirm !== "SWITCH_WALLET") throw new Error("缺少钱包切换确认");
+  const id = String(body?.profileId ?? "").trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error("无效的钱包档案");
+
+  const profiles = loadWalletProfilesInternal();
+  const target = profiles.find((profile) => profile.id === id);
+  if (!target) throw new Error("钱包档案不存在");
+  const previousId = readActiveWalletProfileId(profiles);
+  const previous = profiles.find((profile) => profile.id === previousId) ?? null;
+  setActiveWalletProfile(target);
+  writeEnvValues(localEnvFile, { WALLET_ADDRESS: target.address });
+  process.env.PRIVATE_KEY = "";
+  process.env.PRIVATE_KEY_FILE = walletActiveKeyFile;
+  process.env.WALLET_ADDRESS = target.address;
+
+  try {
+    const switched = dashboardWalletState(readConfig());
+    if (!switched.matchesPrivateKey || normAddress(switched.address) !== normAddress(target.address)) {
+      throw new Error("钱包档案地址与私钥校验失败");
+    }
+    const restart = await restartWatchService();
+    clearDashboardCaches();
+    return {
+      ok: true,
+      walletProfiles: walletProfilesState(),
+      config: configEditorPayload(readConfig()),
+      bot: restart.bot,
+      message: `已切换到 ${target.label}，Watch 已重启`
+    };
+  } catch (error) {
+    if (previous) {
+      setActiveWalletProfile(previous);
+      writeEnvValues(localEnvFile, { WALLET_ADDRESS: previous.address });
+      process.env.WALLET_ADDRESS = previous.address;
+      try {
+        await restartSystemdService(systemdService);
+      } catch {
+        // Preserve the original switch error; service state is reported by the caller.
+      }
+    }
+    clearDashboardCaches();
+    throw error;
+  }
+}
+
+function setActiveWalletProfile(profile) {
+  ensureParentDir(walletActiveKeyFile);
+  const temporaryLink = `${walletActiveKeyFile}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.symlinkSync(profile.keyFile, temporaryLink);
+    fs.renameSync(temporaryLink, walletActiveKeyFile);
+  } finally {
+    if (fs.existsSync(temporaryLink)) fs.unlinkSync(temporaryLink);
+  }
+  writeAtomicPrivateText(walletActiveProfileFile, `${profile.id}\n`, 0o600);
+}
+
+function writeAtomicPrivateText(file, text, mode = 0o600) {
+  ensureParentDir(file);
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(temporary, text, { mode });
+  fs.renameSync(temporary, file);
+  fs.chmodSync(file, mode);
+}
+
+function dashboardWalletState(cfg = readConfig()) {
+  const privateKeyAddress = privateKeyWalletAddress(cfg);
+  const candidates = [
+    { source: "WALLET_ADDRESS", address: cfg.walletAddress },
+    { source: "DASHBOARD_WALLET", address: process.env.DASHBOARD_WALLET },
+    { source: "PRIVATE_KEY", address: privateKeyAddress }
+  ];
+  for (const candidate of candidates) {
+    const address = normalizeWalletAddress(candidate.address);
+    if (!address) continue;
+    return {
+      address,
+      source: candidate.source,
+      configuredWalletAddress: normalizeWalletAddress(cfg.walletAddress) || null,
+      privateKeyAddress: privateKeyAddress || null,
+      matchesPrivateKey: privateKeyAddress ? normAddress(address) === normAddress(privateKeyAddress) : null
+    };
+  }
+  throw new Error("No dashboard wallet address configured");
+}
+
+function privateKeyWalletAddress(cfg) {
+  if (!cfg?.privateKey) return "";
+  try {
+    const { account } = makeClients(cfg);
+    return account?.address ? getAddress(account.address) : "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizeWalletAddress(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  try {
+    return getAddress(text);
+  } catch {
+    return "";
+  }
+}
+
+function assertDashboardWalletCanExecute(cfg, walletAddress) {
+  const privateKeyAddress = privateKeyWalletAddress(cfg);
+  if (!privateKeyAddress) throw new Error("PRIVATE_KEY is not loaded; real wallet action is disabled");
+  if (normAddress(walletAddress) !== normAddress(privateKeyAddress)) {
+    throw new Error(
+      `Current dashboard wallet ${shortHash(walletAddress)} does not match loaded PRIVATE_KEY wallet ${shortHash(privateKeyAddress)}; switch WALLET_ADDRESS/private key before real wallet actions`
+    );
+  }
+}
+
+function assertWalletNotSwitching() {
+  if (walletSwitchPromise) throw new Error("钱包正在切换，请等待完成后再操作");
+}
+
+function assertWalletSwitchIdle() {
+  assertWalletNotSwitching();
+  try {
+    const wallet = normAddress(currentDashboardWallet());
+    const activeTask = listWalletActionTasks(readConfig()).find((task) =>
+      ["queued", "processing"].includes(task.status) && normAddress(task.wallet) === wallet
+    );
+    if (activeTask) throw new Error("存在正在执行的钱包任务，请完成后再切换钱包或重启 Watch");
+  } catch (error) {
+    if (/存在正在执行的钱包任务/.test(error?.message ?? "")) throw error;
+  }
+}
+
+async function withDashboardWalletAction(action) {
+  assertWalletSwitchIdle();
+  activeWalletActions += 1;
+  try {
+    return await action();
+  } finally {
+    activeWalletActions = Math.max(0, activeWalletActions - 1);
+  }
 }
 
 function resolveRuntimeStatusFile() {
@@ -792,6 +1232,7 @@ function normalizeRuntimeStatus(row, bot) {
     dataSources: row.dataSources ?? {},
     strategy: row.strategy ?? {},
     execution: row.execution ?? {},
+    walletActions: row.walletActions ?? {},
     autoSell: row.autoSell ?? {},
     preflight: row.watchPreflight ?? null,
     configSources: row.configSources ?? {}
@@ -825,9 +1266,14 @@ function formatEnvValue(value) {
 
 function windowText(watchConfig, cfg) {
   const openWindow = watchConfig?.eventOpenWindowSeconds ?? cfg.eventOpenWindowSeconds ?? 60;
-  const delay = Number(watchConfig?.eventBuyDelaySeconds ?? cfg.eventBuyDelaySeconds ?? 0);
+  const delay = buyDelaySeconds(watchConfig, cfg);
   if (delay > 0) return `${openWindow}s / 延迟 ${delay}s`;
   return `${openWindow}s`;
+}
+
+function buyDelaySeconds(watchConfig, cfg) {
+  const value = Number(watchConfig?.eventBuyDelaySeconds ?? cfg.eventBuyDelaySeconds ?? 0);
+  return Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 function autoSellText(watchConfig, cfg) {
@@ -849,6 +1295,9 @@ function autoSellText(watchConfig, cfg) {
   if (Boolean(watchConfig?.autoSellBreakevenEnabled ?? cfg.autoSellBreakevenEnabled)) {
     parts.push("保本");
   }
+  if (Boolean(watchConfig?.autoSellTimedExitEnabled ?? cfg.autoSellTimedExitEnabled)) {
+    parts.push(`定时${watchConfig?.autoSellTimedExitAfterOpenSeconds ?? cfg.autoSellTimedExitAfterOpenSeconds}s`);
+  }
   parts.push(`${watchConfig?.autoSellPollMs ?? cfg.autoSellPollMs}ms`);
   const minOutMode = watchConfig?.autoSellMinOutMode ?? cfg.autoSellMinOutMode;
   parts.push(minOutMode === "manual" ? "手动minOut" : "报价minOut");
@@ -856,8 +1305,41 @@ function autoSellText(watchConfig, cfg) {
 }
 
 async function approveRouter(body) {
+  return withDashboardWalletAction(() => approveRouterUnlocked(body));
+}
+
+async function enqueueRouterApproval(body) {
+  assertWalletNotSwitching();
+  const amount = Number(body?.amountUsdt ?? body?.amount);
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error("授权数量必须大于 0");
+  const walletAddress = currentDashboardWallet();
+  assertDashboardWalletCanExecute(readConfig(), walletAddress);
+  await assertWatchAcceptingWalletActions();
+  const { task, created } = createWalletActionTask(readConfig(), {
+    type: "router_approve",
+    priority: 30,
+    wallet: walletAddress,
+    market: "",
+    title: "BUSDT 授权",
+    payload: { amount }
+  });
+  return {
+    ok: true,
+    approval: {
+      taskId: task.id,
+      status: created ? "queued" : task.status,
+      statusText: created ? "授权已排队" : "授权任务已存在",
+      allowance: String(amount),
+      approved: false
+    }
+  };
+}
+
+async function approveRouterUnlocked(body) {
   const amount = Number(body?.amountUsdt ?? body?.amount);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error("Invalid approval amount");
+  const walletAddress = currentDashboardWallet();
+  assertDashboardWalletCanExecute(readConfig(), walletAddress);
 
   const result = await runEvent(["approve", "--amount-usdt", String(amount)], {
     timeoutMs: 180000,
@@ -873,6 +1355,7 @@ async function approveRouter(body) {
   appendJsonl(actionsFile, {
     type: "approve",
     at: new Date().toISOString(),
+    wallet: walletAddress,
     question: "BUSDT 授权",
     amount: approval.allowance,
     status: approval.approved ? "submitted" : "unchanged",
@@ -887,7 +1370,7 @@ async function approveRouter(body) {
       markdownLine("重置交易", shortHash(approval.resetHash))
     ].filter(Boolean).join("\n")
   });
-  overviewCache = null;
+  clearDashboardCaches();
   return {
     ok: true,
     approval
@@ -895,10 +1378,66 @@ async function approveRouter(body) {
 }
 
 async function approveOperator(body) {
+  return withDashboardWalletAction(() => approveOperatorUnlocked(body));
+}
+
+async function enqueueOperatorApproval(body) {
+  assertWalletNotSwitching();
   const market = String(body?.market ?? "").trim();
   if (!/^0x[0-9a-fA-F]{40}$/.test(market)) throw new Error("Missing market");
   const title = String(body?.title ?? market).trim() || market;
-  const result = await runEvent(["operator-approve", "--wallet", botWallet, "--market", market], {
+  const walletAddress = currentDashboardWallet();
+  assertDashboardWalletCanExecute(readConfig(), walletAddress);
+  await assertWatchAcceptingWalletActions();
+  const { task, created } = createWalletActionTask(readConfig(), {
+    type: "operator_approve",
+    priority: 30,
+    wallet: walletAddress,
+    market,
+    title,
+    payload: { market, title }
+  });
+  return {
+    ok: true,
+    operatorApproval: {
+      market,
+      owner: walletAddress,
+      approved: false,
+      operatorApproved: false,
+      alreadyApproved: false,
+      status: "broadcast",
+      statusText: created ? "授权已排队" : "授权任务已存在",
+      txHash: "",
+      taskId: task.id,
+      receiptError: ""
+    }
+  };
+}
+
+async function approveOperatorUnlocked(body) {
+  const market = String(body?.market ?? "").trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(market)) throw new Error("Missing market");
+  const title = String(body?.title ?? market).trim() || market;
+  const walletAddress = currentDashboardWallet();
+  const pendingApproval = pendingOperatorApprovalRecord(readConfig(), walletAddress, market);
+  if (pendingApproval) {
+    return {
+      ok: true,
+      operatorApproval: {
+        market,
+        owner: walletAddress,
+        approved: false,
+        operatorApproved: false,
+        alreadyApproved: false,
+        status: "broadcast",
+        statusText: "授权中",
+        txHash: pendingApproval.txHash ?? "",
+        receiptError: ""
+      }
+    };
+  }
+  assertDashboardWalletCanExecute(readConfig(), walletAddress);
+  const result = await runEvent(["operator-approve", "--wallet", walletAddress, "--market", market], {
     timeoutMs: 180000,
     env: {
       DRY_RUN: "0",
@@ -912,6 +1451,7 @@ async function approveOperator(body) {
   appendJsonl(actionsFile, {
     type: "operator_approve",
     at: new Date().toISOString(),
+    wallet: walletAddress,
     question: title,
     market,
     amount: approval.statusText,
@@ -933,7 +1473,7 @@ async function approveOperator(body) {
       markdownLine("错误", approval.receiptError)
     ].filter(Boolean).join("\n")
   });
-  overviewCache = null;
+  clearDashboardCaches();
   return {
     ok: true,
     operatorApproval: approval
@@ -941,8 +1481,10 @@ async function approveOperator(body) {
 }
 
 async function sellQuote(body) {
+  assertWalletSwitchIdle();
   const args = sellArgs(body);
-  const result = await runEvent(["sell", "--wallet", botWallet, ...args, "--dry-run"], {
+  const walletAddress = currentDashboardWallet();
+  const result = await runEvent(["sell", "--wallet", walletAddress, ...args, "--dry-run"], {
     timeoutMs: 30000,
     env: {
       DRY_RUN: "1",
@@ -956,8 +1498,186 @@ async function sellQuote(body) {
 }
 
 async function sellExecute(body) {
+  return withDashboardWalletAction(() => sellExecuteUnlocked(body));
+}
+
+async function enqueueManualSell(body) {
+  assertWalletNotSwitching();
+  sellArgs(body);
+  const walletAddress = currentDashboardWallet();
+  assertDashboardWalletCanExecute(readConfig(), walletAddress);
+  await assertWatchAcceptingWalletActions();
+  const market = String(body.market);
+  const title = String(body.title ?? market);
+  const { task, created } = createWalletActionTask(readConfig(), {
+    type: "manual_sell",
+    priority: 10,
+    wallet: walletAddress,
+    market,
+    title,
+    payload: {
+      market,
+      tokenId: body.tokenId ? String(body.tokenId) : "",
+      all: Boolean(body.all),
+      percent: Number(body.percent ?? 100),
+      quickSell: Boolean(body.quickSell || body.fastSell),
+      minOutUsdt: String(body.minOutUsdt ?? "0.000001")
+    }
+  });
+  return {
+    ok: true,
+    sell: queuedSellTaskSummary(task, created)
+  };
+}
+
+async function assertWatchAcceptingWalletActions() {
+  const bot = await getBotState();
+  if (!bot.running) throw new Error("Watch 未运行，不能提交真实钱包任务");
+  const runtimeStatus = readRuntimeStatus();
+  if (!runtimeStatus || runtimeStatus.mode !== "execute") {
+    throw new Error("Watch 当前不是实盘执行状态，不能提交真实钱包任务");
+  }
+  if (!runtimeStatus.walletActions?.monitorActive) {
+    throw new Error("Watch 钱包任务执行器未就绪，不能提交真实钱包任务");
+  }
+  if (
+    runtimeStatus.walletAddress &&
+    normAddress(runtimeStatus.walletAddress) !== normAddress(currentDashboardWallet())
+  ) {
+    throw new Error("Watch 运行钱包与前端当前钱包不一致，请先重启 Watch");
+  }
+  if (normalizeRuntimeStatus(runtimeStatus, bot).stale) {
+    throw new Error("Watch 运行快照与当前进程不一致，请先重启 Watch");
+  }
+}
+
+function walletActionTaskResponse(taskId) {
+  const task = readWalletActionTask(readConfig(), taskId);
+  if (!task) return { ok: false, message: "钱包任务不存在" };
+  if (normAddress(task.wallet) !== normAddress(currentDashboardWallet())) {
+    return { ok: false, message: "钱包任务不属于当前钱包" };
+  }
+  const state = walletActionTaskStatus(task);
+  return {
+    ok: true,
+    task: {
+      id: task.id,
+      type: task.type,
+      status: task.status,
+      active: state.active,
+      terminal: state.terminal,
+      progress: task.progress,
+      error: task.error,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+      finishedAt: task.finishedAt
+    },
+    sell: task.type === "manual_sell"
+      ? (task.result ? normalizeSellTaskResult(task) : queuedSellTaskSummary(task, false))
+      : null,
+    operatorApproval: task.type === "operator_approve"
+      ? normalizeQueuedOperatorApproval(task)
+      : null,
+    approval: task.type === "router_approve"
+      ? normalizeQueuedRouterApproval(task)
+      : null
+  };
+}
+
+function queuedSellTaskSummary(task, created) {
+  const progress = task.progress ?? {};
+  const total = Number(progress.total ?? 0);
+  const confirmed = Number(progress.confirmed ?? 0);
+  const broadcast = Number(progress.broadcast ?? 0);
+  const failed = Number(progress.failed ?? 0);
+  const skipped = Number(progress.skipped ?? 0);
+  const terminal = walletActionTaskStatus(task).terminal;
+  const rawStatus = task.status === "completed"
+    ? "success"
+    : task.status === "partial_failed"
+      ? "partial_failed"
+      : task.status === "failed"
+        ? "failed"
+        : task.status;
+  return {
+    status: terminal
+      ? task.status === "completed"
+        ? `已完成 ${confirmed + skipped}/${total}`
+        : task.status === "partial_failed"
+          ? `部分失败 ${failed}/${total}`
+          : "卖出失败"
+      : created
+        ? "卖出任务已排队"
+        : task.status === "processing"
+          ? `卖出处理中 ${confirmed + broadcast + skipped}/${total}`
+          : "卖出任务已存在",
+    title: task.title,
+    outcome: task.payload?.all ? "本市场全部仓位" : String(task.payload?.tokenId ?? ""),
+    positionCount: total,
+    sellMode: task.payload?.quickSell ? "fast" : "quoted",
+    receivedText: task.payload?.quickSell ? "未报价" : "",
+    txHash: progress.items?.find((item) => item.txHash)?.txHash ?? "",
+    txHashes: (progress.items ?? []).map((item) => item.txHash).filter(Boolean),
+    rawStatus,
+    taskId: task.id,
+    taskStatus: task.status,
+    progress,
+    error: task.error ?? ""
+  };
+}
+
+function normalizeSellTaskResult(task) {
+  const summary = normalizeSellExecution(task.result);
+  return {
+    ...summary,
+    title: summary.title === "持仓" ? task.title : summary.title,
+    outcome: task.payload?.all
+      ? `全部 ${Number(task.result?.selectedCount ?? 0)} 个仓位`
+      : summary.outcome,
+    taskId: task.id,
+    taskStatus: task.status,
+    progress: task.progress,
+    error: task.error ?? ""
+  };
+}
+
+function normalizeQueuedOperatorApproval(task) {
+  const approval = task.result?.approval;
+  if (approval) return normalizeOperatorApproval({ result: approval });
+  return {
+    market: task.market,
+    owner: task.wallet,
+    approved: false,
+    operatorApproved: false,
+    alreadyApproved: false,
+    status: task.status === "failed" ? "failed" : "broadcast",
+    statusText: task.status === "failed" ? "授权失败" : "授权中",
+    txHash: "",
+    taskId: task.id,
+    receiptError: task.error ?? ""
+  };
+}
+
+function normalizeQueuedRouterApproval(task) {
+  const approval = task.result?.approval;
+  if (approval) return normalizeApproval(approval);
+  return {
+    taskId: task.id,
+    status: task.status,
+    statusText: task.status === "failed" ? "授权失败" : "授权中",
+    allowance: String(task.payload?.amount ?? ""),
+    approved: false,
+    approveHash: "",
+    resetHash: "",
+    error: task.error ?? ""
+  };
+}
+
+async function sellExecuteUnlocked(body) {
   const args = sellArgs(body);
-  const result = await runEvent(["sell", "--wallet", botWallet, ...args], {
+  const walletAddress = currentDashboardWallet();
+  assertDashboardWalletCanExecute(readConfig(), walletAddress);
+  const result = await runEvent(["sell", "--wallet", walletAddress, ...args], {
     timeoutMs: 120000,
     env: {
       DRY_RUN: "0",
@@ -971,6 +1691,7 @@ async function sellExecute(body) {
   appendJsonl(actionsFile, {
     type: "sell",
     at: new Date().toISOString(),
+    wallet: walletAddress,
     question: summary.title,
     outcome: summary.outcome,
     amount: summary.receivedText,
@@ -993,7 +1714,7 @@ async function sellExecute(body) {
       markdownLine("错误", summary.receiptError)
     ].filter(Boolean).join("\n")
   });
-  overviewCache = null;
+  clearDashboardCaches();
   return {
     ok: true,
     sell: summary
@@ -1068,7 +1789,7 @@ function fundingMessage(wallet) {
   return "需要补 BNB";
 }
 
-function normalizeNext(status) {
+function normalizeNext(status, curvePremiumWindows = new Map()) {
   const markets = status.future ?? [];
   const next = markets[0] ?? null;
   const limit = Math.max(6, Number(process.env.DASHBOARD_UPCOMING_LIMIT ?? 30));
@@ -1080,7 +1801,7 @@ function normalizeNext(status) {
       stake: money(market.totalStakeUsdt),
       choices: market.outcomeCount,
       outcomeCount: market.availableOutcomeCount ?? market.outcomeCount ?? 0,
-      curve: marketCurveSummary(market),
+      premiumWindow: marketPremiumWindow(market, curvePremiumWindows),
       ready: Boolean(market.prepared)
     })),
     first: next ? {
@@ -1089,7 +1810,7 @@ function normalizeNext(status) {
       stake: money(next.totalStakeUsdt),
       choices: next.outcomeCount,
       outcomeCount: next.availableOutcomeCount ?? next.outcomeCount ?? 0,
-      curve: marketCurveSummary(next),
+      premiumWindow: marketPremiumWindow(next, curvePremiumWindows),
       ready: Boolean(next.prepared)
     } : null
   };
@@ -1105,29 +1826,120 @@ function marketTiming(market) {
   };
 }
 
-function marketCurveSummary(market) {
-  const info = curveInfo(market?.curve);
-  return {
-    name: info.name,
-    label: info.label,
-    tone: info.tone,
-    known: info.known,
-    present: Boolean(info.address)
+async function loadCurvePremiumWindows(cfg, markets) {
+  const curves = uniqueMarketCurves(markets);
+  if (curves.length === 0) return new Map();
+  const { publicClient } = makeClients(cfg);
+  const entries = await Promise.all(curves.map(async (curve) => [
+    curve.toLowerCase(),
+    await readCurvePremiumWindow(publicClient, curve)
+  ]));
+  return new Map(entries);
+}
+
+function uniqueMarketCurves(markets) {
+  const seen = new Set();
+  const result = [];
+  for (const market of markets ?? []) {
+    const curve = normalizeMarketAddress(market?.curve);
+    if (!curve) continue;
+    const key = curve.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(curve);
+  }
+  return result;
+}
+
+async function readCurvePremiumWindow(publicClient, curve) {
+  const address = normalizeMarketAddress(curve);
+  if (!address) return { address: "", seconds: null, label: "未知", hasPremium: false, source: "contract" };
+
+  const key = address.toLowerCase();
+  const cached = curvePremiumWindowCache.get(key);
+  if (cached && Date.now() - cached.at < curvePremiumWindowCacheMs) return cached.value;
+
+  let value;
+  try {
+    const raw = await withTimeout(
+      publicClient.readContract({
+        address,
+        abi: curvePremiumWindowAbi,
+        functionName: "WINDOW_STATIC"
+      }),
+      curvePremiumWindowTimeoutMs,
+      `curve premium window timeout after ${curvePremiumWindowTimeoutMs}ms`
+    );
+    const seconds = Number(raw);
+    value = Number.isFinite(seconds) && seconds >= 0
+      ? {
+          address,
+          seconds,
+          label: formatSecondsText(seconds),
+          hasPremium: seconds > 0,
+          source: "contract"
+        }
+      : { address, seconds: null, label: "未知", hasPremium: false, source: "contract" };
+  } catch (error) {
+    value = {
+      address,
+      seconds: null,
+      label: isMissingWindowStatic(error) ? "无" : "未知",
+      hasPremium: false,
+      source: "contract",
+      error: cleanError(error)
+    };
+  }
+
+  curvePremiumWindowCache.set(key, { at: Date.now(), value });
+  if (curvePremiumWindowCache.size > 128) curvePremiumWindowCache.delete(curvePremiumWindowCache.keys().next().value);
+  return value;
+}
+
+function marketPremiumWindow(market, curvePremiumWindows) {
+  const curve = normalizeMarketAddress(market?.curve);
+  if (!curve) return { address: "", seconds: null, label: "未知", hasPremium: false, source: "contract" };
+  return curvePremiumWindows.get(curve.toLowerCase()) ?? {
+    address: curve,
+    seconds: null,
+    label: "未知",
+    hasPremium: false,
+    source: "contract"
   };
 }
 
-function marketCurveMeta(market) {
-  const info = marketCurveSummary(market);
-  return info.present ? info.label : "";
+function normalizeMarketAddress(value) {
+  const text = String(value ?? "").trim();
+  return /^0x[0-9a-fA-F]{40}$/.test(text) ? text : "";
 }
 
-function normalizeNewMarkets(markets, status, walletRows, localRows) {
+function isMissingWindowStatic(error) {
+  const message = cleanError(error);
+  return /reverted|execution reverted|function .*reverted/i.test(message);
+}
+
+function formatSecondsText(value) {
+  const rounded = Math.round(Number(value) * 1000) / 1000;
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : String(rounded).replace(/0+$/u, "").replace(/\.$/u, "")}s`;
+}
+
+function withTimeout(promise, ms, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
+function normalizeNewMarkets(markets, status, walletRows, localRows, curvePremiumWindows = new Map(), walletAddress = "") {
   const cfg = readConfig();
   const openWindowSeconds = Number(status.watchConfig?.eventOpenWindowSeconds ?? cfg.eventOpenWindowSeconds ?? 60);
   const bought = boughtMarketSet(walletRows, localRows);
   const skipped = skippedMarketSet(localRows);
   const future = new Map((status.future ?? []).map((market) => [normAddress(market.address), market]));
-  const executionEvidence = localMarketExecutionEvidence(readJsonl(fillsFile, 2000), walletRows);
+  const executionEvidence = localMarketExecutionEvidence(readJsonl(fillsFile, 2000), walletRows, walletAddress);
   const rows = [];
   let excluded = 0;
 
@@ -1138,13 +1950,14 @@ function normalizeNewMarkets(markets, status, walletRows, localRows) {
     const evidence = executionEvidence.get(key) ?? null;
     if (rejectionReason) {
       excluded += 1;
-      rows.push(rejectedMarketRow(market, rejectionReason, evidence, cfg));
+      rows.push(rejectedMarketRow(market, rejectionReason, evidence, cfg, curvePremiumWindows));
       continue;
     }
     const pending = future.get(key);
     const context = { bought, skipped, pending, openWindowSeconds };
     const outcomeCount = market.outcomes?.length ?? 0;
-    const choices = Math.min(Number(status.watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5), outcomeCount);
+    const manualTokenIds = dashboardManualOutcomeTokenIds(market, cfg);
+    const choices = dashboardPlannedOutcomeCountForMarket(market, status.watchConfig, cfg);
     const state = marketState(market, context);
     rows.push({
       market: market.address,
@@ -1159,26 +1972,131 @@ function normalizeNewMarkets(markets, status, walletRows, localRows) {
       tone: marketTone(market, context),
       bucket: marketBucketFor(market, context),
       manuallyExcluded: false,
-      curve: marketCurveSummary(market),
-      meta: marketMeta(firstCategory(market), choices, outcomeCount, marketCurveMeta(market)),
+      premiumWindow: marketPremiumWindow(market, curvePremiumWindows),
+      manualOutcomeSelection: manualOutcomeSelectionSummary(manualTokenIds),
+      outcomes: dashboardMarketOutcomes(market, manualTokenIds),
+      meta: marketMeta(firstCategory(market), choices, outcomeCount, manualTokenIds.length),
       diagnostics: baseMarketDiagnostics(market, evidence)
     });
   }
+  const eligibleCount = rows.length - excluded;
+  appendHistoricalMarketRows(rows, localRows, status, curvePremiumWindows, cfg);
 
   return {
     count: rows.length,
     excluded,
-    eligibleCount: rows.length - excluded,
-    items: rows.slice(0, Number(process.env.DASHBOARD_MARKET_ROWS_LIMIT ?? 120))
+    eligibleCount,
+    items: rows.slice(0, Number(process.env.DASHBOARD_MARKET_ROWS_LIMIT ?? 1000))
   };
+}
+
+function appendHistoricalMarketRows(rows, localRows, status, curvePremiumWindows, cfg) {
+  const existing = new Set(rows.map((row) => normAddress(row.market)).filter(Boolean));
+  const stakePerOutcome = Number(status.watchConfig?.stakePerOutcomeUsdt ?? cfg.stakePerOutcomeUsdt ?? 5);
+  for (const activity of localRows) {
+    const key = normAddress(activity.market);
+    if (!key || existing.has(key)) continue;
+    const bought = String(activity.label ?? "").startsWith("买入已确认");
+    const skipped = activity.label === "已跳过";
+    if (!bought && !skipped) continue;
+
+    const market = activity.marketData ?? {};
+    const availableOutcomeCount = Number(
+      activity.availableOutcomeCount ??
+      market.outcomes?.length ??
+      market.availableOutcomeCount ??
+      market.outcomeCount ??
+      activity.outcomeCount ??
+      0
+    );
+    const actualPlannedOutcomeCount = Number(activity.plannedOutcomeCount);
+    const choices = Number.isFinite(actualPlannedOutcomeCount) && actualPlannedOutcomeCount >= 0
+      ? actualPlannedOutcomeCount
+      : dashboardPlannedOutcomeCount(availableOutcomeCount, status.watchConfig, cfg);
+    const actualTotalStakeUsdt = Number(activity.totalStakeUsdt);
+    const state = bought ? "已买" : "已跳过";
+    rows.push({
+      market: activity.market,
+      title: activity.title ?? market.question ?? activity.market,
+      category: firstCategory(market),
+      startsAt: market.startDate ?? activity.startsAt ?? null,
+      endsAt: market.endDate ?? activity.endsAt ?? null,
+      durationHours: marketDurationHours(market),
+      outcomeCount: availableOutcomeCount,
+      choices,
+      stake: bought
+        ? money(Number.isFinite(actualTotalStakeUsdt) ? actualTotalStakeUsdt : stakePerOutcome * choices)
+        : "-",
+      state,
+      tone: bought ? "good" : "bad",
+      bucket: bought ? "bought" : "skipped",
+      manuallyExcluded: false,
+      reason: skipped ? activity.amount ?? "" : "",
+      premiumWindow: marketPremiumWindow(market, curvePremiumWindows),
+      meta: [firstCategory(market) || "历史记录", skipped ? activity.amount : ""].filter(Boolean).join(" · "),
+      diagnostics: baseMarketDiagnostics(market)
+    });
+    existing.add(key);
+  }
+}
+
+function dashboardPlannedOutcomeCount(availableOutcomeCount, watchConfig, cfg) {
+  const available = Math.max(0, Number(availableOutcomeCount) || 0);
+  const selection = String(watchConfig?.eventOutcomeSelection ?? cfg.eventOutcomeSelection ?? "lowest_odds");
+  if (selection === "all") return available;
+  const requested = Math.max(0, Number(watchConfig?.eventOutcomeCount ?? cfg.eventOutcomeCount ?? 5) || 0);
+  return Math.min(requested, available);
+}
+
+function dashboardPlannedOutcomeCountForMarket(market, watchConfig, cfg) {
+  const manualTokenIds = dashboardManualOutcomeTokenIds(market, cfg);
+  if (manualTokenIds.length > 0) {
+    const available = Math.max(0, Number(market?.outcomes?.length ?? 0) || 0);
+    return available > 0 ? Math.min(manualTokenIds.length, available) : manualTokenIds.length;
+  }
+  return dashboardPlannedOutcomeCount(market?.outcomes?.length ?? 0, watchConfig, cfg);
+}
+
+function dashboardManualOutcomeTokenIds(market, cfg) {
+  const address = normAddress(market?.address);
+  const tokenIds = cfg.manualOutcomeSelections?.[address];
+  return Array.isArray(tokenIds) ? tokenIds.map((item) => String(item)).filter(Boolean) : [];
+}
+
+function manualOutcomeSelectionSummary(tokenIds) {
+  return {
+    active: tokenIds.length > 0,
+    tokenIds
+  };
+}
+
+function dashboardMarketOutcomes(market, selectedTokenIds = []) {
+  const selected = new Set(selectedTokenIds.map(String));
+  return [...(market?.outcomes ?? [])]
+    .sort((a, b) => compareDashboardTokenId(a.tokenId, b.tokenId))
+    .map((outcome) => ({
+      tokenId: String(outcome.tokenId ?? ""),
+      name: outcome.name ?? String(outcome.tokenId ?? ""),
+      price: outcome.price ?? null,
+      payout: outcome.payout ?? null,
+      selected: selected.has(String(outcome.tokenId ?? ""))
+    }));
+}
+
+function compareDashboardTokenId(a, b) {
+  try {
+    const left = BigInt(a ?? 0);
+    const right = BigInt(b ?? 0);
+    return left < right ? -1 : left > right ? 1 : 0;
+  } catch {
+    return String(a ?? "").localeCompare(String(b ?? ""));
+  }
 }
 
 function marketRejectionReason(market, cfg) {
   if (!market) return "数据为空";
   if (!["live", "not_started"].includes(String(market.status ?? ""))) return `状态 ${market.status ?? "unknown"}`;
   if (!Array.isArray(market.outcomes) || market.outcomes.length === 0) return "没有选项";
-  const curveReason = marketCurveBlockReason(market);
-  if (curveReason) return `Curve ${curveReason}`;
   if (isTestingMarket(market)) return "测试盘";
   if (isBlockedMarketAddress(market, cfg)) return "手动排除";
   if (containsAnyDashboard(market.question ?? "", cfg.marketQuestionBlocklist)) return "手动排除";
@@ -1187,29 +2105,33 @@ function marketRejectionReason(market, cfg) {
   if (!passesMinimumDuration(market, cfg)) {
     return `时长不足 ${Number(cfg.minMarketDurationHours ?? 48)}h`;
   }
+  if (cfg.worldCupScoreMode && !isWorldCupScoreMarket(market)) return "非世界杯25项比分盘";
   if (!isEventMarket(market, cfg, { statuses: ["live", "not_started"] })) return "策略未匹配";
   return "";
 }
 
-function rejectedMarketRow(market, reason, evidence = null, cfg = {}) {
+function rejectedMarketRow(market, reason, evidence = null, cfg = {}, curvePremiumWindows = new Map()) {
   const category = firstCategory(market);
   const duration = marketDurationText(market);
+  const manualTokenIds = dashboardManualOutcomeTokenIds(market, cfg);
   return {
     market: market.address,
     title: market.question ?? market.slug ?? market.address ?? "Unknown market",
     category,
     ...marketTiming(market),
     outcomeCount: market.outcomes?.length ?? 0,
-    choices: market.outcomes?.length ?? 0,
+    choices: dashboardPlannedOutcomeCountForMarket(market, null, cfg),
     stake: "-",
     state: "被刷掉",
     tone: "neutral",
     bucket: "rejected",
     manuallyExcluded: isBlockedMarketAddress(market, cfg),
     reason,
-    curve: marketCurveSummary(market),
+    premiumWindow: marketPremiumWindow(market, curvePremiumWindows),
+    manualOutcomeSelection: manualOutcomeSelectionSummary(manualTokenIds),
+    outcomes: dashboardMarketOutcomes(market, manualTokenIds),
     diagnostics: baseMarketDiagnostics(market, evidence),
-    meta: [category || "Market", marketCurveMeta(market), duration, reason].filter(Boolean).join(" · ")
+    meta: [category || "Market", duration, reason].filter(Boolean).join(" · ")
   };
 }
 
@@ -1223,14 +2145,16 @@ function containsAnyDashboard(text, needles = []) {
   return needles.some((needle) => normalized.includes(String(needle).toLowerCase()));
 }
 
-function localMarketExecutionEvidence(localRows, walletRows = []) {
+function localMarketExecutionEvidence(localRows, walletRows = [], walletAddress = "") {
   const map = new Map();
+  const includeUnknownWallet = shouldIncludeUnknownLocalWallet(walletAddress, readConfig());
   for (const row of walletRows) {
     if (String(row.type ?? "").toUpperCase() === "MINT" && row.marketAddress) {
       addMarketExecutionEvidence(map, row.marketAddress, { chainBuySeen: 1, successCount: 1 });
     }
   }
   for (const row of localRows) {
+    if (!localRowMatchesWallet(row, walletAddress, { includeUnknown: includeUnknownWallet })) continue;
     if (row.level === "event-execution-error" && row.market) {
       addMarketExecutionEvidence(map, row.market, { failureCount: 1, lastFailureAt: row.at, lastFailure: row.message });
       continue;
@@ -1303,15 +2227,6 @@ function baseMarketDiagnostics(market, evidence = null) {
 function marketDiagnosticBadges(market, evidence = null, checks = null) {
   const badges = [];
   const status = String(market?.status ?? "");
-  const curve = marketCurveSummary(market);
-  if (curve.present) {
-    badges.push({
-      key: "curve",
-      label: `Curve ${curve.name || "unknown"}`,
-      tone: curve.tone,
-      detail: curve.label
-    });
-  }
   if (status && !["live", "not_started"].includes(status)) {
     badges.push({ key: "rest_status_abnormal", label: "REST状态异常", tone: "warn", detail: status });
   }
@@ -1377,7 +2292,7 @@ function boughtMarketSet(walletRows, localRows) {
     }
   }
   for (const row of localRows) {
-    if (row.label === "买入成功" && row.market) set.add(normAddress(row.market));
+    if (String(row.label ?? "").startsWith("买入已确认") && row.market) set.add(normAddress(row.market));
   }
   return set;
 }
@@ -1412,8 +2327,9 @@ function marketBucketFor(market, { bought, skipped, pending, openWindowSeconds }
   return "pending";
 }
 
-function marketMeta(category, choices, outcomeCount, curveLabel = "") {
-  return [category || "Event Market", curveLabel, `outcome ${Number(outcomeCount ?? 0)} 个`, `买 ${choices} 档`]
+function marketMeta(category, choices, outcomeCount, manualSelectedCount = 0) {
+  const choiceText = manualSelectedCount > 0 ? `手选 ${manualSelectedCount} 档` : `买 ${choices} 档`;
+  return [category || "Event Market", `outcome ${Number(outcomeCount ?? 0)} 个`, choiceText]
     .filter(Boolean)
     .join(" · ");
 }
@@ -1490,6 +2406,118 @@ function normalizeHoldings(raw) {
       positive: group.pnl >= 0
     }))
   };
+}
+
+async function enrichHoldingsOperatorApprovals(holdings, cfg, walletAddress) {
+  if (!holdings?.groups?.length || !walletAddress) return holdings;
+  const localState = readOperatorApprovalState(cfg);
+  await Promise.all(holdings.groups.map(async (group) => {
+    group.operatorApproval = await marketOperatorApprovalStatus(
+      cfg,
+      walletAddress,
+      group.market,
+      localState
+    );
+  }));
+  return holdings;
+}
+
+async function marketOperatorApprovalStatus(cfg, walletAddress, market, localState) {
+  const key = `${normAddress(walletAddress)}:${normAddress(market)}`;
+  const local = localState.entries?.[key] ?? null;
+  const localUpdatedAt = local?.updatedAt ?? local?.at ?? "";
+  const cached = operatorApprovalStatusCache.get(key);
+  if (
+    cached &&
+    cached.localUpdatedAt === localUpdatedAt &&
+    Date.now() - cached.at < cached.ttlMs
+  ) return cached.value;
+
+  let approved = false;
+  let chainError = "";
+  try {
+    approved = await withDashboardTimeout(
+      isMarketOperatorApproved(cfg, {
+        market,
+        owner: walletAddress
+      }),
+      Number(process.env.DASHBOARD_OPERATOR_STATUS_TIMEOUT_MS ?? 3000),
+      "卖出授权状态检查超时"
+    );
+  } catch (error) {
+    chainError = cleanError(error?.message ?? String(error));
+  }
+
+  const pending = !approved && ["queued", "authorizing", "pending", "broadcast"].includes(local?.status);
+  const failed = !approved && local?.status === "failed";
+  const status = approved
+    ? "approved"
+    : pending
+      ? "pending"
+      : failed
+        ? "failed"
+        : chainError
+          ? "unknown"
+          : "unapproved";
+  const value = {
+    status,
+    approved,
+    pending,
+    failed,
+    statusText: approved
+      ? "已授权"
+      : pending
+        ? "授权中"
+        : failed
+          ? "授权失败"
+          : chainError
+            ? "状态未知"
+            : "未授权",
+    txHash: local?.txHash ?? "",
+    error: local?.error || chainError,
+    checkedAt: new Date().toISOString()
+  };
+  const ttlMs = approved ? 30000 : pending ? 1000 : 5000;
+  operatorApprovalStatusCache.set(key, {
+    at: Date.now(),
+    ttlMs,
+    localUpdatedAt,
+    value
+  });
+  return value;
+}
+
+function readOperatorApprovalState(cfg) {
+  if (!cfg.operatorApprovalStateFile) return { entries: {} };
+  try {
+    const file = path.resolve(rootDir, cfg.operatorApprovalStateFile);
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return {
+      entries: parsed?.entries && typeof parsed.entries === "object" ? parsed.entries : {}
+    };
+  } catch {
+    return { entries: {} };
+  }
+}
+
+function pendingOperatorApprovalRecord(cfg, walletAddress, market) {
+  const state = readOperatorApprovalState(cfg);
+  const key = `${normAddress(walletAddress)}:${normAddress(market)}`;
+  const entry = state.entries?.[key];
+  if (!entry || !["queued", "authorizing", "pending", "broadcast"].includes(entry.status)) return null;
+  const updatedAt = new Date(entry.updatedAt ?? entry.at ?? 0).getTime();
+  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > 5 * 60 * 1000) return null;
+  return entry;
+}
+
+function withDashboardTimeout(promise, timeoutMs, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    })
+  ]).finally(() => clearTimeout(timer));
 }
 
 function buildAnalytics(rawPositions, activityRows) {
@@ -1652,15 +2680,20 @@ function sellExecutionsSummary(executions) {
   const rows = executions.filter(Boolean);
   const executionCount = rows.length;
   const confirmedCount = rows.filter((row) => row.status === "success").length;
-  const failedCount = rows.filter((row) => row.status === "reverted").length;
+  const revertedCount = rows.filter((row) => row.status === "reverted").length;
+  const executionFailedCount = rows.filter((row) => row.status === "failed").length;
+  const failedCount = revertedCount + executionFailedCount;
   const txHashes = rows.map((row) => row.txHash).filter(Boolean);
   const broadcastCount = rows.filter((row) => row.status === "broadcast" || (row.txHash && row.status !== "reverted")).length;
-  const receiptError = rows.find((row) => row.receiptError)?.receiptError ?? "";
+  const receiptError = rows.find((row) => row.receiptError || row.error)?.receiptError
+    ?? rows.find((row) => row.error)?.error
+    ?? "";
   const broadcastModes = [...new Set(rows.map((row) => row.broadcastMode).filter(Boolean))];
   const broadcastRpcCount = Math.max(0, ...rows.map((row) => Number(row.broadcastRpcCount ?? 0)).filter(Number.isFinite));
   const firstBroadcastProvider = rows.find((row) => row.firstBroadcastProvider)?.firstBroadcastProvider ?? "";
   let rawStatus = "processed";
-  if (executionCount > 0 && failedCount === executionCount) rawStatus = "reverted";
+  if (executionCount > 0 && revertedCount === executionCount) rawStatus = "reverted";
+  else if (executionCount > 0 && failedCount === executionCount) rawStatus = "failed";
   else if (failedCount > 0) rawStatus = "partial_failed";
   else if (executionCount > 0 && confirmedCount === executionCount) rawStatus = "success";
   else if (txHashes.length > 0) rawStatus = "broadcast";
@@ -1684,6 +2717,7 @@ function sellExecutionStatusText(summary) {
   if (summary.rawStatus === "broadcast") return summary.executionCount > 1 ? `已广播 ${summary.broadcastCount}/${summary.executionCount}，等待确认` : "已广播，等待确认";
   if (summary.rawStatus === "partial_failed") return `部分失败 ${summary.failedCount}/${summary.executionCount}`;
   if (summary.rawStatus === "reverted") return "链上失败";
+  if (summary.rawStatus === "failed") return "卖出失败";
   return "已处理";
 }
 
@@ -1837,21 +2871,35 @@ function activityAmount(value) {
   return /^-?\d+(?:\.\d+)?$/.test(text) ? `${text} U` : text;
 }
 
-function readRecentActivity() {
+function readRecentActivity(walletAddress = currentDashboardWallet()) {
   const rows = [];
-  for (const row of readJsonl(fillsFile, 120)) {
+  const includeUnknownWallet = shouldIncludeUnknownLocalWallet(walletAddress, readConfig());
+  for (const row of readJsonl(fillsFile, Number(process.env.DASHBOARD_ACTIVITY_HISTORY_LIMIT ?? 5000))) {
     if (isSkipLogLevel(row.level)) {
-      rows.push({ at: row.at, label: "已跳过", title: row.question, market: row.market, amount: row.reason ?? "" });
+      rows.push({
+        at: row.at,
+        label: "已跳过",
+        title: row.question,
+        market: row.market,
+        startsAt: row.startDate ?? null,
+        endsAt: row.endDate ?? null,
+        amount: row.reason ?? ""
+      });
       continue;
     }
     if (row.level === "event-execution-error") {
+      if (!localRowMatchesWallet(row, walletAddress, { includeUnknown: includeUnknownWallet })) continue;
       rows.push({ at: row.at, label: "买入失败", title: row.question, market: row.market, amount: "" });
       continue;
     }
     if (row.level === "event-receipt") {
+      if (!localRowMatchesWallet(row, walletAddress, { includeUnknown: includeUnknownWallet })) continue;
+      const sellReceipt = row.context?.type === "manual-sell" || row.context?.type === "auto-sell";
       rows.push({
         at: row.at,
-        label: row.status === "success" ? "买入已确认" : "买入链上失败",
+        label: row.status === "success"
+          ? sellReceipt ? "卖出已确认" : "买入已确认"
+          : sellReceipt ? "卖出链上失败" : "买入链上失败",
         title: row.context?.question ?? "交易",
         market: row.context?.market,
         amount: ""
@@ -1859,16 +2907,38 @@ function readRecentActivity() {
       continue;
     }
     if (row.plan && row.result && !row.result.dryRun) {
+      if (!localRowMatchesWallet(row, walletAddress, { includeUnknown: includeUnknownWallet })) continue;
       rows.push({
         at: row.at,
         label: buyActivityStatus(row.result),
         title: row.plan.market?.question,
         market: row.plan.market?.address,
+        marketData: row.plan.market,
+        availableOutcomeCount: row.plan.selection?.availableOutcomeCount ?? row.plan.market?.outcomes?.length ?? 0,
+        plannedOutcomeCount: row.plan.outcomes?.length ?? row.plan.selection?.selectedCount ?? 0,
+        totalStakeUsdt: row.plan.totalStakeUsdt,
         amount: row.plan.totalStakeUsdt ? `${money(row.plan.totalStakeUsdt)} U` : ""
       });
     }
+    if (row.bundle && row.result && !row.result.dryRun) {
+      if (!localRowMatchesWallet(row, walletAddress, { includeUnknown: includeUnknownWallet })) continue;
+      for (const market of row.bundle.markets ?? []) {
+        rows.push({
+          at: row.at,
+          label: buyActivityStatus(row.result),
+          title: market.question,
+          market: market.address,
+          marketData: market,
+          availableOutcomeCount: market.availableOutcomeCount ?? market.outcomeCount ?? 0,
+          plannedOutcomeCount: market.outcomeCount ?? 0,
+          totalStakeUsdt: market.totalStakeUsdt,
+          amount: market.totalStakeUsdt ? `${money(market.totalStakeUsdt)} U` : ""
+        });
+      }
+    }
   }
   for (const row of readJsonl(actionsFile, 80)) {
+    if (!localRowMatchesWallet(row, walletAddress, { includeUnknown: includeUnknownWallet })) continue;
     rows.push({
       at: row.at,
       label: actionActivityStatus(row),
@@ -1885,7 +2955,6 @@ function isSkipLogLevel(level) {
   return [
     "event-skip-open-window",
     "event-skip-rest-live-deadline",
-    "event-skip-curve",
     "event-skip-safety-gate",
     "event-skip-catchup-disabled"
   ].includes(String(level ?? ""));
@@ -1965,13 +3034,18 @@ function parseSystemctlShow(text) {
   return props;
 }
 
-async function getBuySpeedStats(cfg) {
+async function getBuySpeedStats(cfg, walletAddress = currentDashboardWallet(cfg)) {
   const now = Date.now();
-  if (buySpeedCache && now - buySpeedCache.at < 60000) return buySpeedCache.data;
-  if (buySpeedPromise) return buySpeedPromise;
-  buySpeedPromise = buildBuySpeedStats(cfg)
+  const walletKey = normAddress(walletAddress);
+  const cached = buySpeedCaches.get(walletKey);
+  if (cached && now - cached.at < 60000) return cached.data;
+  if (buySpeedPromises.has(walletKey)) return buySpeedPromises.get(walletKey);
+  const generation = dashboardCacheGeneration;
+  const promise = buildBuySpeedStats(cfg, walletAddress)
     .then((data) => {
-      buySpeedCache = { at: Date.now(), data };
+      if (generation === dashboardCacheGeneration) {
+        buySpeedCaches.set(walletKey, { at: Date.now(), data });
+      }
       return data;
     })
     .catch((error) => ({
@@ -1981,17 +3055,20 @@ async function getBuySpeedStats(cfg) {
       message: cleanError(error)
     }))
     .finally(() => {
-      buySpeedPromise = null;
+      if (buySpeedPromises.get(walletKey) === promise) buySpeedPromises.delete(walletKey);
     });
-  return buySpeedPromise;
+  buySpeedPromises.set(walletKey, promise);
+  return promise;
 }
 
-async function buildBuySpeedStats(cfg) {
+async function buildBuySpeedStats(cfg, walletAddress = currentDashboardWallet(cfg)) {
   const limit = 6;
   const groups = recentBuyExecutionGroups({
     rowLimit: 2000,
     marketLimit: Math.max(36, limit * 8),
-    txPerMarket: 8
+    txPerMarket: 8,
+    walletAddress,
+    includeUnknownWallet: shouldIncludeUnknownLocalWallet(walletAddress, cfg)
   });
   const blockCache = new Map();
   const computed = [];
@@ -2005,6 +3082,7 @@ async function buildBuySpeedStats(cfg) {
   return {
     ok: true,
     updatedAt: new Date().toISOString(),
+    wallet: walletAddress,
     marketCandidateCount: groups.length,
     computedMarketCount: computed.length,
     validCount: computed.filter((item) => item.ok && !item.dirty).length,
@@ -2040,12 +3118,13 @@ async function computeBestBuySpeedStatForMarket(cfg, group, blockCache) {
   };
 }
 
-function recentBuyExecutionGroups({ rowLimit, marketLimit, txPerMarket }) {
+function recentBuyExecutionGroups({ rowLimit, marketLimit, txPerMarket, walletAddress = "", includeUnknownWallet = false }) {
   const rows = readJsonl(fillsFile, rowLimit).reverse();
   const groups = new Map();
   for (const row of rows) {
     const result = row.result;
     if (!result?.txHash || result.dryRun) continue;
+    if (!localRowMatchesWallet(row, walletAddress, { includeUnknown: includeUnknownWallet })) continue;
     if (row.plan?.market?.address) {
       const item = buySpeedItemFromPlan(row, row.plan, result);
       pushBuySpeedGroupItem(groups, item, txPerMarket);
@@ -2263,6 +3342,35 @@ function compareBuySpeedRecentDesc(a, b) {
   return new Date(b.at ?? 0).getTime() - new Date(a.at ?? 0).getTime();
 }
 
+function shouldIncludeUnknownLocalWallet(walletAddress, cfg) {
+  void walletAddress;
+  void cfg;
+  return truthyConfigValue(process.env.DASHBOARD_INCLUDE_LEGACY_UNKNOWN_WALLET_FILLS ?? "0");
+}
+
+function localRowMatchesWallet(row, walletAddress, { includeUnknown = false } = {}) {
+  const walletKey = normAddress(walletAddress);
+  if (!walletKey) return true;
+  const rowWallet = localRowWallet(row);
+  if (!rowWallet) return Boolean(includeUnknown);
+  return normAddress(rowWallet) === walletKey;
+}
+
+function localRowWallet(row) {
+  return normalizeWalletAddress(
+    row?.wallet ??
+    row?.walletAddress ??
+    row?.receiverAddress ??
+    row?.context?.wallet ??
+    row?.result?.wallet ??
+    row?.result?.receiver ??
+    row?.result?.account ??
+    row?.plan?.receiver ??
+    row?.bundle?.receiver ??
+    row?.bundle?.receiverAddress
+  );
+}
+
 function groupMintLogs(logs) {
   const groups = new Map();
   for (const log of logs ?? []) {
@@ -2360,11 +3468,11 @@ function trimNumber(value, digits = 4) {
   return String(Number(value.toFixed(digits)));
 }
 
-async function fetchUserActivity() {
+async function fetchUserActivity(walletAddress = currentDashboardWallet()) {
   try {
     const cfg = readConfig();
     return await fetchActivity(cfg, {
-      user: botWallet,
+      user: walletAddress,
       limit: Number(process.env.DASHBOARD_ACTIVITY_LIMIT ?? 500)
     });
   } catch {

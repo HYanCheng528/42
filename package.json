@@ -33,7 +33,7 @@
     "event:operator-approve": "node src/event-sniper.js operator-approve",
     "event:doctor": "node src/event-sniper.js doctor",
     "dashboard": "node src/dashboard-server.js",
-    "check": "node --check src/sniper.js && node --check src/event-sniper.js && node --check src/dashboard-server.js && node --check src/fortytwo.js && node --check src/strategy.js && node --check src/event-strategy.js && node --check src/binance.js && node --check src/config.js",
+    "check": "node --check src/sniper.js && node --check src/event-sniper.js && node --check src/dashboard-server.js && node --check src/fortytwo.js && node --check src/strategy.js && node --check src/event-strategy.js && node --check src/binance.js && node --check src/config.js && node --check src/wallet-action-queue.js",
     "verify": "npm run check && npm run event:self-test"
   },
   "dependencies": {

@@ -1,6 +1,4 @@
-import { ADDRESSES, curveInfo } from "./fortytwo.js";
-
-const blockedCurveNames = new Set(["testingCurve", "powerLdaCurve"]);
+import { ADDRESSES } from "./fortytwo.js";
 
 export function filterEventMarkets(markets, cfg, options = {}) {
   return markets
@@ -9,9 +7,19 @@ export function filterEventMarkets(markets, cfg, options = {}) {
     .sort(compareCreatedAtDesc);
 }
 
+export function filterNotificationMarkets(markets, cfg, options = {}) {
+  const notificationCfg = {
+    ...cfg,
+    worldCupScoreMode: false
+  };
+  return markets
+    .filter((market) => isEventMarketBeforeCurveCheck(market, notificationCfg, options))
+    .filter((market) => passesCreatedAtFloor(market, notificationCfg))
+    .sort(compareCreatedAtDesc);
+}
+
 export function isEventMarket(market, cfg, options = {}) {
   if (!isEventMarketBeforeCurveCheck(market, cfg, options)) return false;
-  if (marketCurveBlockReason(market)) return false;
   return true;
 }
 
@@ -26,23 +34,8 @@ export function isEventMarketBeforeCurveCheck(market, cfg, options = {}) {
   if (isPriceMarket(market, cfg)) return false;
   if (!passesCategoryAllowlist(market, cfg)) return false;
   if (!passesMinimumDuration(market, cfg)) return false;
+  if (!passesWorldCupScoreMode(market, cfg)) return false;
   return true;
-}
-
-export function isCurveBlockNotificationCandidate(market, cfg, options = {}) {
-  return Boolean(
-    marketCurveBlockReason(market) &&
-    isEventMarketBeforeCurveCheck(market, cfg, options) &&
-    passesCreatedAtFloor(market, cfg)
-  );
-}
-
-export function marketCurveBlockReason(market) {
-  const info = curveInfo(market?.curve);
-  if (!info.address) return "";
-  if (blockedCurveNames.has(info.name)) return info.name;
-  if (!info.known) return "unknownCurve";
-  return "";
 }
 
 export function isPriceMarket(market, cfg) {
@@ -158,6 +151,40 @@ export function passesMinimumDuration(market, cfg) {
   if (!Number.isFinite(minimumHours) || minimumHours <= 0) return true;
   const durationHours = marketDurationHours(market);
   return durationHours !== null && durationHours >= minimumHours;
+}
+
+export function passesWorldCupScoreMode(market, cfg) {
+  if (!cfg.worldCupScoreMode) return true;
+  return isWorldCupScoreMarket(market);
+}
+
+export function isWorldCupScoreMarket(market) {
+  if (!Array.isArray(market?.outcomes) || market.outcomes.length !== 25) return false;
+  const text = [
+    market.question,
+    market.slug,
+    ...(market.categories ?? []),
+    ...(market.tags ?? []),
+    ...(market.topics ?? [])
+  ].filter(Boolean).join(" ");
+  if (!/(^|\s)(vs\.?|v)(\s|$)/i.test(text) && !/world\s*cup|fifa/i.test(text)) return false;
+
+  const scoreLikeCount = market.outcomes
+    .map(outcomeLabel)
+    .filter(isScoreOutcomeLabel)
+    .length;
+  return scoreLikeCount >= 15;
+}
+
+function outcomeLabel(outcome) {
+  if (!outcome || typeof outcome !== "object") return String(outcome ?? "");
+  return [outcome.name, outcome.label, outcome.title, outcome.symbol].filter(Boolean).join(" ");
+}
+
+function isScoreOutcomeLabel(value) {
+  const text = String(value ?? "").trim();
+  const match = text.match(/^(.{2,48}?)\s+\d+\s*(?:-|[^0-9A-Za-z\s])\s*\d+\s+(.{2,48})$/u);
+  return Boolean(match && /[A-Za-z]/.test(match[1]) && /[A-Za-z]/.test(match[2]));
 }
 
 function containsAny(text, needles = []) {
